@@ -1,0 +1,6 @@
+.gocache/
+.gomodcache/
+/taskpilot
+taskpilot.db
+*.db-shm
+*.db-wal
