@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: taskpilot
+      POSTGRES_USER: taskpilot
+      POSTGRES_PASSWORD: change-this-postgres-password
+    volumes:
+      - taskpilot_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskpilot -d taskpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  taskpilot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - serve
+      - --addr
+      - 0.0.0.0:8080
+      - --production
+    environment:
+      TASKPILOT_TOKEN: change-this-team-token-before-use
+      TASKPILOT_SECRET_KEY: change-this-secret-key-to-at-least-32-characters
+      TASKPILOT_BASE_URL: http://localhost:8080
+      TASKPILOT_ARTIFACT_DIR: /artifacts
+      TASKPILOT_DB_URL: postgres://taskpilot:change-this-postgres-password@postgres:5432/taskpilot?sslmode=disable
+    ports:
+      - "8080:8080"
+    volumes:
+      - taskpilot_artifacts:/artifacts
+
+volumes:
+  taskpilot_postgres:
+  taskpilot_artifacts:

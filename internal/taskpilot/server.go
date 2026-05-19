@@ -7,64 +7,122 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
 )
 
 //go:embed static/*
 var staticFS embed.FS
 
 type Server struct {
-	store *Store
-	token string
-	mux   *http.ServeMux
+	store   *Store
+	token   string
+	mux     *http.ServeMux
+	metrics serverMetrics
 }
 
 func NewServer(store *Store, token string) *Server {
 	if token == "" {
 		token = "dev-token"
 	}
-	s := &Server{store: store, token: token, mux: http.NewServeMux()}
+	s := &Server{store: store, token: token, mux: http.NewServeMux(), metrics: serverMetrics{Started: time.Now().UTC().Format(time.RFC3339)}}
 	s.routes()
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	s.middleware(s.mux).ServeHTTP(w, r)
 }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	s.mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.store.Ping(r.Context()); err != nil {
+			writeErr(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
+	s.mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		stats, _ := s.store.Stats(r.Context())
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(metricsText(serverMetrics{
+			Requests: atomic.LoadUint64(&s.metrics.Requests),
+			Errors:   atomic.LoadUint64(&s.metrics.Errors),
+			Started:  s.metrics.Started,
+		}, stats)))
+	})
+	s.mux.Handle("POST /api/auth/login", http.HandlerFunc(s.handleLogin))
+	s.mux.Handle("POST /api/auth/logout", s.auth(http.HandlerFunc(s.handleLogout)))
+	s.mux.Handle("GET /api/me", s.auth(http.HandlerFunc(s.handleMe)))
+	s.mux.Handle("POST /api/me/password", s.requireScope("task:read", s.handleChangeOwnPassword))
+	s.mux.Handle("GET /api/users", s.requireScope("admin", s.handleUsers))
+	s.mux.Handle("POST /api/users", s.requireScope("admin", s.handleCreateUser))
+	s.mux.Handle("PATCH /api/users/{id}", s.requireScope("admin", s.handleUpdateUser))
+	s.mux.Handle("POST /api/users/{id}/password", s.requireScope("admin", s.handleResetUserPassword))
+	s.mux.Handle("GET /api/api-keys", s.requireScope("admin", s.handleAPIKeys))
+	s.mux.Handle("POST /api/api-keys", s.requireScope("admin", s.handleCreateAPIKey))
+	s.mux.Handle("DELETE /api/api-keys/{id}", s.requireScope("admin", s.handleRevokeAPIKey))
+	s.mux.Handle("GET /api/projects", s.requireScope("task:read", s.handleProjects))
+	s.mux.Handle("POST /api/projects", s.requireScope("task:write", s.handleCreateProject))
+	s.mux.Handle("GET /api/repositories", s.requireScope("task:read", s.handleRepositories))
+	s.mux.Handle("POST /api/repositories", s.requireScope("task:write", s.handleCreateRepository))
+	s.mux.Handle("GET /api/workspaces", s.requireScope("task:read", s.handleWorkspaces))
+	s.mux.Handle("POST /api/workspaces", s.requireScope("task:write", s.handleCreateWorkspace))
 	s.mux.Handle("POST /api/actors/register", s.auth(http.HandlerFunc(s.handleRegisterActor)))
-	s.mux.Handle("GET /api/actors", s.auth(http.HandlerFunc(s.handleActors)))
-	s.mux.Handle("POST /api/tasks", s.auth(http.HandlerFunc(s.handleCreateTask)))
-	s.mux.Handle("GET /api/tasks", s.auth(http.HandlerFunc(s.handleTasks)))
-	s.mux.Handle("GET /api/tasks/{id}", s.auth(http.HandlerFunc(s.handleTaskDetail)))
-	s.mux.Handle("PATCH /api/tasks/{id}", s.auth(http.HandlerFunc(s.handleUpdateTask)))
-	s.mux.Handle("POST /api/tasks/{id}/claim", s.auth(http.HandlerFunc(s.handleClaimTask)))
-	s.mux.Handle("POST /api/tasks/{id}/release", s.auth(http.HandlerFunc(s.handleReleaseTask)))
-	s.mux.Handle("POST /api/tasks/{id}/heartbeat", s.auth(http.HandlerFunc(s.handleHeartbeatTask)))
-	s.mux.Handle("POST /api/tasks/{id}/complete", s.auth(http.HandlerFunc(s.handleCompleteTask)))
-	s.mux.Handle("POST /api/tasks/{id}/context", s.auth(http.HandlerFunc(s.handleAppendContext)))
-	s.mux.Handle("GET /api/tasks/{id}/context", s.auth(http.HandlerFunc(s.handleContext)))
-	s.mux.Handle("POST /api/tasks/{id}/locks", s.auth(http.HandlerFunc(s.handleAcquireLock)))
-	s.mux.Handle("GET /api/tasks/{id}/locks", s.auth(http.HandlerFunc(s.handleLocks)))
-	s.mux.Handle("POST /api/locks/{id}/release", s.auth(http.HandlerFunc(s.handleReleaseLock)))
-	s.mux.Handle("POST /api/locks/{id}/renew", s.auth(http.HandlerFunc(s.handleRenewLock)))
-	s.mux.Handle("POST /api/tasks/{id}/handoff", s.auth(http.HandlerFunc(s.handlePrepareHandoff)))
-	s.mux.Handle("POST /api/handoffs/{id}/accept", s.auth(http.HandlerFunc(s.handleAcceptHandoff)))
-	s.mux.Handle("POST /api/handoffs/{id}/reject", s.auth(http.HandlerFunc(s.handleRejectHandoff)))
-	s.mux.Handle("GET /api/handoffs", s.auth(http.HandlerFunc(s.handleHandoffs)))
-	s.mux.Handle("GET /api/events", s.auth(http.HandlerFunc(s.handleEvents)))
+	s.mux.Handle("GET /api/actors", s.requireScope("task:read", s.handleActors))
+	s.mux.Handle("POST /api/tasks", s.requireScope("task:write", s.handleCreateTask))
+	s.mux.Handle("GET /api/tasks", s.requireScope("task:read", s.handleTasks))
+	s.mux.Handle("GET /api/tasks/{id}", s.requireScope("task:read", s.handleTaskDetail))
+	s.mux.Handle("PATCH /api/tasks/{id}", s.requireScope("task:write", s.handleUpdateTask))
+	s.mux.Handle("POST /api/tasks/{id}/subtasks", s.requireScope("task:write", s.handleCreateSubtask))
+	s.mux.Handle("POST /api/tasks/{id}/dependencies", s.requireScope("task:write", s.handleAddDependency))
+	s.mux.Handle("POST /api/tasks/{id}/claim", s.requireScope("task:write", s.handleClaimTask))
+	s.mux.Handle("POST /api/tasks/{id}/release", s.requireScope("task:write", s.handleReleaseTask))
+	s.mux.Handle("POST /api/tasks/{id}/heartbeat", s.requireScope("task:write", s.handleHeartbeatTask))
+	s.mux.Handle("POST /api/tasks/{id}/complete", s.requireScope("task:write", s.handleCompleteTask))
+	s.mux.Handle("POST /api/tasks/{id}/context", s.requireScope("context:write", s.handleAppendContext))
+	s.mux.Handle("GET /api/tasks/{id}/context", s.requireScope("task:read", s.handleContext))
+	s.mux.Handle("POST /api/tasks/{id}/decisions", s.requireScope("context:write", s.handleAddDecision))
+	s.mux.Handle("GET /api/tasks/{id}/decisions", s.requireScope("task:read", s.handleDecisions))
+	s.mux.Handle("POST /api/tasks/{id}/comments", s.requireScope("context:write", s.handleAddComment))
+	s.mux.Handle("GET /api/tasks/{id}/comments", s.requireScope("task:read", s.handleComments))
+	s.mux.Handle("POST /api/tasks/{id}/artifacts", s.requireScope("context:write", s.handleAddArtifact))
+	s.mux.Handle("GET /api/tasks/{id}/artifacts", s.requireScope("task:read", s.handleArtifacts))
+	s.mux.Handle("POST /api/tasks/{id}/git", s.requireScope("context:write", s.handleAddGitRef))
+	s.mux.Handle("GET /api/tasks/{id}/git", s.requireScope("task:read", s.handleGitRefs))
+	s.mux.Handle("POST /api/tasks/{id}/locks", s.requireScope("lock:write", s.handleAcquireLock))
+	s.mux.Handle("GET /api/tasks/{id}/locks", s.requireScope("task:read", s.handleLocks))
+	s.mux.Handle("POST /api/locks/{id}/release", s.requireScope("lock:write", s.handleReleaseLock))
+	s.mux.Handle("POST /api/locks/{id}/renew", s.requireScope("lock:write", s.handleRenewLock))
+	s.mux.Handle("POST /api/tasks/{id}/handoff", s.requireScope("handoff:write", s.handlePrepareHandoff))
+	s.mux.Handle("POST /api/handoffs/{id}/accept", s.requireScope("handoff:write", s.handleAcceptHandoff))
+	s.mux.Handle("POST /api/handoffs/{id}/reject", s.requireScope("handoff:write", s.handleRejectHandoff))
+	s.mux.Handle("DELETE /api/dependencies/{id}", s.requireScope("task:write", s.handleRemoveDependency))
+	s.mux.Handle("GET /api/conflicts", s.requireScope("task:read", s.handleConflicts))
+	s.mux.Handle("POST /api/conflicts/{id}/resolve", s.requireScope("task:write", s.handleResolveConflict))
+	s.mux.Handle("GET /api/handoffs", s.requireScope("task:read", s.handleHandoffs))
+	s.mux.Handle("GET /api/events", s.requireScope("task:read", s.handleEvents))
+	s.mux.Handle("GET /api/events/stream", s.requireScope("task:read", s.handleEventsStream))
 	s.mux.Handle("/", s.dashboard())
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p, ok := s.authPrincipal(r); ok {
+			ctx := context.WithValue(r.Context(), actorKey{}, p.ActorID)
+			ctx = context.WithValue(ctx, principalKey{}, p)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if got != s.token {
 			writeErr(w, http.StatusUnauthorized, userErr("unauthorized", "invalid or missing team token"))
@@ -87,15 +145,68 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 			s.store.TouchActor(r.Context(), actorID)
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey{}, actorID)))
+		p := Principal{ID: actorID, Kind: "legacy_actor", Role: "agent", ActorID: actorID, Scopes: []string{"admin"}}
+		ctx := context.WithValue(r.Context(), actorKey{}, actorID)
+		ctx = context.WithValue(ctx, principalKey{}, p)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 type actorKey struct{}
+type principalKey struct{}
 
 func actorID(r *http.Request) string {
 	v, _ := r.Context().Value(actorKey{}).(string)
 	return v
+}
+
+func principal(r *http.Request) Principal {
+	v, _ := r.Context().Value(principalKey{}).(Principal)
+	return v
+}
+
+func (s *Server) authPrincipal(r *http.Request) (Principal, bool) {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "ApiKey ") {
+		p, err := s.store.VerifyAPIKey(r.Context(), strings.TrimPrefix(auth, "ApiKey "))
+		return p, err == nil
+	}
+	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
+		p, err := s.store.VerifySession(r.Context(), cookie.Value)
+		return p, err == nil
+	}
+	return Principal{}, false
+}
+
+func (s *Server) requireScope(required string, next http.HandlerFunc) http.Handler {
+	return s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := principal(r)
+		if p.Kind == "api_key" {
+			need := "read"
+			if required == "admin" {
+				need = "admin"
+			} else if required != "task:read" {
+				need = "write"
+			}
+			if !hasScope(p.Scopes, required) || !roleAllows(p.Role, need) {
+				writeErr(w, http.StatusForbidden, userErr("forbidden", "api key role or scope does not allow this action"))
+				return
+			}
+		}
+		if p.Kind == "user" {
+			need := "read"
+			if required == "admin" {
+				need = "admin"
+			} else if required != "task:read" {
+				need = "write"
+			}
+			if !roleAllows(p.Role, need) {
+				writeErr(w, http.StatusForbidden, userErr("forbidden", "role does not allow this action"))
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Server) dashboard() http.Handler {
@@ -106,8 +217,193 @@ func (s *Server) dashboard() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store")
 		files.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	u, err := s.store.AuthenticateUser(r.Context(), in.Email, in.Password)
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
+	token, err := s.store.CreateSession(r.Context(), u.ID)
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "taskpilot_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Now().Add(sessionTTL),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"user": u})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
+		_ = s.store.RevokeSession(r.Context(), cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: "taskpilot_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, principal(r))
+}
+
+func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	if p.Kind != "user" || p.UserID == "" {
+		writeErr(w, http.StatusForbidden, userErr("forbidden", "only human sessions can change passwords"))
+		return
+	}
+	var in struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	err := s.store.ChangeUserPassword(r.Context(), actorID(r), p.UserID, in.CurrentPassword, in.NewPassword, true)
+	writeResult(w, map[string]string{"status": "ok"}, err)
+}
+
+func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListUsers(r.Context())
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email    string `json:"email"`
+		Name     string `json:"name"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	u, err := s.store.CreateUser(r.Context(), in.Email, in.Name, in.Password, in.Role)
+	if err == nil {
+		err = s.store.addEvent(r.Context(), "", actorID(r), "user.invited", map[string]any{"id": u.ID, "email": u.Email, "role": u.Role})
+	}
+	writeResult(w, u, err)
+}
+
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name   string `json:"name"`
+		Role   string `json:"role"`
+		Active *bool  `json:"active"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.UpdateUser(r.Context(), actorID(r), r.PathValue("id"), in.Name, in.Role, in.Active)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		NewPassword string `json:"new_password"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	err := s.store.ChangeUserPassword(r.Context(), actorID(r), r.PathValue("id"), "", in.NewPassword, false)
+	writeResult(w, map[string]string{"status": "ok"}, err)
+}
+
+func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListAPIKeys(r.Context())
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name    string   `json:"name"`
+		ActorID string   `json:"actor_id"`
+		Role    string   `json:"role"`
+		Scopes  []string `json:"scopes"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	key, err := s.store.CreateAPIKey(r.Context(), in.Name, in.ActorID, in.Role, in.Scopes, actorID(r))
+	writeResult(w, key, err)
+}
+
+func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	err := s.store.RevokeAPIKey(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, map[string]string{"status": "ok"}, err)
+}
+
+func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListProjects(r.Context())
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.CreateProject(r.Context(), actorID(r), in.Name, in.Description)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListRepositories(r.Context(), r.URL.Query().Get("project_id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProjectID     string `json:"project_id"`
+		Name          string `json:"name"`
+		Path          string `json:"path"`
+		DefaultBranch string `json:"default_branch"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.CreateRepository(r.Context(), actorID(r), in.ProjectID, in.Name, in.Path, in.DefaultBranch)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListWorkspaces(r.Context(), r.URL.Query().Get("project_id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProjectID   string `json:"project_id"`
+		ActorID     string `json:"actor_id"`
+		Name        string `json:"name"`
+		MachineName string `json:"machine_name"`
+		Kind        string `json:"kind"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.CreateWorkspace(r.Context(), actorID(r), in.ProjectID, in.ActorID, in.Name, in.MachineName, in.Kind)
+	writeResult(w, out, err)
 }
 
 func (s *Server) handleRegisterActor(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +434,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.ListTasks(r.Context())
+	out, err := s.store.ListTasks(r.Context(), r.URL.Query().Get("project_id"))
 	writeResult(w, out, err)
 }
 
@@ -157,6 +453,46 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.store.UpdateTask(r.Context(), actorID(r), r.PathValue("id"), in.TaskInput, in.Reason)
 	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateSubtask(w http.ResponseWriter, r *http.Request) {
+	parent, err := s.store.GetTask(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
+	var in TaskInput
+	if !decode(w, r, &in) {
+		return
+	}
+	in.ParentTaskID = parent.ID
+	if in.ProjectID == "" {
+		in.ProjectID = parent.ProjectID
+	}
+	if in.RepoID == "" {
+		in.RepoID = parent.RepoID
+	}
+	if in.WorkspaceID == "" {
+		in.WorkspaceID = parent.WorkspaceID
+	}
+	out, err := s.store.CreateTask(r.Context(), actorID(r), in)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleAddDependency(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		DependsOnID string `json:"depends_on_id"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.AddTaskDependency(r.Context(), actorID(r), r.PathValue("id"), in.DependsOnID)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleRemoveDependency(w http.ResponseWriter, r *http.Request) {
+	err := s.store.RemoveTaskDependency(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, map[string]string{"status": "ok"}, err)
 }
 
 func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
@@ -205,6 +541,81 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	writeResult(w, out, err)
 }
 
+func (s *Server) handleAddDecision(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Decision     string   `json:"decision"`
+		Alternatives []string `json:"alternatives"`
+		Reason       string   `json:"reason"`
+		Impact       string   `json:"impact"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.AddDecision(r.Context(), actorID(r), r.PathValue("id"), in.Decision, in.Alternatives, in.Reason, in.Impact)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListDecisions(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleAddComment(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Body string `json:"body"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.AddComment(r.Context(), actorID(r), r.PathValue("id"), in.Body)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleComments(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListComments(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleAddArtifact(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Kind        string         `json:"kind"`
+		Title       string         `json:"title"`
+		URI         string         `json:"uri"`
+		Description string         `json:"description"`
+		Metadata    map[string]any `json:"metadata"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.AddArtifact(r.Context(), actorID(r), r.PathValue("id"), in.Kind, in.Title, in.URI, in.Description, in.Metadata)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListArtifacts(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleAddGitRef(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Branch       string   `json:"branch"`
+		CommitSHA    string   `json:"commit_sha"`
+		PRURL        string   `json:"pr_url"`
+		ChangedFiles []string `json:"changed_files"`
+		Note         string   `json:"note"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.AddGitRef(r.Context(), actorID(r), r.PathValue("id"), in.Branch, in.CommitSHA, in.PRURL, in.ChangedFiles, in.Note)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleGitRefs(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListGitRefs(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
 func (s *Server) handleAcquireLock(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Scope     string `json:"scope"`
@@ -229,6 +640,25 @@ func (s *Server) handleLocks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReleaseLock(w http.ResponseWriter, r *http.Request) {
 	out, err := s.store.ReleaseLock(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleConflicts(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	out, err := s.store.ListConflicts(r.Context(), status)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Resolution    string `json:"resolution"`
+		Note          string `json:"note"`
+		TargetActorID string `json:"target_actor_id"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.ResolveConflict(r.Context(), actorID(r), r.PathValue("id"), in.Resolution, in.Note, in.TargetActorID)
 	writeResult(w, out, err)
 }
 
@@ -269,6 +699,58 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
 	out, err := s.store.ListEvents(r.Context(), since, "")
 	writeResult(w, out, err)
+}
+
+func (s *Server) handleEventsStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+		return
+	}
+	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, ": taskpilot stream connected\n\n")
+	flusher.Flush()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	send := func() bool {
+		events, err := s.store.ListEvents(r.Context(), since, "")
+		if err != nil {
+			_, _ = fmt.Fprintf(w, "event: error\ndata: %q\n\n", err.Error())
+			flusher.Flush()
+			return false
+		}
+		for _, event := range events {
+			data, _ := json.Marshal(event)
+			_, _ = fmt.Fprintf(w, "id: %d\nevent: taskpilot.event\ndata: %s\n\n", event.ID, data)
+			if event.ID > since {
+				since = event.ID
+			}
+		}
+		flusher.Flush()
+		return true
+	}
+	_ = send()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		case <-heartbeat.C:
+			_, _ = fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))
+			flusher.Flush()
+		}
+	}
 }
 
 func decode(w http.ResponseWriter, r *http.Request, out any) bool {
@@ -320,18 +802,62 @@ func writeJSON(w http.ResponseWriter, status int, out any) {
 }
 
 func ListenAndServe(addr, dbPath, token string) error {
-	if token == "" || token == "dev-token" {
-		host, _, _ := net.SplitHostPort(addr)
-		if host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
-			return userErr("validation", "refusing to expose server with default token; set TASKPILOT_TOKEN or pass --token with a strong value")
-		}
+	cfg := LoadServerConfig(addr, dbPath, token, false)
+	return ListenAndServeConfig(cfg)
+}
+
+func ListenAndServeConfig(cfg ServerConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
-	store, err := OpenStore(dbPath)
+	store, err := openStoreWithRetry(cfg)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	fmt.Printf("TaskPilot server listening on http://%s\n", addr)
-	fmt.Printf("Team token: %s\n", token)
-	return http.ListenAndServe(addr, NewServer(store, token))
+	server := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           NewServer(store, cfg.Token),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ListenAndServe()
+	}()
+	fmt.Printf("TaskPilot server listening on %s\n", cfg.EffectiveBaseURL())
+	fmt.Printf("Team token: %s\n", cfg.Token)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	select {
+	case sig := <-stop:
+		fmt.Printf("TaskPilot shutting down after %s\n", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return server.Shutdown(ctx)
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+func openStoreWithRetry(cfg ServerConfig) (*Store, error) {
+	attempts := 1
+	if cfg.Production || dbDialect(cfg.DBPath) == "postgres" {
+		attempts = 20
+	}
+	var last error
+	for i := 1; i <= attempts; i++ {
+		store, err := OpenStore(cfg.DBPath)
+		if err == nil {
+			return store, nil
+		}
+		last = err
+		if i < attempts {
+			fmt.Printf("Waiting for database (%d/%d): %v\n", i, attempts, err)
+			time.Sleep(2 * time.Second)
+		}
+	}
+	return nil, last
 }

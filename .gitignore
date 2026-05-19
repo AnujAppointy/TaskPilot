@@ -1,5 +1,8 @@
 .gocache/
 .gomodcache/
+.env
+.env.*
+!.env.example
 /taskpilot
 taskpilot.db
 *.db-shm

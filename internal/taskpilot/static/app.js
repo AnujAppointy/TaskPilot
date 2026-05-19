@@ -1,23 +1,51 @@
 const apiState = {
   token: loadSetting("taskpilot.token", "dev-token"),
+  apiKey: loadSetting("taskpilot.apiKey", ""),
+  legacyEnabled: loadSetting("taskpilot.legacyEnabled", "") === "true",
   actor: loadSetting("taskpilot.actor", ""),
   actorSecret: loadSetting("taskpilot.actorSecret", ""),
+  principal: null,
   tab: "board",
   selected: null,
   tasks: [],
   actors: [],
+  projects: [],
+  repositories: [],
+  workspaces: [],
+  selectedProject: loadSetting("taskpilot.project", ""),
+  filters: {
+    search: "",
+    owner: "",
+    status: "",
+    repo: "",
+    priority: "",
+    blocked: "",
+    stale: "",
+  },
+  users: [],
+  apiKeys: [],
   handoffs: [],
+  conflicts: [],
   events: [],
   detail: null,
   error: "",
+  authChecked: false,
+  streamActive: false,
+  streamController: null,
+  streamRetry: null,
+  refreshTimer: null,
+  lastEventID: 0,
 };
 
 const statuses = ["ready", "claimed", "in_progress", "blocked", "handoff_ready", "in_review", "completed"];
+const writeRoles = ["admin", "maintainer", "developer", "agent"];
 
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (k === "class") el.className = v;
+    else if (k === "checked") el.checked = !!v;
+    else if (k === "selected") el.selected = !!v;
     else if (k.startsWith("on")) el.addEventListener(k.slice(2).toLowerCase(), v);
     else if (v !== undefined && v !== null) el.setAttribute(k, v);
   }
@@ -38,21 +66,43 @@ function loadSetting(key, fallback) {
 
 function saveSetting(key, value) {
   try {
-    localStorage.setItem(key, value);
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
   } catch {
-    // The dashboard still works for the current tab if browser storage is blocked.
+    // The current tab can still use in-memory state if storage is blocked.
   }
 }
 
 function clearActorSettings() {
   apiState.actor = "";
   apiState.actorSecret = "";
-  try {
-    localStorage.removeItem("taskpilot.actor");
-    localStorage.removeItem("taskpilot.actorSecret");
-  } catch {
-    // Ignore blocked storage.
+  saveSetting("taskpilot.actor", "");
+  saveSetting("taskpilot.actorSecret", "");
+}
+
+function setLegacyEnabled(value) {
+  apiState.legacyEnabled = value;
+  saveSetting("taskpilot.legacyEnabled", value ? "true" : "");
+}
+
+function isAdmin() {
+  return apiState.principal && apiState.principal.role === "admin";
+}
+
+function canWrite() {
+  return apiState.principal && writeRoles.includes(apiState.principal.role);
+}
+
+function authHeaders(includeActor = true) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiState.apiKey) {
+    headers.Authorization = `ApiKey ${apiState.apiKey}`;
+  } else if (apiState.legacyEnabled && apiState.token) {
+    headers.Authorization = `Bearer ${apiState.token}`;
+    if (includeActor && apiState.actor) headers["X-Actor-ID"] = apiState.actor;
+    if (includeActor && apiState.actorSecret) headers["X-Actor-Secret"] = apiState.actorSecret;
   }
+  return headers;
 }
 
 async function api(path, options = {}) {
@@ -64,16 +114,10 @@ async function apiNoActor(path, options = {}) {
 }
 
 async function apiRequest(path, options = {}, includeActor = true) {
-  const headers = {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${apiState.token}`,
-    ...(options.headers || {}),
-  };
-  if (includeActor && apiState.actor) headers["X-Actor-ID"] = apiState.actor;
-  if (includeActor && apiState.actorSecret) headers["X-Actor-Secret"] = apiState.actorSecret;
   const res = await fetch(path, {
+    credentials: "same-origin",
     ...options,
-    headers,
+    headers: { ...authHeaders(includeActor), ...(options.headers || {}) },
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -84,28 +128,156 @@ async function apiRequest(path, options = {}, includeActor = true) {
   return data;
 }
 
+async function loadMe() {
+  try {
+    apiState.principal = await api("/api/me");
+    apiState.authChecked = true;
+    return true;
+  } catch (err) {
+    if (!apiState.apiKey && apiState.legacyEnabled && apiState.token && err.status === 401) {
+      try {
+        await ensureLegacyActor();
+        apiState.principal = await api("/api/me");
+        apiState.authChecked = true;
+        return true;
+      } catch {
+        clearActorSettings();
+      }
+    }
+    apiState.principal = null;
+    apiState.authChecked = true;
+    return false;
+  }
+}
+
 async function refresh() {
   try {
     apiState.error = "";
-    await ensureActor();
-    const [tasks, actors, handoffs, events] = await Promise.all([
-      api("/api/tasks"),
+    const authed = await loadMe();
+    if (!authed) {
+      render();
+      return;
+    }
+    if (apiState.principal.kind === "legacy_actor") await ensureLegacyActor();
+    const calls = [
+      apiState.selectedProject ? api(`/api/tasks?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/tasks"),
       api("/api/actors"),
+      api("/api/projects"),
+      apiState.selectedProject ? api(`/api/repositories?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/repositories"),
+      apiState.selectedProject ? api(`/api/workspaces?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/workspaces"),
       api("/api/handoffs"),
+      api("/api/conflicts?status=open"),
       api("/api/events"),
-    ]);
+    ];
+    if (isAdmin()) {
+      calls.push(api("/api/users"));
+      calls.push(api("/api/api-keys"));
+    }
+    const [tasks, actors, projects, repositories, workspaces, handoffs, conflicts, events, users = [], apiKeys = []] = await Promise.all(calls);
     apiState.tasks = Array.isArray(tasks) ? tasks : [];
     apiState.actors = Array.isArray(actors) ? actors : [];
+    apiState.projects = Array.isArray(projects) ? projects : [];
+    apiState.repositories = Array.isArray(repositories) ? repositories : [];
+    apiState.workspaces = Array.isArray(workspaces) ? workspaces : [];
+    if (!apiState.selectedProject && apiState.projects.length) {
+      apiState.selectedProject = "project_default";
+      saveSetting("taskpilot.project", apiState.selectedProject);
+    }
     apiState.handoffs = Array.isArray(handoffs) ? handoffs : [];
+    apiState.conflicts = Array.isArray(conflicts) ? conflicts : [];
     apiState.events = Array.isArray(events) ? events : [];
+    apiState.lastEventID = apiState.events.reduce((max, e) => Math.max(max, e.id || 0), apiState.lastEventID || 0);
+    apiState.users = Array.isArray(users) ? users : [];
+    apiState.apiKeys = Array.isArray(apiKeys) ? apiKeys : [];
     if (apiState.selected) apiState.detail = await api(`/api/tasks/${apiState.selected}`);
+    ensureEventStream();
   } catch (err) {
     apiState.error = err.message;
+    stopEventStream();
   }
   render();
 }
 
-async function ensureActor() {
+function scheduleRefresh(delay = 200) {
+  if (apiState.refreshTimer) return;
+  apiState.refreshTimer = setTimeout(async () => {
+    apiState.refreshTimer = null;
+    await refresh();
+  }, delay);
+}
+
+function stopEventStream() {
+  if (apiState.streamController) {
+    apiState.streamController.abort();
+  }
+  apiState.streamController = null;
+  apiState.streamActive = false;
+  if (apiState.streamRetry) {
+    clearTimeout(apiState.streamRetry);
+    apiState.streamRetry = null;
+  }
+}
+
+function ensureEventStream() {
+  if (!apiState.principal || apiState.streamActive) return;
+  apiState.streamActive = true;
+  const controller = new AbortController();
+  apiState.streamController = controller;
+  const since = apiState.lastEventID || 0;
+  fetch(`/api/events/stream?since=${encodeURIComponent(since)}`, {
+    credentials: "same-origin",
+    headers: authHeaders(true),
+    signal: controller.signal,
+  }).then(async res => {
+    if (!res.ok || !res.body) throw new Error(`event stream failed: ${res.status}`);
+    await readEventStream(res.body);
+  }).catch(() => {
+    if (controller.signal.aborted) return;
+  }).finally(() => {
+    if (apiState.streamController === controller) {
+      apiState.streamController = null;
+      apiState.streamActive = false;
+      if (apiState.principal) {
+        apiState.streamRetry = setTimeout(() => {
+          apiState.streamRetry = null;
+          ensureEventStream();
+        }, 5000);
+      }
+    }
+  });
+}
+
+async function readEventStream(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+    for (const part of parts) {
+      handleStreamFrame(part);
+    }
+  }
+}
+
+function handleStreamFrame(frame) {
+  const lines = frame.split("\n");
+  let id = 0;
+  const dataLines = [];
+  for (const line of lines) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("id:")) id = Number(line.slice(3).trim()) || 0;
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  if (!dataLines.length) return;
+  if (id > apiState.lastEventID) apiState.lastEventID = id;
+  scheduleRefresh(150);
+}
+
+async function ensureLegacyActor() {
   if (apiState.actor && apiState.actorSecret) {
     try {
       await api("/api/actors");
@@ -127,16 +299,108 @@ async function ensureActor() {
 
 function actorName(id) {
   const actor = apiState.actors.find(a => a.id === id);
-  return (actor && actor.name) || id || "Unowned";
+  if (actor) return actor.name;
+  const user = apiState.users.find(u => u.id === id);
+  if (user) return user.name || user.email;
+  return id || "Unowned";
+}
+
+function projectName(id) {
+  const project = apiState.projects.find(p => p.id === id);
+  return (project && project.name) || id || "Default";
+}
+
+function repoName(id) {
+  const repo = apiState.repositories.find(r => r.id === id);
+  return (repo && repo.name) || id || "None";
+}
+
+function workspaceName(id) {
+  const workspace = apiState.workspaces.find(w => w.id === id);
+  return (workspace && workspace.name) || id || "None";
+}
+
+function projectFilter() {
+  const select = h("select", {}, [
+    h("option", { value: "", selected: apiState.selectedProject === "" }, "All projects"),
+    ...apiState.projects.map(p => h("option", { value: p.id, selected: apiState.selectedProject === p.id }, p.name)),
+  ]);
+  return h("div", { class: "toolbar" },
+    h("label", {}, "Project"),
+    select,
+    h("button", { onclick: async () => {
+      apiState.selectedProject = select.value;
+      saveSetting("taskpilot.project", select.value);
+      await refresh();
+    }}, "Apply")
+  );
+}
+
+function taskFilters() {
+  const f = apiState.filters;
+  const search = h("input", { placeholder: "Search title, goal, context, decisions", value: f.search });
+  const owner = h("select", {}, [h("option", { value: "" }, "Any owner")].concat(apiState.actors.map(a => h("option", { value: a.id, selected: f.owner === a.id }, a.name))));
+  const status = h("select", {}, [h("option", { value: "" }, "Any status")].concat(statuses.map(s => h("option", { value: s, selected: f.status === s }, s))));
+  const repo = h("select", {}, [h("option", { value: "" }, "Any repo")].concat(apiState.repositories.map(r => h("option", { value: r.id, selected: f.repo === r.id }, r.name))));
+  const priority = h("select", {}, [h("option", { value: "" }, "Any priority")].concat(["low","normal","high","urgent"].map(p => h("option", { value: p, selected: f.priority === p }, p))));
+  const blocked = h("select", {}, [
+    h("option", { value: "", selected: f.blocked === "" }, "Any blocked state"),
+    h("option", { value: "blocked", selected: f.blocked === "blocked" }, "Blocked only"),
+    h("option", { value: "not_blocked", selected: f.blocked === "not_blocked" }, "Not blocked"),
+  ]);
+  const stale = h("select", {}, [
+    h("option", { value: "", selected: f.stale === "" }, "Any stale state"),
+    h("option", { value: "stale", selected: f.stale === "stale" }, "Stale only"),
+    h("option", { value: "fresh", selected: f.stale === "fresh" }, "Fresh only"),
+  ]);
+  const apply = async () => {
+    apiState.filters = { search: search.value, owner: owner.value, status: status.value, repo: repo.value, priority: priority.value, blocked: blocked.value, stale: stale.value };
+    render();
+  };
+  for (const el of [search, owner, status, repo, priority, blocked, stale]) {
+    el.addEventListener("change", apply);
+  }
+  search.addEventListener("input", () => {
+    apiState.filters.search = search.value;
+    render();
+  });
+  return h("div", { class: "toolbar filters" },
+    h("label", {}, "Filters"),
+    search, owner, status, repo, priority, blocked, stale,
+    h("button", { onclick: () => { apiState.filters = { search: "", owner: "", status: "", repo: "", priority: "", blocked: "", stale: "" }; render(); } }, "Clear")
+  );
+}
+
+function filteredTasks() {
+  const f = apiState.filters;
+  const q = (f.search || "").trim().toLowerCase();
+  return apiState.tasks.filter(t => {
+    if (f.owner && t.owner_id !== f.owner) return false;
+    if (f.status && t.status !== f.status) return false;
+    if (f.repo && t.repo_id !== f.repo) return false;
+    if (f.priority && t.priority !== f.priority) return false;
+    const isBlocked = t.status === "blocked" || (Array.isArray(t.blockers) && t.blockers.length > 0) || (t.open_dependency_count || 0) > 0;
+    if (f.blocked === "blocked" && !isBlocked) return false;
+    if (f.blocked === "not_blocked" && isBlocked) return false;
+    const isStale = t.claim_expires_at && new Date(t.claim_expires_at) < new Date();
+    if (f.stale === "stale" && !isStale) return false;
+    if (f.stale === "fresh" && isStale) return false;
+    if (q) {
+      const haystack = [t.title, t.goal, t.search_text, ...(t.blockers || [])].join(" ").toLowerCase();
+      if (!haystack.includes(q)) return false;
+    }
+    return true;
+  });
 }
 
 function stats() {
+  const tasks = filteredTasks();
   return h("div", { class: "stats" },
-    stat("Active", apiState.tasks.filter(t => !["completed", "cancelled"].includes(t.status)).length),
-    stat("Blocked", apiState.tasks.filter(t => t.status === "blocked" || (t.blockers || []).length).length),
-    stat("Conflicts", apiState.tasks.reduce((n, t) => n + (t.potential_conflict_count || 0), 0)),
+    stat("Active", tasks.filter(t => !["completed", "cancelled"].includes(t.status)).length),
+    stat("Blocked", tasks.filter(t => t.status === "blocked" || (t.blockers || []).length).length),
+    stat("Conflicts", apiState.conflicts.length || tasks.reduce((n, t) => n + (t.potential_conflict_count || 0), 0)),
     stat("Handoffs", apiState.handoffs.filter(h => h.status === "prepared").length),
-    stat("Completed", apiState.tasks.filter(t => t.status === "completed").length),
+    stat("Completed", tasks.filter(t => t.status === "completed").length),
   );
 }
 
@@ -145,12 +409,15 @@ function stat(label, value) {
 }
 
 function board() {
+  const tasks = filteredTasks();
   return h("div", {},
+    projectFilter(),
+    taskFilters(),
     stats(),
     h("div", { class: "board" }, statuses.map(status =>
       h("div", { class: "column" },
         h("h3", {}, status.split("_").join(" ")),
-        apiState.tasks.filter(t => t.status === status).map(taskCard)
+        tasks.filter(t => t.status === status).map(taskCard)
       )
     ))
   );
@@ -161,9 +428,13 @@ function taskCard(t) {
     h("div", { class: "card-title" }, t.title),
     h("div", { class: "meta" },
       h("span", {}, `Owner: ${actorName(t.owner_id)}`),
+      h("span", {}, `Project: ${projectName(t.project_id)}`),
+      t.repo_id ? h("span", {}, `Repo: ${repoName(t.repo_id)}`) : null,
       h("span", {}, `Priority: ${t.priority}`),
       h("span", {}, `Updated: ${new Date(t.updated_at).toLocaleString()}`),
       h("span", { class: "pill" }, `${t.active_lock_count || 0} locks`),
+      (t.subtask_count || 0) > 0 ? h("span", { class: "pill" }, `${t.subtask_count} subtasks`) : null,
+      (t.open_dependency_count || 0) > 0 ? h("span", { class: "pill amber" }, `${t.open_dependency_count} blockers`) : null,
       (t.potential_conflict_count || 0) > 0 ? h("span", { class: "pill red" }, "conflict") : null,
       (t.blockers || []).length ? h("span", { class: "pill amber" }, "blocked") : null,
     )
@@ -178,19 +449,28 @@ async function selectTask(id) {
 }
 
 function createTaskForm() {
+  if (!canWrite()) return null;
   const title = h("input", { placeholder: "Title" });
   const goal = h("textarea", { placeholder: "Goal" });
   const scope = h("input", { placeholder: "Scope, comma separated" });
+  const project = h("select", {}, apiState.projects.map(p => h("option", { value: p.id, selected: (apiState.selectedProject || "project_default") === p.id }, p.name)));
+  const repo = h("select", {}, [h("option", { value: "" }, "No repo")].concat(apiState.repositories.map(r => h("option", { value: r.id }, r.name))));
+  const workspace = h("select", {}, [h("option", { value: "" }, "No workspace")].concat(apiState.workspaces.map(w => h("option", { value: w.id }, w.name))));
+  const parent = h("select", {}, [h("option", { value: "" }, "No parent task")].concat(apiState.tasks.map(t => h("option", { value: t.id }, `${t.title} · ${t.status}`))));
   const type = h("select", {}, ["planning","research","implementation","review","debugging","documentation","other"].map(v => h("option", { value: v }, v)));
   const priority = h("select", {}, ["normal","low","high","urgent"].map(v => h("option", { value: v }, v)));
   return h("div", { class: "panel" },
     h("h2", {}, "Create Task"),
     h("div", { class: "form" },
       title, goal,
+      project,
+      h("div", { class: "row" }, repo, workspace),
       h("div", { class: "row" }, type, priority),
+      parent,
       scope,
       h("button", { class: "primary", onclick: async () => {
         await api("/api/tasks", { method: "POST", body: JSON.stringify({
+          project_id: project.value, repo_id: repo.value, workspace_id: workspace.value, parent_task_id: parent.value,
           title: title.value, goal: goal.value, type: type.value, priority: priority.value,
           scope: scope.value.split(",").map(s => s.trim()).filter(Boolean),
         })});
@@ -205,9 +485,17 @@ function detailView() {
   if (!apiState.detail) return h("div", { class: "panel" }, "Select a task.");
   const { task } = apiState.detail;
   const context = Array.isArray(apiState.detail.context) ? apiState.detail.context : [];
+  const decisions = Array.isArray(apiState.detail.decisions) ? apiState.detail.decisions : [];
+  const comments = Array.isArray(apiState.detail.comments) ? apiState.detail.comments : [];
+  const artifacts = Array.isArray(apiState.detail.artifacts) ? apiState.detail.artifacts : [];
+  const gitRefs = Array.isArray(apiState.detail.git_refs) ? apiState.detail.git_refs : [];
   const locks = Array.isArray(apiState.detail.locks) ? apiState.detail.locks : [];
   const handoffs = Array.isArray(apiState.detail.handoffs) ? apiState.detail.handoffs : [];
   const events = Array.isArray(apiState.detail.events) ? apiState.detail.events : [];
+  const subtasks = Array.isArray(apiState.detail.subtasks) ? apiState.detail.subtasks : [];
+  const dependencies = Array.isArray(apiState.detail.dependencies) ? apiState.detail.dependencies : [];
+  const dependents = Array.isArray(apiState.detail.dependents) ? apiState.detail.dependents : [];
+  const parent = apiState.detail.parent;
   return h("div", { class: "grid2" },
     h("div", {}, createTaskForm(), h("br"), actionsPanel(task)),
     h("div", { class: "panel detail" },
@@ -216,8 +504,19 @@ function detailView() {
         h("span", {}, `Goal: ${task.goal}`),
         h("span", {}, `Status: ${task.status}`),
         h("span", {}, `Owner: ${actorName(task.owner_id)}`),
+        h("span", {}, `Project: ${projectName(task.project_id)}`),
+        h("span", {}, `Repo: ${repoName(task.repo_id)}`),
+        h("span", {}, `Workspace: ${workspaceName(task.workspace_id)}`),
+        parent ? h("span", { class: "linkish", onclick: () => selectTask(parent.id) }, `Parent: ${parent.title}`) : null,
         h("span", {}, `Scope: ${(task.scope || []).join(", ") || "none"}`)
       ),
+      section("Subtasks", subtasks.map(subtaskItem)),
+      section("Blocked By", dependencies.map(dependencyItem)),
+      section("Blocking", dependents.map(dependentItem)),
+      section("Decisions", decisions.map(decisionItem)),
+      section("Comments", comments.map(commentItem)),
+      section("Artifacts", artifacts.map(artifactItem)),
+      section("Git", gitRefs.map(gitItem)),
       section("Context", context.map(c => h("div", { class: "item" }, h("strong", {}, c.kind), h("p", {}, c.content), h("small", {}, actorName(c.author_id))))),
       section("Locks", locks.map(l => h("div", { class: "item" }, `${l.scope_type}: ${l.scope} · owner ${actorName(l.owner_id)} · expires ${new Date(l.expires_at).toLocaleString()}`))),
       section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`)))),
@@ -230,21 +529,148 @@ function section(title, content) {
   return h("div", { class: "section" }, h("h3", {}, title), Array.isArray(content) && !content.length ? h("p", { class: "meta" }, "Nothing yet.") : content);
 }
 
+function subtaskItem(t) {
+  return h("div", { class: "item clickable", onclick: () => selectTask(t.id) },
+    h("strong", {}, t.title),
+    h("p", { class: "meta" }, `${t.status} · ${t.priority} · ${t.id}`)
+  );
+}
+
+function dependencyItem(dep) {
+  const t = dep.depends_on_task || {};
+  const titleAttrs = t.id ? { class: "linkish", onclick: () => selectTask(t.id) } : {};
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", titleAttrs, t.title || dep.depends_on_id),
+      canWrite() ? h("button", { class: "danger", onclick: async () => { await api(`/api/dependencies/${dep.id}`, { method: "DELETE" }); await refresh(); } }, "Remove") : null
+    ),
+    h("p", { class: "meta" }, `${t.status || "unknown"} · dependency ${dep.id}`)
+  );
+}
+
+function dependentItem(dep) {
+  const t = dep.task || {};
+  const attrs = t.id ? { class: "item clickable", onclick: () => selectTask(t.id) } : { class: "item" };
+  return h("div", attrs,
+    h("strong", {}, t.title || dep.task_id),
+    h("p", { class: "meta" }, `${t.status || "unknown"} · waits for this task`)
+  );
+}
+
+function decisionItem(d) {
+  return h("div", { class: "item" },
+    h("strong", {}, d.decision),
+    d.reason ? h("p", {}, `Reason: ${d.reason}`) : null,
+    d.impact ? h("p", {}, `Impact: ${d.impact}`) : null,
+    Array.isArray(d.alternatives) && d.alternatives.length ? h("p", { class: "meta" }, `Alternatives: ${d.alternatives.join(", ")}`) : null,
+    h("small", { class: "meta" }, `${actorName(d.author_id)} · ${new Date(d.created_at).toLocaleString()}`)
+  );
+}
+
+function commentItem(c) {
+  return h("div", { class: "item" },
+    h("p", {}, c.body),
+    h("small", { class: "meta" }, `${actorName(c.author_id)} · ${new Date(c.created_at).toLocaleString()}`)
+  );
+}
+
+function artifactItem(a) {
+  const link = /^https?:\/\//.test(a.uri) ? h("a", { href: a.uri, target: "_blank", rel: "noreferrer" }, a.uri) : h("span", {}, a.uri);
+  return h("div", { class: "item" },
+    h("strong", {}, `${a.kind}: ${a.title}`),
+    h("p", {}, link),
+    a.description ? h("p", { class: "meta" }, a.description) : null,
+    h("small", { class: "meta" }, `${actorName(a.author_id)} · ${new Date(a.created_at).toLocaleString()}`)
+  );
+}
+
+function gitItem(g) {
+  return h("div", { class: "item" },
+    g.branch ? h("p", {}, `Branch: ${g.branch}`) : null,
+    g.commit_sha ? h("p", {}, `Commit: ${g.commit_sha}`) : null,
+    g.pr_url ? h("p", {}, h("a", { href: g.pr_url, target: "_blank", rel: "noreferrer" }, g.pr_url)) : null,
+    Array.isArray(g.changed_files) && g.changed_files.length ? h("p", { class: "meta" }, `Files: ${g.changed_files.join(", ")}`) : null,
+    g.note ? h("p", { class: "meta" }, g.note) : null,
+    h("small", { class: "meta" }, `${actorName(g.author_id)} · ${new Date(g.created_at).toLocaleString()}`)
+  );
+}
+
 function actionsPanel(task) {
-  const status = h("select", {}, statuses.concat(["cancelled"]).map(v => h("option", { value: v, selected: v === task.status ? "selected" : null }, v)));
+  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Actions"), h("p", { class: "meta" }, "Your role is read-only."));
+  const status = h("select", {}, statuses.concat(["cancelled"]).map(v => h("option", { value: v, selected: v === task.status }, v)));
   const noteKind = h("select", {}, ["note","summary","decision","risk","blocker","output_ref"].map(v => h("option", { value: v }, v)));
   const note = h("textarea", { placeholder: "Add sanitized context" });
   const lockScope = h("input", { placeholder: "Lock scope, e.g. src/auth/*" });
   const handoffSummary = h("textarea", { placeholder: "Handoff resume summary" });
   const nextSteps = h("input", { placeholder: "Next steps, comma separated" });
+  const decision = h("textarea", { placeholder: "Decision" });
+  const decisionReason = h("input", { placeholder: "Reason" });
+  const decisionImpact = h("input", { placeholder: "Impact" });
+  const decisionAlternatives = h("input", { placeholder: "Alternatives, comma separated" });
+  const comment = h("textarea", { placeholder: "Human comment or review note" });
+  const artifactKind = h("select", {}, ["pr","log","branch","doc","screenshot","output","other"].map(v => h("option", { value: v }, v)));
+  const artifactTitle = h("input", { placeholder: "Artifact title" });
+  const artifactURI = h("input", { placeholder: "Artifact URL/path/reference" });
+  const artifactDescription = h("textarea", { placeholder: "Artifact description" });
+  const gitBranch = h("input", { placeholder: "Branch" });
+  const gitCommit = h("input", { placeholder: "Commit SHA" });
+  const gitPR = h("input", { placeholder: "PR URL" });
+  const gitFiles = h("textarea", { placeholder: "Changed files, comma separated" });
+  const gitNote = h("input", { placeholder: "Git note" });
+  const subtaskTitle = h("input", { placeholder: "Subtask title" });
+  const subtaskGoal = h("textarea", { placeholder: "Subtask goal" });
+  const dependencyOptions = apiState.tasks.filter(t => t.id !== task.id && t.project_id === task.project_id);
+  const dependency = h("select", {}, [h("option", { value: "" }, "Select blocking task")].concat(dependencyOptions.map(t => h("option", { value: t.id }, `${t.title} · ${t.status}`))));
   return h("div", { class: "panel" },
     h("h2", {}, "Actions"),
     h("div", { class: "form" },
       h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, "Claim"),
       h("div", { class: "row" }, status, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: status.value }) }); await refresh(); } }, "Update Status")),
+      h("h3", {}, "Subtasks"),
+      subtaskTitle, subtaskGoal,
+      h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/subtasks`, { method: "POST", body: JSON.stringify({ title: subtaskTitle.value, goal: subtaskGoal.value, type: task.type, priority: task.priority }) }); subtaskTitle.value = ""; subtaskGoal.value = ""; await refresh(); } }, "Create Subtask"),
+      h("h3", {}, "Dependencies"),
+      h("div", { class: "row" }, dependency, h("button", { onclick: async () => { if (!dependency.value) return; await api(`/api/tasks/${task.id}/dependencies`, { method: "POST", body: JSON.stringify({ depends_on_id: dependency.value }) }); dependency.value = ""; await refresh(); } }, "Add Blocker")),
+      h("h3", {}, "Decision"),
+      decision, decisionReason, decisionImpact, decisionAlternatives,
+      h("button", { onclick: async () => {
+        await api(`/api/tasks/${task.id}/decisions`, { method: "POST", body: JSON.stringify({
+          decision: decision.value,
+          reason: decisionReason.value,
+          impact: decisionImpact.value,
+          alternatives: decisionAlternatives.value.split(",").map(s => s.trim()).filter(Boolean),
+        }) });
+        decision.value = ""; decisionReason.value = ""; decisionImpact.value = ""; decisionAlternatives.value = "";
+        await refresh();
+      } }, "Record Decision"),
+      h("h3", {}, "Comment"),
+      comment,
+      h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ body: comment.value }) }); comment.value = ""; await refresh(); } }, "Add Comment"),
+      h("h3", {}, "Artifact Reference"),
+      h("div", { class: "row" }, artifactKind, artifactTitle),
+      artifactURI, artifactDescription,
+      h("button", { onclick: async () => {
+        await api(`/api/tasks/${task.id}/artifacts`, { method: "POST", body: JSON.stringify({ kind: artifactKind.value, title: artifactTitle.value, uri: artifactURI.value, description: artifactDescription.value }) });
+        artifactTitle.value = ""; artifactURI.value = ""; artifactDescription.value = "";
+        await refresh();
+      } }, "Add Artifact"),
+      h("h3", {}, "Git Metadata"),
+      h("div", { class: "row" }, gitBranch, gitCommit),
+      gitPR, gitFiles, gitNote,
+      h("button", { onclick: async () => {
+        await api(`/api/tasks/${task.id}/git`, { method: "POST", body: JSON.stringify({
+          branch: gitBranch.value,
+          commit_sha: gitCommit.value,
+          pr_url: gitPR.value,
+          changed_files: gitFiles.value.split(",").map(s => s.trim()).filter(Boolean),
+          note: gitNote.value,
+        }) });
+        gitBranch.value = ""; gitCommit.value = ""; gitPR.value = ""; gitFiles.value = ""; gitNote.value = "";
+        await refresh();
+      } }, "Attach Git Metadata"),
       h("div", { class: "row" }, noteKind, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/context`, { method: "POST", body: JSON.stringify({ kind: noteKind.value, content: note.value }) }); note.value = ""; await refresh(); } }, "Add Context")),
       note,
-      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; await refresh(); } }, "Acquire Lock")),
+      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock")),
       handoffSummary, nextSteps,
       h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/handoff`, { method: "POST", body: JSON.stringify({ summary: handoffSummary.value, next_steps: nextSteps.value.split(",").map(s => s.trim()).filter(Boolean) }) }); await refresh(); } }, "Prepare Handoff"),
       h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from dashboard." }) }); await refresh(); } }, "Complete")
@@ -257,6 +683,7 @@ function actorsView() {
 }
 
 function actorForm() {
+  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Register Actor"), h("p", { class: "meta" }, "Your role is read-only."));
   const name = h("input", { placeholder: "Name" });
   const machine = h("input", { placeholder: "Machine name" });
   const kind = h("select", {}, h("option", { value: "agent" }, "agent"), h("option", { value: "human" }, "human"));
@@ -275,28 +702,257 @@ function handoffsView() {
     h("strong", {}, `${x.status} · ${x.task_id}`),
     h("p", {}, x.resume_summary),
     h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`),
-    x.status === "prepared" ? h("button", { onclick: async () => { await api(`/api/handoffs/${x.id}/accept`, { method: "POST", body: "{}" }); await refresh(); } }, "Accept") : null
+    x.status === "prepared" && canWrite() ? h("button", { onclick: async () => { await api(`/api/handoffs/${x.id}/accept`, { method: "POST", body: "{}" }); await refresh(); } }, "Accept") : null
   )));
 }
 
 function conflictsView() {
-  const conflicts = apiState.tasks.filter(t => (t.potential_conflict_count || 0) > 0 || (t.claim_expires_at && new Date(t.claim_expires_at) < new Date()));
-  return h("div", { class: "panel list" }, h("h2", {}, "Conflicts and Stale Work"), conflicts.length ? conflicts.map(taskCard) : h("p", { class: "meta" }, "No conflicts detected."));
+  const stale = apiState.tasks.filter(t => t.claim_expires_at && new Date(t.claim_expires_at) < new Date());
+  return h("div", { class: "grid2" },
+    h("div", { class: "panel list" },
+      h("h2", {}, "Open Conflicts"),
+      apiState.conflicts.length ? apiState.conflicts.map(conflictItem) : h("p", { class: "meta" }, "No conflicts detected.")
+    ),
+    h("div", { class: "panel list" },
+      h("h2", {}, "Stale Claims"),
+      stale.length ? stale.map(taskCard) : h("p", { class: "meta" }, "No stale claims.")
+    )
+  );
+}
+
+function conflictItem(c) {
+  const task = c.task || apiState.tasks.find(t => t.id === c.task_id) || {};
+  const otherTask = c.other_task || apiState.tasks.find(t => t.id === c.other_task_id) || {};
+  const resolution = h("select", {}, [
+    ["continue_current_owner", "Continue current owner"],
+    ["transfer_ownership", "Transfer ownership"],
+    ["split_scope", "Split scope"],
+    ["pause_secondary_work", "Pause secondary work"],
+    ["mark_duplicate", "Mark duplicate"],
+    ["escalate_to_human", "Escalate to human"],
+  ].map(([value, label]) => h("option", { value }, label)));
+  const target = h("select", {}, [h("option", { value: "" }, "Default target actor")].concat(apiState.actors.map(a => h("option", { value: a.id }, `${a.name} · ${a.id}`))));
+  const note = h("textarea", { placeholder: "Resolution note required" });
+  return h("div", { class: "item" },
+    h("strong", {}, c.conflict_type.split("_").join(" ")),
+    h("p", { class: "meta" }, `Task: ${task.title || c.task_id || "none"}`),
+    c.scope ? h("p", { class: "meta" }, `Scope: ${c.scope_type || "scope"} · ${c.scope}`) : null,
+    c.current_owner_id ? h("p", { class: "meta" }, `Current owner: ${actorName(c.current_owner_id)}`) : null,
+    c.other_actor_id ? h("p", { class: "meta" }, `Other actor: ${actorName(c.other_actor_id)}`) : null,
+    otherTask.id ? h("p", { class: "meta" }, `Other task: ${otherTask.title}`) : null,
+    canWrite() ? h("div", { class: "form" },
+      resolution,
+      target,
+      note,
+      h("button", { class: "primary", onclick: async () => {
+        await api(`/api/conflicts/${c.id}/resolve`, { method: "POST", body: JSON.stringify({ resolution: resolution.value, target_actor_id: target.value, note: note.value }) });
+        await refresh();
+      } }, "Resolve Conflict")
+    ) : null
+  );
+}
+
+function projectsView() {
+  return h("div", { class: "grid2" },
+    h("div", {}, createProjectForm(), h("br"), createRepoForm(), h("br"), createWorkspaceForm()),
+    h("div", {},
+      h("div", { class: "panel list" }, h("h2", {}, "Projects"), apiState.projects.map(p => h("div", { class: "item" }, h("strong", {}, p.name), h("p", { class: "meta" }, `${p.id} · ${p.description || "no description"}`)))),
+      h("br"),
+      h("div", { class: "panel list" }, h("h2", {}, "Repositories"), apiState.repositories.map(r => h("div", { class: "item" }, h("strong", {}, r.name), h("p", { class: "meta" }, `${r.id} · ${projectName(r.project_id)} · ${r.default_branch} · ${r.path || "no path"}`)))),
+      h("br"),
+      h("div", { class: "panel list" }, h("h2", {}, "Workspaces"), apiState.workspaces.map(w => h("div", { class: "item" }, h("strong", {}, w.name), h("p", { class: "meta" }, `${w.id} · ${projectName(w.project_id)} · ${actorName(w.actor_id)} · ${w.machine_name || "no machine"}`))))
+    )
+  );
+}
+
+function createProjectForm() {
+  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Create Project"), h("p", { class: "meta" }, "Your role is read-only."));
+  const name = h("input", { placeholder: "Project name" });
+  const description = h("textarea", { placeholder: "Description" });
+  return h("div", { class: "panel form" }, h("h2", {}, "Create Project"), name, description,
+    h("button", { class: "primary", onclick: async () => {
+      await api("/api/projects", { method: "POST", body: JSON.stringify({ name: name.value, description: description.value }) });
+      name.value = ""; description.value = "";
+      await refresh();
+    }}, "Create Project"));
+}
+
+function projectSelect(selected = "") {
+  return h("select", {}, apiState.projects.map(p => h("option", { value: p.id, selected: selected === p.id }, p.name)));
+}
+
+function createRepoForm() {
+  if (!canWrite()) return null;
+  const project = projectSelect(apiState.selectedProject || "project_default");
+  const name = h("input", { placeholder: "Repository name" });
+  const path = h("input", { placeholder: "Local path or remote URL" });
+  const branch = h("input", { placeholder: "Default branch", value: "main" });
+  return h("div", { class: "panel form" }, h("h2", {}, "Add Repository"), project, name, path, branch,
+    h("button", { onclick: async () => {
+      await api("/api/repositories", { method: "POST", body: JSON.stringify({ project_id: project.value, name: name.value, path: path.value, default_branch: branch.value }) });
+      name.value = ""; path.value = "";
+      await refresh();
+    }}, "Add Repository"));
+}
+
+function createWorkspaceForm() {
+  if (!canWrite()) return null;
+  const project = projectSelect(apiState.selectedProject || "project_default");
+  const actor = h("select", {}, [h("option", { value: "" }, "No actor")].concat(apiState.actors.map(a => h("option", { value: a.id }, `${a.name} · ${a.id}`))));
+  const name = h("input", { placeholder: "Workspace name" });
+  const machine = h("input", { placeholder: "Machine name" });
+  const kind = h("select", {}, ["local","agent","ci","other"].map(v => h("option", { value: v }, v)));
+  return h("div", { class: "panel form" }, h("h2", {}, "Add Workspace"), project, actor, name, machine, kind,
+    h("button", { onclick: async () => {
+      await api("/api/workspaces", { method: "POST", body: JSON.stringify({ project_id: project.value, actor_id: actor.value, name: name.value, machine_name: machine.value, kind: kind.value }) });
+      name.value = ""; machine.value = "";
+      await refresh();
+    }}, "Add Workspace"));
+}
+
+function adminView() {
+  if (!isAdmin()) return h("div", { class: "panel" }, h("h2", {}, "Admin"), h("p", { class: "meta" }, "Admin role required."));
+  return h("div", { class: "grid2" },
+    h("div", {}, createUserForm(), h("br"), createKeyForm(), h("br"), changePasswordForm()),
+    h("div", {},
+      h("div", { class: "panel list" }, h("h2", {}, "Users"), apiState.users.map(userItem)),
+      h("br"),
+      h("div", { class: "panel list" }, h("h2", {}, "API Keys"), apiState.apiKeys.map(keyItem))
+    )
+  );
+}
+
+function createUserForm() {
+  const email = h("input", { placeholder: "Email" });
+  const name = h("input", { placeholder: "Name" });
+  const password = h("input", { type: "password", placeholder: "Temporary password" });
+  const role = h("select", {}, ["developer","maintainer","viewer","admin"].map(v => h("option", { value: v }, v)));
+  return h("div", { class: "panel form" }, h("h2", {}, "Invite User"), email, name, password, role,
+    h("button", { class: "primary", onclick: async () => {
+      await api("/api/users", { method: "POST", body: JSON.stringify({ email: email.value, name: name.value, password: password.value, role: role.value }) });
+      email.value = ""; name.value = ""; password.value = "";
+      await refresh();
+    }}, "Create User"));
+}
+
+function userItem(u) {
+  const role = h("select", {}, ["admin","maintainer","developer","viewer"].map(v => h("option", { value: v, selected: v === u.role }, v)));
+  const active = h("input", { type: "checkbox", checked: u.active });
+  const newPassword = h("input", { type: "password", placeholder: "New password" });
+  return h("div", { class: "item" },
+    h("strong", {}, `${u.name} · ${u.email}`),
+    h("p", { class: "meta" }, `${u.id} · last seen ${u.last_seen_at ? new Date(u.last_seen_at).toLocaleString() : "never"}`),
+    h("div", { class: "row" }, role, h("label", { class: "check" }, active, " Active")),
+    h("div", { class: "row" },
+      h("button", { onclick: async () => { await api(`/api/users/${u.id}`, { method: "PATCH", body: JSON.stringify({ role: role.value, active: active.checked }) }); await refresh(); } }, "Save User"),
+      h("button", { class: "danger", onclick: async () => { active.checked = false; await api(`/api/users/${u.id}`, { method: "PATCH", body: JSON.stringify({ active: false }) }); await refresh(); } }, "Deactivate")
+    ),
+    h("div", { class: "row" }, newPassword, h("button", { onclick: async () => { await api(`/api/users/${u.id}/password`, { method: "POST", body: JSON.stringify({ new_password: newPassword.value }) }); newPassword.value = ""; await refresh(); } }, "Reset Password"))
+  );
+}
+
+function createKeyForm() {
+  const name = h("input", { placeholder: "Key name" });
+  const actor = h("select", {}, apiState.actors.map(a => h("option", { value: a.id }, `${a.name} · ${a.id}`)));
+  const role = h("select", {}, ["agent","developer","maintainer","viewer","admin"].map(v => h("option", { value: v }, v)));
+  const scopes = h("input", { placeholder: "Scopes comma separated", value: "task:read,task:write,lock:write,context:write,handoff:write" });
+  const output = h("textarea", { readonly: "readonly", placeholder: "New API key appears here once" });
+  return h("div", { class: "panel form" }, h("h2", {}, "Create API Key"), name, actor, role, scopes,
+    h("button", { class: "primary", onclick: async () => {
+      const key = await api("/api/api-keys", { method: "POST", body: JSON.stringify({
+        name: name.value, actor_id: actor.value, role: role.value,
+        scopes: scopes.value.split(",").map(s => s.trim()).filter(Boolean),
+      }) });
+      output.value = key.api_key || "";
+      await refresh();
+    }}, "Create Key"),
+    output);
+}
+
+function keyItem(k) {
+  return h("div", { class: "item" },
+    h("strong", {}, `${k.name} · ${k.prefix}`),
+    h("p", { class: "meta" }, `${k.id} · actor ${actorName(k.actor_id)} · ${k.role} · ${(k.scopes || []).join(", ")}`),
+    k.revoked_at ? h("span", { class: "pill amber" }, `revoked ${new Date(k.revoked_at).toLocaleString()}`) :
+      h("button", { class: "danger", onclick: async () => { await api(`/api/api-keys/${k.id}`, { method: "DELETE" }); await refresh(); } }, "Revoke")
+  );
+}
+
+function changePasswordForm() {
+  if (!apiState.principal || apiState.principal.kind !== "user") return null;
+  const current = h("input", { type: "password", placeholder: "Current password" });
+  const next = h("input", { type: "password", placeholder: "New password" });
+  return h("div", { class: "panel form" }, h("h2", {}, "Change My Password"), current, next,
+    h("button", { onclick: async () => { await api("/api/me/password", { method: "POST", body: JSON.stringify({ current_password: current.value, new_password: next.value }) }); current.value = ""; next.value = ""; apiState.error = "Password changed. Please log in again."; await logout(false); } }, "Change Password"));
 }
 
 function settings() {
   const token = h("input", { value: apiState.token, placeholder: "Team token" });
+  const apiKey = h("input", { value: apiState.apiKey, placeholder: "API key" });
   const actor = h("input", { value: apiState.actor, placeholder: "Actor ID" });
   const actorSecret = h("input", { value: apiState.actorSecret, placeholder: "Actor secret" });
-  return h("div", { class: "panel form" }, h("h2", {}, "Connection"), token, actor, actorSecret, h("button", { class: "primary", onclick: async () => {
+  return h("div", { class: "panel form" }, h("h2", {}, "Connection"), token, apiKey, actor, actorSecret, h("button", { class: "primary", onclick: async () => {
     saveSetting("taskpilot.token", token.value);
+    saveSetting("taskpilot.apiKey", apiKey.value);
     saveSetting("taskpilot.actor", actor.value);
     saveSetting("taskpilot.actorSecret", actorSecret.value);
     apiState.token = token.value;
+    apiState.apiKey = apiKey.value;
     apiState.actor = actor.value;
     apiState.actorSecret = actorSecret.value;
+    setLegacyEnabled(!apiKey.value && !!token.value);
     await refresh();
   }}, "Save"));
+}
+
+function loginView() {
+  const email = h("input", { placeholder: "Email" });
+  const password = h("input", { type: "password", placeholder: "Password" });
+  const apiKey = h("input", { placeholder: "Agent/API key" });
+  const token = h("input", { value: apiState.token, placeholder: "Development team token" });
+  return h("div", { class: "login" },
+    h("div", { class: "panel form login-panel" },
+      h("h1", {}, "TaskPilot"),
+      h("p", { class: "meta" }, "Sign in as a human, paste an agent API key, or use the development token flow."),
+      email, password,
+      h("button", { class: "primary", onclick: async () => {
+        await apiRequest("/api/auth/login", { method: "POST", body: JSON.stringify({ email: email.value, password: password.value }) }, false);
+        apiState.apiKey = "";
+        setLegacyEnabled(false);
+        saveSetting("taskpilot.apiKey", "");
+        await refresh();
+      }}, "Log In"),
+      h("hr", {}),
+      apiKey,
+      h("button", { onclick: async () => {
+        apiState.apiKey = apiKey.value;
+        saveSetting("taskpilot.apiKey", apiKey.value);
+        setLegacyEnabled(false);
+        await refresh();
+      }}, "Use API Key"),
+      h("hr", {}),
+      token,
+      h("button", { onclick: async () => {
+        apiState.token = token.value;
+        saveSetting("taskpilot.token", token.value);
+        setLegacyEnabled(true);
+        await ensureLegacyActor();
+        await refresh();
+      }}, "Use Development Token")
+    )
+  );
+}
+
+async function logout(callServer = true) {
+  stopEventStream();
+  if (callServer) {
+    try { await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch {}
+  }
+  apiState.principal = null;
+  apiState.apiKey = "";
+  setLegacyEnabled(false);
+  saveSetting("taskpilot.apiKey", "");
+  render();
 }
 
 function render() {
@@ -308,17 +964,29 @@ function render() {
       document.body.append(root);
     }
     root.innerHTML = "";
-    const tabs = ["board", "detail", "conflicts", "actors", "handoffs", "settings"];
+    if (!apiState.principal) {
+      root.append(loginView());
+      if (apiState.error) root.append(h("div", { class: "toast error" }, apiState.error));
+      return;
+    }
+    const tabs = ["board", "detail", "projects", "conflicts", "actors", "handoffs", "settings"];
+    if (isAdmin()) tabs.splice(5, 0, "admin");
     const content = apiState.tab === "board" ? board()
       : apiState.tab === "detail" ? detailView()
+      : apiState.tab === "projects" ? projectsView()
       : apiState.tab === "conflicts" ? conflictsView()
       : apiState.tab === "actors" ? actorsView()
       : apiState.tab === "handoffs" ? handoffsView()
+      : apiState.tab === "admin" ? adminView()
       : settings();
     root.append(h("div", { class: "shell" },
       h("div", { class: "topbar" },
         h("div", { class: "brand" }, "TaskPilot"),
-        h("div", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } }, t)))
+        h("div", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } }, t))),
+        h("div", { class: "identity" },
+          h("span", {}, `${apiState.principal.kind} · ${apiState.principal.role}`),
+          h("button", { onclick: () => logout(true) }, "Log Out")
+        )
       ),
       h("main", { class: "main" }, apiState.error ? h("div", { class: "panel error" }, apiState.error) : null, content)
     ));
@@ -329,4 +997,6 @@ function render() {
 
 render();
 refresh();
-setInterval(refresh, 5000);
+setInterval(() => {
+  if (!apiState.streamActive) refresh();
+}, 5000);
