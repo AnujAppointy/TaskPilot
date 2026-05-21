@@ -2,6 +2,12 @@
 
 TaskPilot is a local-first coordination MVP for distributed AI agents and humans. It gives agents a CLI/API and gives managers or tech leads a dashboard over the same task state.
 
+New to TaskPilot? Start with the team-friendly onboarding guide:
+
+```text
+docs/ONBOARDING.md
+```
+
 ## Run
 
 ```bash

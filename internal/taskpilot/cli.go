@@ -188,6 +188,7 @@ func runAgentCommand(args []string) error {
 		return err
 	}
 	defer cleanup()
+	var contextOffset int64
 	_ = appendRunContext(taskID, "summary", "taskpilot run started agent command: "+strings.Join(commandArgs, " "))
 	if detail.Task.OwnerID == "" || detail.Task.OwnerID != cfg.ActorID {
 		var claimed Task
@@ -203,7 +204,7 @@ func runAgentCommand(args []string) error {
 	defer cancel()
 	done := make(chan struct{})
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, *progressEvery, done)
+	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -220,7 +221,7 @@ func runAgentCommand(args []string) error {
 	)
 	err = cmd.Run()
 	close(done)
-	imported := importRunContext(taskID, contextPath)
+	imported := importRunContextSince(taskID, contextPath, &contextOffset)
 	changed := touchedFilesSummary(beforeFiles, gitChangedFiles())
 	if changed != "" {
 		_ = appendRunContext(taskID, "output_ref", changed)
@@ -291,7 +292,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID string, interval time.Duration, done <-chan struct{}) {
+func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}) {
 	if interval <= 0 {
 		return
 	}
@@ -304,7 +305,7 @@ func progressLoop(ctx context.Context, taskID string, interval time.Duration, do
 		case <-done:
 			return
 		case <-ticker.C:
-			_ = appendRunContext(taskID, "note", "taskpilot run is still active; heartbeat renewed and child command is still running.")
+			importRunContextSince(taskID, contextPath, contextOffset)
 		}
 	}
 }
@@ -321,8 +322,9 @@ func createRunContextFile(taskID string) (string, func(), error) {
 	return path, func() { _ = os.Remove(path) }, nil
 }
 
-func importRunContext(taskID, path string) int {
-	entries := readRunContextFile(path)
+func importRunContextSince(taskID, path string, offset *int64) int {
+	entries, next := readRunContextFileSince(path, *offset)
+	*offset = next
 	imported := 0
 	for _, entry := range entries {
 		if appendRunContext(taskID, entry.Kind, entry.Content) == nil {
@@ -337,12 +339,17 @@ type runContextEntry struct {
 	Content string `json:"content"`
 }
 
-func readRunContextFile(path string) []runContextEntry {
+func readRunContextFileSince(path string, offset int64) ([]runContextEntry, int64) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		return nil, offset
 	}
 	defer f.Close()
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, offset
+		}
+	}
 	out := []runContextEntry{}
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -350,7 +357,11 @@ func readRunContextFile(path string) []runContextEntry {
 			out = append(out, entry)
 		}
 	}
-	return out
+	next, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		next = offset
+	}
+	return out, next
 }
 
 func parseRunContextLine(line string) (runContextEntry, bool) {
@@ -646,7 +657,56 @@ func mcpToolResult(v any) map[string]any {
 }
 
 func agentInstructions(taskID string) string {
-	return "Use TaskPilot for coordination. Read task " + taskID + ", keep ownership heartbeated, and write sanitized progress to TASKPILOT_RUN_CONTEXT_FILE as JSON lines like {\"kind\":\"decision\",\"content\":\"...\"} or lines like decision: ... . Complete or prepare handoff before stopping."
+	return `You are working inside TaskPilot coordination.
+
+TaskPilot is the shared task memory for humans and agents across machines. Treat it as the source of truth for task status, ownership, decisions, handoffs, and coordination.
+
+Current task:
+- TASKPILOT_TASK_ID=` + taskID + `
+- Use TASKPILOT_SERVER when calling TaskPilot.
+- Use TASKPILOT_ACTOR_ID as your agent identity.
+- Write task progress to TASKPILOT_RUN_CONTEXT_FILE.
+
+Required workflow:
+1. Read the current task before making assumptions.
+2. Respect the task goal, scope, status, owner, locks, decisions, blockers, and handoff state.
+3. Work only inside the task scope unless the user explicitly expands it.
+4. Do not duplicate work already owned by another actor.
+5. If you discover overlap, blockers, stale context, or unsafe ambiguity, record it as task context.
+6. Share sanitized context only. Do not write secrets, raw local files, private prompts, customer data, credentials, or long logs.
+7. Preserve decisions made by previous agents unless new evidence clearly invalidates them.
+8. Before stopping, leave enough context for another agent to continue without asking a human to re-explain.
+
+Write useful updates to TASKPILOT_RUN_CONTEXT_FILE as soon as each meaningful unit of work finishes. Do not wait until the whole session ends.
+
+Accepted context formats:
+- summary: Found that expiry validation fails after invite token lookup
+- decision: Keep token format unchanged
+- risk: Changing DB schema may break existing invite links
+- blocker: Need reproduction data for expired invite token
+- output_ref: Touched src/auth/token.go and src/auth/token_test.go
+- next: Add regression coverage for invited-user signup
+- {"kind":"decision","content":"Patch expiry comparison only"}
+
+Recommended update timing:
+- After reading important task context, write a short summary if it changes your plan.
+- After finding a root cause, write a summary.
+- After making a decision, write a decision with the reason.
+- After discovering a risk or blocker, write it immediately.
+- After changing files or creating outputs, write an output_ref.
+- Before handing off or stopping, write next steps.
+
+When possible, use the TaskPilot CLI directly:
+- taskpilot task show ` + taskID + ` --json
+- taskpilot context append ` + taskID + ` --kind decision --content "..."
+- taskpilot decision add ` + taskID + ` --decision "..." --reason "..." --impact "..."
+- taskpilot handoff prepare ` + taskID + ` --summary "..." --next "..."
+
+If the taskpilot command is not available on PATH, continue using TASKPILOT_RUN_CONTEXT_FILE so TaskPilot can import your context.
+
+Completion rule:
+- Mark work complete only when the task goal and completion criteria are satisfied.
+- If work cannot be completed, record blocker/risk/next steps and leave the task ready for handoff.`
 }
 
 func agentRulesFile() string {

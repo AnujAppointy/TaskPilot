@@ -34,7 +34,10 @@ const apiState = {
   streamController: null,
   streamRetry: null,
   refreshTimer: null,
+  refreshing: false,
+  refreshQueued: false,
   lastEventID: 0,
+  pendingRender: false,
 };
 
 const statuses = ["ready", "claimed", "in_progress", "blocked", "handoff_ready", "in_review", "completed"];
@@ -71,6 +74,21 @@ function saveSetting(key, value) {
   } catch {
     // The current tab can still use in-memory state if storage is blocked.
   }
+}
+
+function isFormEditing() {
+  const el = document.activeElement;
+  if (!el) return false;
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
+}
+
+function renderWhenSafe() {
+  if (isFormEditing()) {
+    apiState.pendingRender = true;
+    return;
+  }
+  apiState.pendingRender = false;
+  render();
 }
 
 function clearActorSettings() {
@@ -151,11 +169,28 @@ async function loadMe() {
 }
 
 async function refresh() {
+  if (apiState.refreshing) {
+    apiState.refreshQueued = true;
+    return;
+  }
+  apiState.refreshing = true;
+  try {
+    await refreshNow();
+  } finally {
+    apiState.refreshing = false;
+    if (apiState.refreshQueued) {
+      apiState.refreshQueued = false;
+      scheduleRefresh(100);
+    }
+  }
+}
+
+async function refreshNow() {
   try {
     apiState.error = "";
     const authed = await loadMe();
     if (!authed) {
-      render();
+      renderWhenSafe();
       return;
     }
     if (apiState.principal.kind === "legacy_actor") await ensureLegacyActor();
@@ -195,7 +230,7 @@ async function refresh() {
     apiState.error = err.message;
     stopEventStream();
   }
-  render();
+  renderWhenSafe();
 }
 
 function scheduleRefresh(delay = 200) {
@@ -362,11 +397,11 @@ function taskFilters() {
   }
   search.addEventListener("input", () => {
     apiState.filters.search = search.value;
-    render();
   });
   return h("div", { class: "toolbar filters" },
     h("label", {}, "Filters"),
     search, owner, status, repo, priority, blocked, stale,
+    h("button", { onclick: () => render() }, "Apply"),
     h("button", { onclick: () => { apiState.filters = { search: "", owner: "", status: "", repo: "", priority: "", blocked: "", stale: "" }; render(); } }, "Clear")
   );
 }
@@ -484,7 +519,7 @@ function createTaskForm() {
 function detailView() {
   if (!apiState.detail) return h("div", { class: "panel" }, "Select a task.");
   const { task } = apiState.detail;
-  const context = Array.isArray(apiState.detail.context) ? apiState.detail.context : [];
+  const context = visibleContextEntries(Array.isArray(apiState.detail.context) ? apiState.detail.context : []);
   const decisions = Array.isArray(apiState.detail.decisions) ? apiState.detail.decisions : [];
   const comments = Array.isArray(apiState.detail.comments) ? apiState.detail.comments : [];
   const artifacts = Array.isArray(apiState.detail.artifacts) ? apiState.detail.artifacts : [];
@@ -517,7 +552,7 @@ function detailView() {
       section("Comments", comments.map(commentItem)),
       section("Artifacts", artifacts.map(artifactItem)),
       section("Git", gitRefs.map(gitItem)),
-      section("Context", context.map(c => h("div", { class: "item" }, h("strong", {}, c.kind), h("p", {}, c.content), h("small", {}, actorName(c.author_id))))),
+      section("Context", context.map(contextItem)),
       section("Locks", locks.map(l => h("div", { class: "item" }, `${l.scope_type}: ${l.scope} · owner ${actorName(l.owner_id)} · expires ${new Date(l.expires_at).toLocaleString()}`))),
       section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`)))),
       section("Timeline", h("div", { class: "timeline" }, events.map(e => h("div", { class: "event" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
@@ -527,6 +562,26 @@ function detailView() {
 
 function section(title, content) {
   return h("div", { class: "section" }, h("h3", {}, title), Array.isArray(content) && !content.length ? h("p", { class: "meta" }, "Nothing yet.") : content);
+}
+
+function visibleContextEntries(entries) {
+  const noisy = "taskpilot run is still active; heartbeat renewed and child command is still running.";
+  const grouped = new Map();
+  for (const entry of entries) {
+    if ((entry.content || "").trim() === noisy) continue;
+    const key = `${entry.kind}\n${entry.content}\n${entry.author_id}`;
+    if (!grouped.has(key)) grouped.set(key, { ...entry, count: 0 });
+    grouped.get(key).count += 1;
+  }
+  return Array.from(grouped.values());
+}
+
+function contextItem(c) {
+  return h("div", { class: "item" },
+    h("strong", {}, c.kind),
+    h("p", {}, c.content),
+    h("small", { class: "meta" }, `${actorName(c.author_id)}${c.count > 1 ? ` · repeated ${c.count} times` : ""}`)
+  );
 }
 
 function subtaskItem(t) {
@@ -723,6 +778,7 @@ function conflictsView() {
 function conflictItem(c) {
   const task = c.task || apiState.tasks.find(t => t.id === c.task_id) || {};
   const otherTask = c.other_task || apiState.tasks.find(t => t.id === c.other_task_id) || {};
+  const reason = conflictReason(c, task, otherTask);
   const resolution = h("select", {}, [
     ["continue_current_owner", "Continue current owner"],
     ["transfer_ownership", "Transfer ownership"],
@@ -733,13 +789,29 @@ function conflictItem(c) {
   ].map(([value, label]) => h("option", { value }, label)));
   const target = h("select", {}, [h("option", { value: "" }, "Default target actor")].concat(apiState.actors.map(a => h("option", { value: a.id }, `${a.name} · ${a.id}`))));
   const note = h("textarea", { placeholder: "Resolution note required" });
-  return h("div", { class: "item" },
-    h("strong", {}, c.conflict_type.split("_").join(" ")),
-    h("p", { class: "meta" }, `Task: ${task.title || c.task_id || "none"}`),
-    c.scope ? h("p", { class: "meta" }, `Scope: ${c.scope_type || "scope"} · ${c.scope}`) : null,
-    c.current_owner_id ? h("p", { class: "meta" }, `Current owner: ${actorName(c.current_owner_id)}`) : null,
-    c.other_actor_id ? h("p", { class: "meta" }, `Other actor: ${actorName(c.other_actor_id)}`) : null,
-    otherTask.id ? h("p", { class: "meta" }, `Other task: ${otherTask.title}`) : null,
+  return h("div", { class: "item conflict-card" },
+    h("div", { class: "item-head" },
+      h("strong", {}, c.conflict_type.split("_").join(" ")),
+      h("span", { class: "pill red" }, "needs decision")
+    ),
+    h("p", {}, reason),
+    h("div", { class: "conflict-tasks" },
+      h("div", { class: "mini-card clickable", onclick: () => task.id && selectTask(task.id) },
+        h("small", { class: "meta" }, "Task"),
+        h("strong", {}, task.title || c.task_id || "Unknown task"),
+        h("p", { class: "meta" }, `${c.task_id || ""} · owner ${actorName(task.owner_id || c.current_owner_id)}`)
+      ),
+      otherTask.id || c.other_task_id ? h("div", { class: "mini-card clickable", onclick: () => otherTask.id && selectTask(otherTask.id) },
+        h("small", { class: "meta" }, "Conflicts with"),
+        h("strong", {}, otherTask.title || c.other_task_id),
+        h("p", { class: "meta" }, `${c.other_task_id || ""} · owner ${actorName(otherTask.owner_id || c.other_actor_id)}`)
+      ) : h("div", { class: "mini-card" },
+        h("small", { class: "meta" }, "Conflicts with"),
+        h("strong", {}, actorName(c.other_actor_id || c.current_owner_id)),
+        h("p", { class: "meta" }, "Same task ownership")
+      )
+    ),
+    c.scope ? h("p", { class: "meta" }, `Overlapping scope: ${c.scope_type || "scope"} · ${c.scope}`) : null,
     canWrite() ? h("div", { class: "form" },
       resolution,
       target,
@@ -750,6 +822,19 @@ function conflictItem(c) {
       } }, "Resolve Conflict")
     ) : null
   );
+}
+
+function conflictReason(c, task, otherTask) {
+  if (c.conflict_type === "lock_overlap") {
+    return `Two active work claims overlap on ${c.scope || "the same scope"}. Resolve who should continue before both agents edit the same area.`;
+  }
+  if (c.conflict_type === "ownership") {
+    return `Another actor tried to claim a task that already has an active owner. Resolve whether to keep the current owner or transfer work.`;
+  }
+  if (otherTask && otherTask.id) {
+    return `${task.title || "This task"} conflicts with ${otherTask.title}.`;
+  }
+  return "TaskPilot detected competing work that needs a human decision.";
 }
 
 function projectsView() {
@@ -889,20 +974,29 @@ function changePasswordForm() {
 function settings() {
   const token = h("input", { value: apiState.token, placeholder: "Team token" });
   const apiKey = h("input", { value: apiState.apiKey, placeholder: "API key" });
-  const actor = h("input", { value: apiState.actor, placeholder: "Actor ID" });
-  const actorSecret = h("input", { value: apiState.actorSecret, placeholder: "Actor secret" });
-  return h("div", { class: "panel form" }, h("h2", {}, "Connection"), token, apiKey, actor, actorSecret, h("button", { class: "primary", onclick: async () => {
+  const identity = apiState.principal
+    ? `${apiState.principal.kind} · ${apiState.principal.role} · ${apiState.principal.actor_id || apiState.principal.user_id || "session"}`
+    : "Not signed in";
+  return h("div", { class: "panel form" },
+    h("h2", {}, "Connection"),
+    h("p", { class: "meta" }, `Current identity: ${identity}`),
+    h("p", { class: "meta" }, "Use a team token for local testing or an API key for an agent. Dashboard actor credentials are managed automatically."),
+    token,
+    apiKey,
+    h("button", { class: "primary", onclick: async () => {
     saveSetting("taskpilot.token", token.value);
     saveSetting("taskpilot.apiKey", apiKey.value);
-    saveSetting("taskpilot.actor", actor.value);
-    saveSetting("taskpilot.actorSecret", actorSecret.value);
     apiState.token = token.value;
     apiState.apiKey = apiKey.value;
-    apiState.actor = actor.value;
-    apiState.actorSecret = actorSecret.value;
     setLegacyEnabled(!apiKey.value && !!token.value);
     await refresh();
-  }}, "Save"));
+  }}, "Save Connection"),
+    h("button", { onclick: async () => {
+      clearActorSettings();
+      await ensureLegacyActor();
+      await refresh();
+    }}, "Reset Dashboard Actor")
+  );
 }
 
 function loginView() {
@@ -931,13 +1025,25 @@ function loginView() {
         await refresh();
       }}, "Use API Key"),
       h("hr", {}),
+      h("p", { class: "meta" }, "Docker default token: change-this-team-token-before-use. Local SQLite default token: dev-token."),
       token,
       h("button", { onclick: async () => {
-        apiState.token = token.value;
-        saveSetting("taskpilot.token", token.value);
-        setLegacyEnabled(true);
-        await ensureLegacyActor();
-        await refresh();
+        try {
+          apiState.error = "";
+          stopEventStream();
+          apiState.token = token.value.trim();
+          saveSetting("taskpilot.token", apiState.token);
+          setLegacyEnabled(true);
+          clearActorSettings();
+          await ensureLegacyActor();
+          await refresh();
+        } catch (err) {
+          setLegacyEnabled(false);
+          clearActorSettings();
+          apiState.principal = null;
+          apiState.error = `Development token was rejected. For the Docker setup use change-this-team-token-before-use. (${err.message})`;
+          render();
+        }
       }}, "Use Development Token")
     )
   );
@@ -997,6 +1103,12 @@ function render() {
 
 render();
 refresh();
+document.addEventListener("focusout", () => {
+  if (!apiState.pendingRender) return;
+  setTimeout(() => {
+    if (!isFormEditing() && apiState.pendingRender) renderWhenSafe();
+  }, 50);
+});
 setInterval(() => {
-  if (!apiState.streamActive) refresh();
+  if (apiState.principal && !apiState.streamActive) refresh();
 }, 5000);

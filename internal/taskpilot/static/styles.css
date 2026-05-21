@@ -70,7 +70,7 @@ textarea { min-height: 76px; resize: vertical; }
 .toolbar select { max-width: 280px; }
 .toolbar.filters {
   display: grid;
-  grid-template-columns: 80px minmax(220px, 2fr) repeat(6, minmax(130px, 1fr)) auto;
+  grid-template-columns: 80px minmax(220px, 2fr) repeat(6, minmax(130px, 1fr)) auto auto;
   align-items: center;
 }
 .toolbar.filters input,
@@ -149,6 +149,25 @@ textarea { min-height: 76px; resize: vertical; }
 .item-head button {
   width: auto;
   flex: 0 0 auto;
+}
+.conflict-card > p {
+  margin: 8px 0;
+}
+.conflict-tasks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+.mini-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #f8fafc;
+}
+.mini-card strong {
+  display: block;
+  margin: 4px 0;
 }
 .error { color: var(--red); }
 .login {
