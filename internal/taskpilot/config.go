@@ -71,3 +71,12 @@ func heartbeatInterval() time.Duration {
 	}
 	return 5 * time.Minute
 }
+
+func progressInterval() time.Duration {
+	if v := os.Getenv("TASKPILOT_PROGRESS_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Second
+}

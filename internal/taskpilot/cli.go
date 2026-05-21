@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -147,7 +148,7 @@ func runScaffold(domain string, args []string) error {
 
 func runAgentCommand(args []string) error {
 	if len(args) < 3 {
-		return fmt.Errorf("usage: taskpilot run <task-id> [--progress-interval 2m] [--no-complete] [--handoff-on-failure] [--handoff-to actor-id] [--summary text] -- <agent-command> [args...]")
+		return fmt.Errorf("usage: taskpilot run <task-id> [--progress-interval 5s] [--no-complete] [--handoff-on-failure] [--handoff-to actor-id] [--summary text] -- <agent-command> [args...]")
 	}
 	taskID := args[0]
 	sep := -1
@@ -161,7 +162,7 @@ func runAgentCommand(args []string) error {
 		return fmt.Errorf("usage: taskpilot run <task-id> [options] -- <agent-command> [args...]")
 	}
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	progressEvery := fs.Duration("progress-interval", heartbeatInterval(), "append periodic progress context while the child command runs")
+	progressEvery := fs.Duration("progress-interval", progressInterval(), "sync run context to the server while the child command runs")
 	noComplete := fs.Bool("no-complete", false, "leave task in progress instead of completing after successful command")
 	handoffOnFailure := fs.Bool("handoff-on-failure", true, "prepare a handoff packet if the child command fails")
 	handoffTo := fs.String("handoff-to", "", "target actor for failure handoff")
@@ -221,8 +222,9 @@ func runAgentCommand(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	done := make(chan struct{})
+	var contextMu sync.Mutex
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done)
+	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done, &contextMu)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -242,7 +244,9 @@ func runAgentCommand(args []string) error {
 	)
 	err = cmd.Run()
 	close(done)
+	contextMu.Lock()
 	imported := importRunContextSince(taskID, contextPath, &contextOffset)
+	contextMu.Unlock()
 	changed := touchedFilesSummary(beforeFiles, gitChangedFiles())
 	if changed != "" {
 		_ = appendRunContext(taskID, "output_ref", changed)
@@ -313,7 +317,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}) {
+func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}, mu *sync.Mutex) {
 	if interval <= 0 {
 		return
 	}
@@ -326,7 +330,9 @@ func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset
 		case <-done:
 			return
 		case <-ticker.C:
+			mu.Lock()
 			importRunContextSince(taskID, contextPath, contextOffset)
+			mu.Unlock()
 		}
 	}
 }
