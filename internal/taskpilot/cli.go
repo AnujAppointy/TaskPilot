@@ -200,6 +200,14 @@ func runAgentCommand(args []string) error {
 		var lock Lock
 		_ = request("POST", "/api/tasks/"+taskID+"/locks", map[string]any{"scope": scope, "scope_type": "file_glob"}, &lock)
 	}
+	if err := request("GET", "/api/tasks/"+taskID, nil, &detail); err != nil {
+		return err
+	}
+	taskContextPath, relatedContextPath, contextCleanup, err := createAgentContextFiles(taskID, detail)
+	if err != nil {
+		return err
+	}
+	defer contextCleanup()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	done := make(chan struct{})
@@ -217,6 +225,8 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_REPO_ID="+detail.Task.RepoID,
 		"TASKPILOT_WORKSPACE_ID="+detail.Task.WorkspaceID,
 		"TASKPILOT_RUN_CONTEXT_FILE="+contextPath,
+		"TASKPILOT_TASK_CONTEXT_FILE="+taskContextPath,
+		"TASKPILOT_RELATED_CONTEXT_FILE="+relatedContextPath,
 		"TASKPILOT_AGENT_INSTRUCTIONS="+agentInstructions(taskID),
 	)
 	err = cmd.Run()
@@ -320,6 +330,392 @@ func createRunContextFile(taskID string) (string, func(), error) {
 		return "", nil, err
 	}
 	return path, func() { _ = os.Remove(path) }, nil
+}
+
+type agentTaskContextFile struct {
+	GeneratedAt time.Time       `json:"generated_at"`
+	Usage       string          `json:"usage"`
+	CurrentTask agentTaskDetail `json:"current_task"`
+}
+
+type agentRelatedContextFile struct {
+	GeneratedAt   time.Time             `json:"generated_at"`
+	Usage         string                `json:"usage"`
+	SelectionRule string                `json:"selection_rule"`
+	RelatedTasks  []agentRelatedContext `json:"related_tasks"`
+}
+
+type agentTaskDetail struct {
+	Task         Task             `json:"task"`
+	Owner        *Actor           `json:"owner,omitempty"`
+	Parent       *Task            `json:"parent,omitempty"`
+	Subtasks     []Task           `json:"subtasks,omitempty"`
+	Dependencies []TaskDependency `json:"dependencies,omitempty"`
+	Dependents   []TaskDependency `json:"dependents,omitempty"`
+	Context      []ContextEntry   `json:"context,omitempty"`
+	Decisions    []DecisionRecord `json:"decisions,omitempty"`
+	Comments     []Comment        `json:"comments,omitempty"`
+	Artifacts    []Artifact       `json:"artifacts,omitempty"`
+	GitRefs      []GitRef         `json:"git_refs,omitempty"`
+	Locks        []Lock           `json:"locks,omitempty"`
+	Handoffs     []Handoff        `json:"handoffs,omitempty"`
+}
+
+type agentRelatedContext struct {
+	ID               string           `json:"id"`
+	Title            string           `json:"title"`
+	Goal             string           `json:"goal,omitempty"`
+	Type             string           `json:"type"`
+	Status           string           `json:"status"`
+	Priority         string           `json:"priority"`
+	OwnerID          string           `json:"owner_id,omitempty"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+	Scope            []string         `json:"scope,omitempty"`
+	Relation         []string         `json:"relation,omitempty"`
+	RelevanceReasons []string         `json:"relevance_reasons,omitempty"`
+	Summaries        []string         `json:"summaries,omitempty"`
+	Decisions        []DecisionRecord `json:"decisions,omitempty"`
+	Risks            []string         `json:"risks,omitempty"`
+	Blockers         []string         `json:"blockers,omitempty"`
+	Outputs          []string         `json:"outputs,omitempty"`
+	Artifacts        []Artifact       `json:"artifacts,omitempty"`
+	GitRefs          []GitRef         `json:"git_refs,omitempty"`
+	HandoffSummary   string           `json:"handoff_summary,omitempty"`
+}
+
+func createAgentContextFiles(taskID string, detail TaskDetail) (string, string, func(), error) {
+	taskSnapshot := agentTaskContextFile{
+		GeneratedAt: time.Now().UTC(),
+		Usage:       "Read this first. It is the authoritative TaskPilot snapshot for the current task. Prefer it over live CLI calls from inside sandboxed agents.",
+		CurrentTask: compactAgentTaskDetail(detail),
+	}
+	relatedSnapshot := agentRelatedContextFile{
+		GeneratedAt:   time.Now().UTC(),
+		Usage:         "Use this as prior work context. These tasks were selected because they are linked or relevant to the current task; unrelated tasks are intentionally omitted.",
+		SelectionRule: "Includes directly linked tasks plus up to five same-project tasks with overlapping scope/repo/parent signals. Related tasks contain summaries, decisions, risks, blockers, outputs, artifacts, and git refs, not full event history.",
+		RelatedTasks:  collectRelatedAgentContexts(detail),
+	}
+	taskPath, taskCleanup, err := createJSONTemp("taskpilot-"+taskID+"-task-*.json", taskSnapshot)
+	if err != nil {
+		return "", "", nil, err
+	}
+	relatedPath, relatedCleanup, err := createJSONTemp("taskpilot-"+taskID+"-related-*.json", relatedSnapshot)
+	if err != nil {
+		taskCleanup()
+		return "", "", nil, err
+	}
+	return taskPath, relatedPath, func() {
+		taskCleanup()
+		relatedCleanup()
+	}, nil
+}
+
+func createJSONTemp(pattern string, v any) (string, func(), error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", nil, err
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", nil, err
+	}
+	path := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", nil, err
+	}
+	return path, func() { _ = os.Remove(path) }, nil
+}
+
+func compactAgentTaskDetail(detail TaskDetail) agentTaskDetail {
+	return agentTaskDetail{
+		Task:         detail.Task,
+		Owner:        detail.Owner,
+		Parent:       detail.Parent,
+		Subtasks:     detail.Subtasks,
+		Dependencies: detail.Dependencies,
+		Dependents:   detail.Dependents,
+		Context:      compactContextEntries(detail.Context, 40),
+		Decisions:    limitDecisions(detail.Decisions, 20),
+		Comments:     limitComments(detail.Comments, 20),
+		Artifacts:    limitArtifacts(detail.Artifacts, 20),
+		GitRefs:      limitGitRefs(detail.GitRefs, 20),
+		Locks:        detail.Locks,
+		Handoffs:     detail.Handoffs,
+	}
+}
+
+type relatedCandidate struct {
+	Task      Task
+	Score     int
+	Reasons   []string
+	Relations []string
+}
+
+func collectRelatedAgentContexts(current TaskDetail) []agentRelatedContext {
+	var tasks []Task
+	path := "/api/tasks"
+	if current.Task.ProjectID != "" {
+		path += "?project_id=" + current.Task.ProjectID
+	}
+	if err := request("GET", path, nil, &tasks); err != nil {
+		return nil
+	}
+	linked := linkedTaskRelations(current)
+	candidates := []relatedCandidate{}
+	for _, task := range tasks {
+		if task.ID == current.Task.ID {
+			continue
+		}
+		score, reasons := relatedTaskScore(current.Task, task)
+		relations := linked[task.ID]
+		if len(relations) > 0 {
+			score += 100
+			reasons = append(reasons, "directly linked to current task")
+		}
+		if score < 50 {
+			continue
+		}
+		candidates = append(candidates, relatedCandidate{Task: task, Score: score, Reasons: uniqueStrings(reasons), Relations: uniqueStrings(relations)})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Score == candidates[j].Score {
+			return candidates[i].Task.UpdatedAt.After(candidates[j].Task.UpdatedAt)
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+	if len(candidates) > 5 {
+		candidates = candidates[:5]
+	}
+	out := []agentRelatedContext{}
+	for _, candidate := range candidates {
+		var detail TaskDetail
+		if err := request("GET", "/api/tasks/"+candidate.Task.ID, nil, &detail); err != nil {
+			continue
+		}
+		out = append(out, summarizeRelatedTask(detail, candidate.Relations, candidate.Reasons))
+	}
+	return out
+}
+
+func linkedTaskRelations(detail TaskDetail) map[string][]string {
+	out := map[string][]string{}
+	if detail.Parent != nil {
+		out[detail.Parent.ID] = append(out[detail.Parent.ID], "parent")
+	}
+	for _, task := range detail.Subtasks {
+		out[task.ID] = append(out[task.ID], "subtask")
+	}
+	for _, dep := range detail.Dependencies {
+		if dep.DependsOnID != "" {
+			out[dep.DependsOnID] = append(out[dep.DependsOnID], "blocked_by")
+		}
+	}
+	for _, dep := range detail.Dependents {
+		if dep.TaskID != "" {
+			out[dep.TaskID] = append(out[dep.TaskID], "blocking")
+		}
+	}
+	return out
+}
+
+func relatedTaskScore(current, candidate Task) (int, []string) {
+	score := 0
+	reasons := []string{}
+	if current.ProjectID != "" && candidate.ProjectID == current.ProjectID {
+		score += 5
+	}
+	if current.RepoID != "" && candidate.RepoID == current.RepoID {
+		score += 15
+		reasons = append(reasons, "same repository")
+	}
+	if current.ParentTaskID != "" && candidate.ParentTaskID == current.ParentTaskID {
+		score += 20
+		reasons = append(reasons, "same parent task")
+	}
+	if taskScopesOverlap(current.Scope, candidate.Scope) {
+		score += 70
+		reasons = append(reasons, "overlapping scope")
+	}
+	if candidate.Status == "completed" {
+		score += 10
+		reasons = append(reasons, "completed prior work")
+	}
+	if time.Since(candidate.UpdatedAt) <= 14*24*time.Hour {
+		score += 10
+		reasons = append(reasons, "recently updated")
+	}
+	return score, reasons
+}
+
+func taskScopesOverlap(a, b []string) bool {
+	for _, left := range a {
+		for _, right := range b {
+			if scopeOverlaps(left, right) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func scopeOverlaps(a, b string) bool {
+	a = normalizeScope(a)
+	b = normalizeScope(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	ap := scopePrefix(a)
+	bp := scopePrefix(b)
+	return ap != "" && bp != "" && (strings.HasPrefix(ap, bp) || strings.HasPrefix(bp, ap))
+}
+
+func normalizeScope(scope string) string {
+	scope = strings.TrimSpace(strings.ReplaceAll(scope, "\\", "/"))
+	scope = strings.TrimPrefix(scope, "./")
+	return scope
+}
+
+func scopePrefix(scope string) string {
+	scope = normalizeScope(scope)
+	scope = strings.TrimSuffix(scope, "*")
+	scope = strings.TrimSuffix(scope, "/")
+	if scope == "" {
+		return ""
+	}
+	if strings.ContainsAny(scope, "*?[") {
+		return strings.TrimRight(scope[:strings.IndexAny(scope, "*?[")], "/")
+	}
+	return scope
+}
+
+func summarizeRelatedTask(detail TaskDetail, relations, reasons []string) agentRelatedContext {
+	summaries := []string{}
+	risks := []string{}
+	blockers := []string{}
+	outputs := []string{}
+	for _, entry := range compactContextEntries(detail.Context, 30) {
+		switch entry.Kind {
+		case "summary":
+			summaries = append(summaries, entry.Content)
+		case "decision":
+			summaries = append(summaries, "Decision note: "+entry.Content)
+		case "risk":
+			risks = append(risks, entry.Content)
+		case "blocker":
+			blockers = append(blockers, entry.Content)
+		case "output_ref":
+			outputs = append(outputs, entry.Content)
+		}
+	}
+	handoffSummary := ""
+	if len(detail.Handoffs) > 0 {
+		handoffSummary = detail.Handoffs[len(detail.Handoffs)-1].ResumeSummary
+	}
+	return agentRelatedContext{
+		ID:               detail.Task.ID,
+		Title:            detail.Task.Title,
+		Goal:             detail.Task.Goal,
+		Type:             detail.Task.Type,
+		Status:           detail.Task.Status,
+		Priority:         detail.Task.Priority,
+		OwnerID:          detail.Task.OwnerID,
+		UpdatedAt:        detail.Task.UpdatedAt,
+		Scope:            detail.Task.Scope,
+		Relation:         relations,
+		RelevanceReasons: reasons,
+		Summaries:        limitStrings(uniqueStrings(summaries), 8),
+		Decisions:        limitDecisions(detail.Decisions, 8),
+		Risks:            limitStrings(uniqueStrings(append(risks, detail.Task.Risks...)), 8),
+		Blockers:         limitStrings(uniqueStrings(append(blockers, detail.Task.Blockers...)), 8),
+		Outputs:          limitStrings(uniqueStrings(outputs), 8),
+		Artifacts:        limitArtifacts(detail.Artifacts, 8),
+		GitRefs:          limitGitRefs(detail.GitRefs, 8),
+		HandoffSummary:   handoffSummary,
+	}
+}
+
+func compactContextEntries(entries []ContextEntry, max int) []ContextEntry {
+	out := []ContextEntry{}
+	seen := map[string]bool{}
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if isNoisyRunContext(entry.Content) {
+			continue
+		}
+		key := entry.Kind + "\x00" + strings.TrimSpace(entry.Content)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, entry)
+		if len(out) >= max {
+			break
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+func isNoisyRunContext(content string) bool {
+	return strings.Contains(strings.ToLower(content), "taskpilot run is still active; heartbeat renewed")
+}
+
+func uniqueStrings(values []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func limitStrings(values []string, max int) []string {
+	if len(values) <= max {
+		return values
+	}
+	return values[:max]
+}
+
+func limitDecisions(values []DecisionRecord, max int) []DecisionRecord {
+	if len(values) <= max {
+		return values
+	}
+	return values[len(values)-max:]
+}
+
+func limitComments(values []Comment, max int) []Comment {
+	if len(values) <= max {
+		return values
+	}
+	return values[len(values)-max:]
+}
+
+func limitArtifacts(values []Artifact, max int) []Artifact {
+	if len(values) <= max {
+		return values
+	}
+	return values[len(values)-max:]
+}
+
+func limitGitRefs(values []GitRef, max int) []GitRef {
+	if len(values) <= max {
+		return values
+	}
+	return values[len(values)-max:]
 }
 
 func importRunContextSince(taskID, path string, offset *int64) int {
@@ -665,17 +1061,20 @@ Current task:
 - TASKPILOT_TASK_ID=` + taskID + `
 - Use TASKPILOT_SERVER when calling TaskPilot.
 - Use TASKPILOT_ACTOR_ID as your agent identity.
+- Read TASKPILOT_TASK_CONTEXT_FILE for the current task snapshot.
+- Read TASKPILOT_RELATED_CONTEXT_FILE for selected prior/linked work context.
 - Write task progress to TASKPILOT_RUN_CONTEXT_FILE.
 
 Required workflow:
-1. Read the current task before making assumptions.
-2. Respect the task goal, scope, status, owner, locks, decisions, blockers, and handoff state.
-3. Work only inside the task scope unless the user explicitly expands it.
-4. Do not duplicate work already owned by another actor.
-5. If you discover overlap, blockers, stale context, or unsafe ambiguity, record it as task context.
-6. Share sanitized context only. Do not write secrets, raw local files, private prompts, customer data, credentials, or long logs.
-7. Preserve decisions made by previous agents unless new evidence clearly invalidates them.
-8. Before stopping, leave enough context for another agent to continue without asking a human to re-explain.
+1. Read TASKPILOT_TASK_CONTEXT_FILE before making assumptions.
+2. Read TASKPILOT_RELATED_CONTEXT_FILE for linked tasks and relevant prior work, especially tasks with overlapping scope.
+3. Respect the task goal, scope, status, owner, locks, decisions, blockers, and handoff state.
+4. Work only inside the task scope unless the user explicitly expands it.
+5. Do not duplicate work already owned by another actor.
+6. If you discover overlap, blockers, stale context, or unsafe ambiguity, record it as task context.
+7. Share sanitized context only. Do not write secrets, raw local files, private prompts, customer data, credentials, or long logs.
+8. Preserve decisions made by previous agents unless new evidence clearly invalidates them.
+9. Before stopping, leave enough context for another agent to continue without asking a human to re-explain.
 
 Write useful updates to TASKPILOT_RUN_CONTEXT_FILE as soon as each meaningful unit of work finishes. Do not wait until the whole session ends.
 
@@ -702,7 +1101,7 @@ When possible, use the TaskPilot CLI directly:
 - taskpilot decision add ` + taskID + ` --decision "..." --reason "..." --impact "..."
 - taskpilot handoff prepare ` + taskID + ` --summary "..." --next "..."
 
-If the taskpilot command is not available on PATH, continue using TASKPILOT_RUN_CONTEXT_FILE so TaskPilot can import your context.
+If the taskpilot command is not available on PATH, or the agent runtime cannot reach the TaskPilot server, continue from TASKPILOT_TASK_CONTEXT_FILE and TASKPILOT_RELATED_CONTEXT_FILE, then write updates to TASKPILOT_RUN_CONTEXT_FILE so TaskPilot can import your context.
 
 Completion rule:
 - Mark work complete only when the task goal and completion criteria are satisfied.
