@@ -166,6 +166,7 @@ func runAgentCommand(args []string) error {
 	handoffOnFailure := fs.Bool("handoff-on-failure", true, "prepare a handoff packet if the child command fails")
 	handoffTo := fs.String("handoff-to", "", "target actor for failure handoff")
 	summaryFlag := fs.String("summary", "", "completion summary override")
+	noPromptInject := fs.Bool("no-prompt-inject", false, "do not pass TaskPilot startup prompt to known agent commands")
 	_ = fs.Parse(args[1:sep])
 	commandArgs := args[sep+1:]
 	if len(commandArgs) == 0 {
@@ -208,6 +209,15 @@ func runAgentCommand(args []string) error {
 		return err
 	}
 	defer contextCleanup()
+	startupPrompt := agentStartupPrompt(taskID, taskContextPath, relatedContextPath, contextPath)
+	promptPath, promptCleanup, err := createTextTemp("taskpilot-"+taskID+"-prompt-*.txt", startupPrompt)
+	if err != nil {
+		return err
+	}
+	defer promptCleanup()
+	if !*noPromptInject {
+		commandArgs = injectAgentStartupPrompt(commandArgs, startupPrompt)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	done := make(chan struct{})
@@ -227,6 +237,7 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_RUN_CONTEXT_FILE="+contextPath,
 		"TASKPILOT_TASK_CONTEXT_FILE="+taskContextPath,
 		"TASKPILOT_RELATED_CONTEXT_FILE="+relatedContextPath,
+		"TASKPILOT_AGENT_PROMPT_FILE="+promptPath,
 		"TASKPILOT_AGENT_INSTRUCTIONS="+agentInstructions(taskID),
 	)
 	err = cmd.Run()
@@ -428,6 +439,66 @@ func createJSONTemp(pattern string, v any) (string, func(), error) {
 		return "", nil, err
 	}
 	return path, func() { _ = os.Remove(path) }, nil
+}
+
+func createTextTemp(pattern, content string) (string, func(), error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", nil, err
+	}
+	path := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", nil, err
+	}
+	return path, func() { _ = os.Remove(path) }, nil
+}
+
+func injectAgentStartupPrompt(commandArgs []string, prompt string) []string {
+	if len(commandArgs) == 0 {
+		return commandArgs
+	}
+	name := strings.ToLower(filepath.Base(commandArgs[0]))
+	switch name {
+	case "codex", "gemini":
+		if len(commandArgs) == 1 {
+			return append(commandArgs, prompt)
+		}
+	}
+	return commandArgs
+}
+
+func agentStartupPrompt(taskID, taskContextPath, relatedContextPath, runContextPath string) string {
+	return `Work on the current TaskPilot task.
+
+You are launched by taskpilot run. Do not infer the task from repo-local files or stale local databases.
+
+Before doing any repository analysis or edits:
+1. Read ` + taskContextPath + ` for the authoritative current task snapshot.
+2. Read ` + relatedContextPath + ` for selected related/prior task context from the TaskPilot server.
+3. Treat TASKPILOT_TASK_ID=` + taskID + ` as the only current task.
+4. Ignore repo-local .taskpilot-data.db, old peer/daemon state, and guessed commands like ./bin/taskpilot task current unless the current task context explicitly asks for them.
+
+While working:
+- Follow the current task goal, scope, locks, blockers, decisions, and handoff state from the context files.
+- Use related context only when it is relevant to the current task. Do not pull unrelated task history into the answer.
+- If live taskpilot CLI/server access fails from inside the agent runtime, continue from the injected context files.
+- Write useful updates immediately to ` + runContextPath + `.
+
+Accepted update lines for ` + runContextPath + `:
+- summary: what you found or completed
+- decision: decision made and why
+- risk: risk or caveat
+- blocker: what blocks progress
+- output_ref: changed files, PRs, docs, or other references
+- next: next step for another agent or human
+
+Do not upload or write secrets, raw private logs, customer data, private prompts, or raw local files into TaskPilot context.`
 }
 
 func compactAgentTaskDetail(detail TaskDetail) agentTaskDetail {
