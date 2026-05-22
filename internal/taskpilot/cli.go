@@ -472,17 +472,32 @@ func injectAgentStartupPrompt(commandArgs []string, prompt string) []string {
 	name := strings.ToLower(filepath.Base(commandArgs[0]))
 	switch name {
 	case "codex", "gemini":
-		if len(commandArgs) == 1 {
+		if len(commandArgs) == 1 || isAgentResumeCommand(commandArgs) {
 			return append(commandArgs, prompt)
 		}
 	}
 	return commandArgs
 }
 
+func isAgentResumeCommand(commandArgs []string) bool {
+	if len(commandArgs) < 2 {
+		return false
+	}
+	for _, arg := range commandArgs[1:] {
+		switch strings.ToLower(arg) {
+		case "resume", "continue":
+			return true
+		}
+	}
+	return false
+}
+
 func agentStartupPrompt(taskID, taskContextPath, relatedContextPath, runContextPath string) string {
 	return `Work on the current TaskPilot task.
 
 You are launched by taskpilot run. Do not infer the task from repo-local files or stale local databases.
+
+If this is a resumed agent session, treat this prompt as the fresh TaskPilot coordination context for the resumed work. The previous chat memory may help with conversation continuity, but TaskPilot task state is authoritative.
 
 Before doing any repository analysis or edits:
 1. Read ` + taskContextPath + ` for the authoritative current task snapshot.

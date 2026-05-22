@@ -8,6 +8,12 @@ New to TaskPilot? Start with the team-friendly onboarding guide:
 docs/ONBOARDING.md
 ```
 
+Want to understand the technology choices? Read:
+
+```text
+docs/TECHNICAL_DECISIONS.md
+```
+
 ## Run
 
 ```bash
