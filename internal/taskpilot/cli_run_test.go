@@ -15,6 +15,12 @@ func TestParseRunContextLine(t *testing.T) {
 	}{
 		{`decision: Keep token format unchanged`, "decision", "Keep token format unchanged", true},
 		{`progress: Still adding tests`, "note", "Still adding tests", true},
+		{`finding: Expiry check fails after invite lookup`, "summary", "Finding: Expiry check fails after invite lookup", true},
+		{`rationale: DB schema already has enough state`, "note", "Rationale: DB schema already has enough state", true},
+		{`rejected: Adding a new invite token table would duplicate state`, "decision", "Rejected approach: Adding a new invite token table would duplicate state", true},
+		{`files: src/auth/invite.go`, "output_ref", "src/auth/invite.go", true},
+		{`verification: go test ./src/auth passed`, "note", "Verification: go test ./src/auth passed", true},
+		{`next: Add used-token regression test`, "next", "Add used-token regression test", true},
 		{`{"kind":"risk","content":"Expiry logic has timezone edge cases"}`, "risk", "Expiry logic has timezone edge cases", true},
 		{`plain note`, "note", "plain note", true},
 		{`   `, "", "", false},

@@ -26,6 +26,7 @@ const apiState = {
   apiKeys: [],
   handoffs: [],
   conflicts: [],
+  staleClaims: [],
   events: [],
   detail: null,
   error: "",
@@ -38,6 +39,8 @@ const apiState = {
   refreshQueued: false,
   lastEventID: 0,
   pendingRender: false,
+  memoryError: "",
+  handoffModal: null,
 };
 
 const statuses = ["ready", "claimed", "in_progress", "blocked", "handoff_ready", "in_review", "completed"];
@@ -49,6 +52,7 @@ function h(tag, attrs = {}, ...children) {
     if (k === "class") el.className = v;
     else if (k === "checked") el.checked = !!v;
     else if (k === "selected") el.selected = !!v;
+    else if (k === "value") el.value = v;
     else if (k.startsWith("on")) el.addEventListener(k.slice(2).toLowerCase(), v);
     else if (v !== undefined && v !== null) el.setAttribute(k, v);
   }
@@ -141,6 +145,7 @@ async function apiRequest(path, options = {}, includeActor = true) {
   if (!res.ok) {
     const err = new Error(data.message || data.error || res.statusText);
     err.status = res.status;
+    err.data = data;
     throw err;
   }
   return data;
@@ -202,13 +207,14 @@ async function refreshNow() {
       apiState.selectedProject ? api(`/api/workspaces?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/workspaces"),
       api("/api/handoffs"),
       api("/api/conflicts?status=open"),
+      api("/api/conflicts/stale-claims"),
       api("/api/events"),
     ];
     if (isAdmin()) {
       calls.push(api("/api/users"));
       calls.push(api("/api/api-keys"));
     }
-    const [tasks, actors, projects, repositories, workspaces, handoffs, conflicts, events, users = [], apiKeys = []] = await Promise.all(calls);
+    const [tasks, actors, projects, repositories, workspaces, handoffs, conflicts, staleClaims, events, users = [], apiKeys = []] = await Promise.all(calls);
     apiState.tasks = Array.isArray(tasks) ? tasks : [];
     apiState.actors = Array.isArray(actors) ? actors : [];
     apiState.projects = Array.isArray(projects) ? projects : [];
@@ -220,6 +226,7 @@ async function refreshNow() {
     }
     apiState.handoffs = Array.isArray(handoffs) ? handoffs : [];
     apiState.conflicts = Array.isArray(conflicts) ? conflicts : [];
+    apiState.staleClaims = Array.isArray(staleClaims) ? staleClaims : [];
     apiState.events = Array.isArray(events) ? events : [];
     apiState.lastEventID = apiState.events.reduce((max, e) => Math.max(max, e.id || 0), apiState.lastEventID || 0);
     apiState.users = Array.isArray(users) ? users : [];
@@ -309,6 +316,12 @@ function handleStreamFrame(frame) {
   }
   if (!dataLines.length) return;
   if (id > apiState.lastEventID) apiState.lastEventID = id;
+  try {
+    const event = JSON.parse(dataLines.join("\n"));
+    if (["context.appended", "task.heartbeat"].includes(event.event_type)) return;
+  } catch {
+    // Refresh on malformed frames; the next full load will reconcile state.
+  }
   scheduleRefresh(150);
 }
 
@@ -517,16 +530,26 @@ function createTaskForm() {
 }
 
 function detailView() {
-  if (!apiState.detail) return h("div", { class: "panel" }, "Select a task.");
+  if (!apiState.detail) {
+    return h("div", { class: "grid2" },
+      h("div", {}, createTaskForm()),
+      h("div", { class: "panel" },
+        h("h2", {}, "Task Detail"),
+        h("p", { class: "meta" }, "Select a task from the board or create a new task here.")
+      )
+    );
+  }
   const { task } = apiState.detail;
-  const context = visibleContextEntries(Array.isArray(apiState.detail.context) ? apiState.detail.context : []);
   const decisions = Array.isArray(apiState.detail.decisions) ? apiState.detail.decisions : [];
   const comments = Array.isArray(apiState.detail.comments) ? apiState.detail.comments : [];
   const artifacts = Array.isArray(apiState.detail.artifacts) ? apiState.detail.artifacts : [];
   const gitRefs = Array.isArray(apiState.detail.git_refs) ? apiState.detail.git_refs : [];
   const locks = Array.isArray(apiState.detail.locks) ? apiState.detail.locks : [];
   const handoffs = Array.isArray(apiState.detail.handoffs) ? apiState.detail.handoffs : [];
-  const events = Array.isArray(apiState.detail.events) ? apiState.detail.events : [];
+  const snapshots = Array.isArray(apiState.detail.snapshots) ? apiState.detail.snapshots : [];
+  const latestSnapshot = apiState.detail.latest_snapshot;
+  const handoffPacket = apiState.detail.handoff_packet;
+  const events = visibleTimelineEvents(Array.isArray(apiState.detail.events) ? apiState.detail.events : []);
   const subtasks = Array.isArray(apiState.detail.subtasks) ? apiState.detail.subtasks : [];
   const dependencies = Array.isArray(apiState.detail.dependencies) ? apiState.detail.dependencies : [];
   const dependents = Array.isArray(apiState.detail.dependents) ? apiState.detail.dependents : [];
@@ -545,6 +568,7 @@ function detailView() {
         parent ? h("span", { class: "linkish", onclick: () => selectTask(parent.id) }, `Parent: ${parent.title}`) : null,
         h("span", {}, `Scope: ${(task.scope || []).join(", ") || "none"}`)
       ),
+      taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots),
       section("Subtasks", subtasks.map(subtaskItem)),
       section("Blocked By", dependencies.map(dependencyItem)),
       section("Blocking", dependents.map(dependentItem)),
@@ -552,10 +576,149 @@ function detailView() {
       section("Comments", comments.map(commentItem)),
       section("Artifacts", artifacts.map(artifactItem)),
       section("Git", gitRefs.map(gitItem)),
-      section("Context", context.map(contextItem)),
-      section("Locks", locks.map(l => h("div", { class: "item" }, `${l.scope_type}: ${l.scope} · owner ${actorName(l.owner_id)} · expires ${new Date(l.expires_at).toLocaleString()}`))),
+      section("Locks", locks.map(lockItem)),
       section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`)))),
       section("Timeline", h("div", { class: "timeline" }, events.map(e => h("div", { class: "event" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
+    )
+  );
+}
+
+function lockItem(l) {
+  const stale = l.status === "stale";
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", {}, `${l.scope_type}: ${l.scope}`),
+      h("span", { class: `pill ${stale ? "amber" : l.status === "overridden" ? "red" : ""}` }, l.status || "active")
+    ),
+    h("p", { class: "meta" }, `Owner: ${l.owner_name || actorName(l.owner_id)} · created ${new Date(l.created_at).toLocaleString()}`),
+    h("p", { class: "meta" }, `Last activity: ${l.last_heartbeat_at ? new Date(l.last_heartbeat_at).toLocaleString() : "unknown"} · expires ${new Date(l.expires_at).toLocaleString()}`),
+    l.message ? h("p", {}, l.message) : null,
+    canWrite() && !l.released_at && l.status !== "overridden" ? h("div", { class: "button-row" },
+      h("button", { onclick: async () => { await api(`/api/locks/${l.id}/release`, { method: "POST", body: JSON.stringify({ reason: "Released from dashboard." }) }); await refresh(); } }, "Release Lock"),
+      h("button", { onclick: async () => {
+        const reason = prompt("Reason for overriding this lock?");
+        if (!reason) return;
+        await api(`/api/locks/${l.id}/override`, { method: "POST", body: JSON.stringify({ reason }) });
+        await refresh();
+      } }, "Override Lock")
+    ) : null
+  );
+}
+
+function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
+  const packetMarkdown = handoffPacket && handoffPacket.markdown ? handoffPacket.markdown : "";
+  const snapshotMarkdown = latestSnapshot && latestSnapshot.markdown ? latestSnapshot.markdown : "";
+  const markdown = packetMarkdown || snapshotMarkdown || "# Task Memory\n\nNo handoff packet or context snapshot has been generated yet.\n";
+  const editor = h("textarea", { class: "memory-editor", value: markdown });
+  const source = packetMarkdown ? `Handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}` : "No memory document yet";
+  const saveMarkdown = async () => {
+    apiState.memoryError = "";
+    try {
+      if (handoffPacket) {
+        await api(`/api/handoff-packets/${handoffPacket.id}`, { method: "PATCH", body: JSON.stringify({ markdown: editor.value }) });
+      } else if (latestSnapshot) {
+        await api(`/api/snapshots/${latestSnapshot.id}`, { method: "PATCH", body: JSON.stringify({ markdown: editor.value }) });
+      }
+      await refresh();
+    } catch (err) {
+      const details = err.data && Array.isArray(err.data.errors) ? err.data.errors.map(e => `${e.section || "Document"}${e.line ? ` line ${e.line}` : ""}: ${e.message}`).join("\n") : err.message;
+      apiState.memoryError = details;
+      render();
+    }
+  };
+  const snapshotItems = (snapshots || []).slice(-5).reverse().map(s => h("div", { class: "mini-card" },
+    h("strong", {}, `${s.snapshot_type} · ${s.status_at_time}`),
+    h("p", { class: "meta" }, `${new Date(s.created_at).toLocaleString()} · ${s.source_context_ids ? s.source_context_ids.length : 0} context items`)
+  ));
+  return h("div", { class: "section task-memory" },
+    h("div", { class: "item-head" },
+      h("div", {}, h("h3", {}, "Task Memory"), h("p", { class: "meta" }, source)),
+      canWrite() ? h("div", { class: "button-row" },
+        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/snapshots`, { method: "POST", body: JSON.stringify({ snapshot_type: "manual" }) }); await refresh(); } }, "Generate Snapshot"),
+        h("button", { onclick: () => openHandoffModal(task, latestSnapshot, handoffPacket) }, "Prepare handoff for other agent")
+      ) : null
+    ),
+    h("pre", { class: "markdown-doc" }, markdown),
+    apiState.memoryError ? h("pre", { class: "error-box" }, apiState.memoryError) : null,
+    canWrite() ? h("details", { class: "memory-edit" },
+      h("summary", {}, "Edit Markdown"),
+      editor,
+      h("div", { class: "button-row" },
+        handoffPacket || latestSnapshot ? h("button", { class: "primary", onclick: saveMarkdown }, handoffPacket ? "Save Draft" : "Save Snapshot") : null
+      )
+    ) : null,
+    snapshotItems.length ? h("details", {}, h("summary", {}, "Recent snapshots"), h("div", { class: "snapshot-list" }, snapshotItems)) : null
+  );
+}
+
+function openHandoffModal(task, latestSnapshot, handoffPacket) {
+  const packet = handoffPacket && handoffPacket.packet ? handoffPacket.packet : {};
+  const snapshot = latestSnapshot && latestSnapshot.summary ? latestSnapshot.summary : {};
+  const next = packet.suggested_next_steps || snapshot.next_recommended_actions || [];
+  apiState.handoffModal = {
+    taskId: task.id,
+    title: task.title,
+    summary: packet.handoff_message || packet.task_objective || snapshot.implementation_direction || task.goal || "",
+    nextText: Array.isArray(next) ? next.join("\n") : "",
+    error: "",
+  };
+  render();
+}
+
+function closeHandoffModal() {
+  apiState.handoffModal = null;
+  render();
+}
+
+function parseHandoffNextSteps(text) {
+  return (text || "")
+    .split(/\n|,/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function handoffModalView() {
+  const modal = apiState.handoffModal;
+  if (!modal) return null;
+  const summary = h("textarea", { value: modal.summary, placeholder: "Ready for next agent" });
+  const nextSteps = h("textarea", { value: modal.nextText, placeholder: "Write test\nPatch logic" });
+  return h("div", { class: "modal-backdrop", onclick: (event) => { if (event.target.className === "modal-backdrop") closeHandoffModal(); } },
+    h("div", { class: "modal-card" },
+      h("div", { class: "item-head" },
+        h("div", {},
+          h("h2", {}, "Prepare Handoff"),
+          h("p", { class: "meta" }, `${modal.title} · ${modal.taskId}`)
+        ),
+        h("button", { onclick: closeHandoffModal }, "Close")
+      ),
+      h("label", {}, "Summary"),
+      summary,
+      h("label", {}, "Next steps"),
+      nextSteps,
+      modal.error ? h("div", { class: "error-box" }, modal.error) : null,
+      h("div", { class: "button-row modal-actions" },
+        h("button", { onclick: closeHandoffModal }, "Cancel"),
+        h("button", { class: "primary", onclick: async () => {
+          const body = {
+            summary: summary.value.trim(),
+            next_steps: parseHandoffNextSteps(nextSteps.value),
+          };
+          if (!body.summary) {
+            apiState.handoffModal.error = "Summary is required before publishing a handoff.";
+            render();
+            return;
+          }
+          try {
+            await api(`/api/tasks/${modal.taskId}/handoff`, { method: "POST", body: JSON.stringify(body) });
+            apiState.handoffModal = null;
+            apiState.tab = "handoffs";
+            await refresh();
+          } catch (err) {
+            apiState.handoffModal.error = err.message;
+            render();
+          }
+        } }, "Publish Handoff")
+      )
     )
   );
 }
@@ -564,24 +727,9 @@ function section(title, content) {
   return h("div", { class: "section" }, h("h3", {}, title), Array.isArray(content) && !content.length ? h("p", { class: "meta" }, "Nothing yet.") : content);
 }
 
-function visibleContextEntries(entries) {
-  const noisy = "taskpilot run is still active; heartbeat renewed and child command is still running.";
-  const grouped = new Map();
-  for (const entry of entries) {
-    if ((entry.content || "").trim() === noisy) continue;
-    const key = `${entry.kind}\n${entry.content}\n${entry.author_id}`;
-    if (!grouped.has(key)) grouped.set(key, { ...entry, count: 0 });
-    grouped.get(key).count += 1;
-  }
-  return Array.from(grouped.values());
-}
-
-function contextItem(c) {
-  return h("div", { class: "item" },
-    h("strong", {}, c.kind),
-    h("p", {}, c.content),
-    h("small", { class: "meta" }, `${actorName(c.author_id)}${c.count > 1 ? ` · repeated ${c.count} times` : ""}`)
-  );
+function visibleTimelineEvents(events) {
+  const hidden = new Set(["context.appended", "task.heartbeat"]);
+  return events.filter(e => !hidden.has(e.event_type)).slice(-80);
 }
 
 function subtaskItem(t) {
@@ -652,12 +800,8 @@ function gitItem(g) {
 
 function actionsPanel(task) {
   if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Actions"), h("p", { class: "meta" }, "Your role is read-only."));
-  const status = h("select", {}, statuses.concat(["cancelled"]).map(v => h("option", { value: v, selected: v === task.status }, v)));
-  const noteKind = h("select", {}, ["note","summary","decision","risk","blocker","output_ref"].map(v => h("option", { value: v }, v)));
-  const note = h("textarea", { placeholder: "Add sanitized context" });
+  const status = h("select", {}, ["blocked", "handoff_ready", "in_review", "cancelled"].map(v => h("option", { value: v, selected: v === task.status }, v)));
   const lockScope = h("input", { placeholder: "Lock scope, e.g. src/auth/*" });
-  const handoffSummary = h("textarea", { placeholder: "Handoff resume summary" });
-  const nextSteps = h("input", { placeholder: "Next steps, comma separated" });
   const decision = h("textarea", { placeholder: "Decision" });
   const decisionReason = h("input", { placeholder: "Reason" });
   const decisionImpact = h("input", { placeholder: "Impact" });
@@ -680,7 +824,13 @@ function actionsPanel(task) {
     h("h2", {}, "Actions"),
     h("div", { class: "form" },
       h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, "Claim"),
-      h("div", { class: "row" }, status, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: status.value }) }); await refresh(); } }, "Update Status")),
+      h("div", { class: "row" }, status, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: status.value }) }); await refresh(); } }, "Apply Manual Status")),
+      h("div", { class: "button-row" },
+        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "blocked" }) }); await refresh(); } }, "Mark Blocked"),
+        h("button", { onclick: () => openHandoffModal(task, apiState.detail && apiState.detail.latest_snapshot, apiState.detail && apiState.detail.handoff_packet) }, "Prepare Handoff"),
+        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "in_review" }) }); await refresh(); } }, "Send To Review"),
+        h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from dashboard." }) }); await refresh(); } }, "Mark Complete")
+      ),
       h("h3", {}, "Subtasks"),
       subtaskTitle, subtaskGoal,
       h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/subtasks`, { method: "POST", body: JSON.stringify({ title: subtaskTitle.value, goal: subtaskGoal.value, type: task.type, priority: task.priority }) }); subtaskTitle.value = ""; subtaskGoal.value = ""; await refresh(); } }, "Create Subtask"),
@@ -723,12 +873,7 @@ function actionsPanel(task) {
         gitBranch.value = ""; gitCommit.value = ""; gitPR.value = ""; gitFiles.value = ""; gitNote.value = "";
         await refresh();
       } }, "Attach Git Metadata"),
-      h("div", { class: "row" }, noteKind, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/context`, { method: "POST", body: JSON.stringify({ kind: noteKind.value, content: note.value }) }); note.value = ""; await refresh(); } }, "Add Context")),
-      note,
-      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock")),
-      handoffSummary, nextSteps,
-      h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/handoff`, { method: "POST", body: JSON.stringify({ summary: handoffSummary.value, next_steps: nextSteps.value.split(",").map(s => s.trim()).filter(Boolean) }) }); await refresh(); } }, "Prepare Handoff"),
-      h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from dashboard." }) }); await refresh(); } }, "Complete")
+      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock"))
     )
   );
 }
@@ -753,16 +898,44 @@ function actorForm() {
 }
 
 function handoffsView() {
-  return h("div", { class: "panel list" }, h("h2", {}, "Handoffs"), apiState.handoffs.map(x => h("div", { class: "item" },
-    h("strong", {}, `${x.status} · ${x.task_id}`),
-    h("p", {}, x.resume_summary),
-    h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`),
-    x.status === "prepared" && canWrite() ? h("button", { onclick: async () => { await api(`/api/handoffs/${x.id}/accept`, { method: "POST", body: "{}" }); await refresh(); } }, "Accept") : null
-  )));
+  const seenTasks = new Set();
+  const published = apiState.handoffs.filter(x => {
+    if (x.status !== "prepared") return false;
+    if (seenTasks.has(x.task_id)) return false;
+    seenTasks.add(x.task_id);
+    return true;
+  });
+  return h("div", { class: "panel list" },
+    h("h2", {}, "Handoffs"),
+    published.length ? published.map(handoffItem) : h("p", { class: "meta" }, "No published handoffs.")
+  );
+}
+
+function handoffItem(x) {
+  const task = x.task || apiState.tasks.find(t => t.id === x.task_id) || {};
+  const packet = x.packet && x.packet.packet ? x.packet.packet : {};
+  const next = x.next_steps && x.next_steps.length ? x.next_steps : (packet.suggested_next_steps || []);
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", {}, `${task.title || x.task_id}`),
+      h("span", { class: "pill amber" }, x.packet ? `handoff v${x.packet.version || 1}` : "handoff")
+    ),
+    h("p", {}, x.resume_summary || packet.task_objective),
+    h("p", { class: "meta" }, `Task: ${x.task_id} · owner ${actorName(task.owner_id || x.from_actor_id)} · ${new Date(x.created_at).toLocaleString()}`),
+    next.length ? h("ol", { class: "compact-list" }, next.map(step => h("li", {}, step))) : h("p", { class: "meta" }, "No next steps provided."),
+    x.packet ? h("details", {},
+      h("summary", {}, "More details"),
+      packet.files_components_affected && packet.files_components_affected.length ? h("p", { class: "meta" }, `Files: ${packet.files_components_affected.slice(0, 5).join(", ")}`) : null,
+      packet.risks && packet.risks.length ? h("p", { class: "meta" }, `Risks: ${packet.risks.slice(0, 3).join("; ")}`) : null
+    ) : null,
+    h("div", { class: "button-row" },
+      task.id ? h("button", { onclick: () => selectTask(task.id) }, "Open Task") : null,
+      canWrite() ? h("button", { class: "primary", onclick: async () => { await api(`/api/handoffs/${x.id}/accept`, { method: "POST", body: "{}" }); await refresh(); } }, "Acquire / Accept Handoff") : null
+    )
+  );
 }
 
 function conflictsView() {
-  const stale = apiState.tasks.filter(t => t.claim_expires_at && new Date(t.claim_expires_at) < new Date());
   return h("div", { class: "grid2" },
     h("div", { class: "panel list" },
       h("h2", {}, "Open Conflicts"),
@@ -770,7 +943,26 @@ function conflictsView() {
     ),
     h("div", { class: "panel list" },
       h("h2", {}, "Stale Claims"),
-      stale.length ? stale.map(taskCard) : h("p", { class: "meta" }, "No stale claims.")
+      apiState.staleClaims.length ? apiState.staleClaims.map(staleClaimItem) : h("p", { class: "meta" }, "No stale claims.")
+    )
+  );
+}
+
+function staleClaimItem(item) {
+  const task = item.task || {};
+  const owner = item.owner ? item.owner.name : actorName(task.owner_id);
+  return h("div", { class: "item conflict-card" },
+    h("div", { class: "item-head" },
+      h("strong", {}, task.title || task.id),
+      h("span", { class: "pill amber" }, "stale claim")
+    ),
+    h("p", {}, item.reason || "Claim appears stale."),
+    h("p", { class: "meta" }, `Task: ${task.id} · owner ${owner}`),
+    h("p", { class: "meta" }, `Claimed: ${item.claim_timestamp ? new Date(item.claim_timestamp).toLocaleString() : "unknown"} · last activity: ${item.last_activity_timestamp ? new Date(item.last_activity_timestamp).toLocaleString() : "unknown"}`),
+    h("p", { class: "meta" }, `Threshold: ${item.stale_threshold || "unknown"} · actions: ${(item.suggested_actions || []).join(", ")}`),
+    h("div", { class: "button-row" },
+      task.id ? h("button", { onclick: () => selectTask(task.id) }, "Open Task") : null,
+      canWrite() && task.id ? h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/release`, { method: "POST", body: "{}" }); await refresh(); } }, "Release Claim") : null
     )
   );
 }
@@ -974,13 +1166,15 @@ function changePasswordForm() {
 function settings() {
   const token = h("input", { value: apiState.token, placeholder: "Team token" });
   const apiKey = h("input", { value: apiState.apiKey, placeholder: "API key" });
+  const actorID = h("input", { value: apiState.actor, placeholder: "Actor ID from CLI config" });
+  const actorSecret = h("input", { value: apiState.actorSecret, placeholder: "Actor secret from CLI config" });
   const identity = apiState.principal
     ? `${apiState.principal.kind} · ${apiState.principal.role} · ${apiState.principal.actor_id || apiState.principal.user_id || "session"}`
     : "Not signed in";
   return h("div", { class: "panel form" },
     h("h2", {}, "Connection"),
     h("p", { class: "meta" }, `Current identity: ${identity}`),
-    h("p", { class: "meta" }, "Use a team token for local testing or an API key for an agent. Dashboard actor credentials are managed automatically."),
+    h("p", { class: "meta" }, "Use a team token for local testing, an API key for an agent, or paste the CLI actor credentials so dashboard and CLI act as the same identity."),
     token,
     apiKey,
     h("button", { class: "primary", onclick: async () => {
@@ -991,6 +1185,30 @@ function settings() {
     setLegacyEnabled(!apiKey.value && !!token.value);
     await refresh();
   }}, "Save Connection"),
+    h("hr", {}),
+    h("p", { class: "meta" }, "Match dashboard identity to CLI. Use values from `taskpilot config show` and the local config file."),
+    actorID,
+    actorSecret,
+    h("button", { onclick: async () => {
+      apiState.error = "";
+      stopEventStream();
+      apiState.apiKey = "";
+      apiState.token = token.value.trim();
+      apiState.actor = actorID.value.trim();
+      apiState.actorSecret = actorSecret.value.trim();
+      saveSetting("taskpilot.apiKey", "");
+      saveSetting("taskpilot.token", apiState.token);
+      saveSetting("taskpilot.actor", apiState.actor);
+      saveSetting("taskpilot.actorSecret", apiState.actorSecret);
+      setLegacyEnabled(true);
+      try {
+        await api("/api/me");
+        await refresh();
+      } catch (err) {
+        apiState.error = `Could not use that actor identity. Check actor id, actor secret, and team token. (${err.message})`;
+        render();
+      }
+    }}, "Use This Actor In Dashboard"),
     h("button", { onclick: async () => {
       clearActorSettings();
       await ensureLegacyActor();
@@ -1004,6 +1222,8 @@ function loginView() {
   const password = h("input", { type: "password", placeholder: "Password" });
   const apiKey = h("input", { placeholder: "Agent/API key" });
   const token = h("input", { value: apiState.token, placeholder: "Development team token" });
+  const actorID = h("input", { value: apiState.actor, placeholder: "Existing actor ID, optional" });
+  const actorSecret = h("input", { value: apiState.actorSecret, placeholder: "Existing actor secret, optional" });
   return h("div", { class: "login" },
     h("div", { class: "panel form login-panel" },
       h("h1", {}, "TaskPilot"),
@@ -1027,15 +1247,26 @@ function loginView() {
       h("hr", {}),
       h("p", { class: "meta" }, "Docker default token: change-this-team-token-before-use. Local SQLite default token: dev-token."),
       token,
+      actorID,
+      actorSecret,
       h("button", { onclick: async () => {
         try {
           apiState.error = "";
           stopEventStream();
           apiState.token = token.value.trim();
+          apiState.apiKey = "";
+          saveSetting("taskpilot.apiKey", "");
           saveSetting("taskpilot.token", apiState.token);
           setLegacyEnabled(true);
-          clearActorSettings();
-          await ensureLegacyActor();
+          if (actorID.value.trim() || actorSecret.value.trim()) {
+            apiState.actor = actorID.value.trim();
+            apiState.actorSecret = actorSecret.value.trim();
+            saveSetting("taskpilot.actor", apiState.actor);
+            saveSetting("taskpilot.actorSecret", apiState.actorSecret);
+            await api("/api/me");
+          } else {
+            await ensureLegacyActor();
+          }
           await refresh();
         } catch (err) {
           setLegacyEnabled(false);
@@ -1096,6 +1327,7 @@ function render() {
       ),
       h("main", { class: "main" }, apiState.error ? h("div", { class: "panel error" }, apiState.error) : null, content)
     ));
+    if (apiState.handoffModal) root.append(handoffModalView());
   } catch (err) {
     document.body.innerHTML = `<div style="font:14px system-ui;padding:24px"><h1>TaskPilot dashboard error</h1><p>${String(err.message || err)}</p></div>`;
   }

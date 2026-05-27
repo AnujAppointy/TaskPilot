@@ -100,6 +100,7 @@ Server:
 Config:
   taskpilot login --server http://127.0.0.1:8080 --token dev-token
   taskpilot login --server http://127.0.0.1:8080 --api-key tpk_...
+  taskpilot config show
   taskpilot config set-server http://127.0.0.1:8080
   taskpilot config set-token dev-token
   taskpilot config set-api-key tpk_...
@@ -148,7 +149,7 @@ func runScaffold(domain string, args []string) error {
 
 func runAgentCommand(args []string) error {
 	if len(args) < 3 {
-		return fmt.Errorf("usage: taskpilot run <task-id> [--progress-interval 5s] [--no-complete] [--handoff-on-failure] [--handoff-to actor-id] [--summary text] -- <agent-command> [args...]")
+		return fmt.Errorf("usage: taskpilot run <task-id> [--progress-interval 5s] [--complete] [--handoff-on-failure] [--handoff-to actor-id] [--summary text] -- <agent-command> [args...]")
 	}
 	taskID := args[0]
 	sep := -1
@@ -163,7 +164,8 @@ func runAgentCommand(args []string) error {
 	}
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	progressEvery := fs.Duration("progress-interval", progressInterval(), "sync run context to the server while the child command runs")
-	noComplete := fs.Bool("no-complete", false, "leave task in progress instead of completing after successful command")
+	noComplete := fs.Bool("no-complete", false, "deprecated: taskpilot run no longer completes automatically")
+	completeOnSuccess := fs.Bool("complete", false, "explicitly complete the task when the child command succeeds")
 	handoffOnFailure := fs.Bool("handoff-on-failure", true, "prepare a handoff packet if the child command fails")
 	handoffTo := fs.String("handoff-to", "", "target actor for failure handoff")
 	summaryFlag := fs.String("summary", "", "completion summary override")
@@ -191,11 +193,10 @@ func runAgentCommand(args []string) error {
 	}
 	defer cleanup()
 	var contextOffset int64
-	_ = appendRunContext(taskID, "summary", "taskpilot run started agent command: "+strings.Join(commandArgs, " "))
 	if detail.Task.OwnerID == "" || detail.Task.OwnerID != cfg.ActorID {
 		var claimed Task
 		if err := request("POST", "/api/tasks/"+taskID+"/claim", map[string]any{"reason": "taskpilot run"}, &claimed); err != nil {
-			return err
+			return taskRunOwnershipError(taskID, cfg, detail, err)
 		}
 	}
 	for _, scope := range detail.Task.Scope {
@@ -205,6 +206,11 @@ func runAgentCommand(args []string) error {
 	if err := request("GET", "/api/tasks/"+taskID, nil, &detail); err != nil {
 		return err
 	}
+	var session TaskSession
+	if err := request("POST", "/api/tasks/"+taskID+"/sessions/start", map[string]any{}, &session); err != nil {
+		return taskRunOwnershipError(taskID, cfg, detail, err)
+	}
+	_ = appendRunContext(taskID, "summary", "taskpilot run started agent command: "+strings.Join(commandArgs, " "))
 	taskContextPath, relatedContextPath, contextCleanup, err := createAgentContextFiles(taskID, detail)
 	if err != nil {
 		return err
@@ -223,8 +229,10 @@ func runAgentCommand(args []string) error {
 	defer cancel()
 	done := make(chan struct{})
 	var contextMu sync.Mutex
+	lastSnapshotAt := time.Now().UTC()
+	pendingSnapshotEntries := 0
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done, &contextMu)
+	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done, &contextMu, &lastSnapshotAt, &pendingSnapshotEntries)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -246,20 +254,24 @@ func runAgentCommand(args []string) error {
 	close(done)
 	contextMu.Lock()
 	imported := importRunContextSince(taskID, contextPath, &contextOffset)
+	if imported > 0 {
+		_ = generateRunSnapshot(taskID, "final")
+	}
 	contextMu.Unlock()
 	changed := touchedFilesSummary(beforeFiles, gitChangedFiles())
 	if changed != "" {
 		_ = appendRunContext(taskID, "output_ref", changed)
+		_ = generateRunSnapshot(taskID, "final")
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "agent command exited with error: %v\n", err)
 		_ = appendRunContext(taskID, "blocker", "taskpilot run command failed: "+err.Error())
-		if *handoffOnFailure {
+		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "failed", "finish_reason": err.Error()}, &Task{})
+		_ = generateRunHandoffPacket(taskID, "", "draft")
+		if *handoffOnFailure && *handoffTo != "" {
 			_, _ = prepareRunHandoff(taskID, *handoffTo, err.Error(), changed, imported)
 		}
-		var status Task
-		_ = request("PATCH", "/api/tasks/"+taskID, map[string]any{"status": "blocked", "reason": "agent command failed"}, &status)
-		_, _ = fmt.Fprintf(os.Stderr, "Task marked blocked. Add context or prepare handoff with taskpilot context/handoff commands.\n")
+		_, _ = fmt.Fprintf(os.Stderr, "Task returned to claimed state. Review context, mark blocked, or publish a handoff if needed.\n")
 		return err
 	}
 	summary := strings.TrimSpace(*summaryFlag)
@@ -269,17 +281,22 @@ func runAgentCommand(args []string) error {
 	if summary == "" {
 		summary = "Agent command completed successfully through taskpilot run."
 	}
-	if *noComplete {
-		_ = appendRunContext(taskID, "summary", summary)
-		var inProgress Task
-		_ = request("PATCH", "/api/tasks/"+taskID, map[string]any{"status": "in_progress", "reason": "taskpilot run finished with --no-complete"}, &inProgress)
-		return print(inProgress, false)
+	_ = generateRunSnapshot(taskID, "final")
+	_ = generateRunHandoffPacket(taskID, "", "draft")
+	if *completeOnSuccess && !*noComplete {
+		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "success", "finish_reason": "agent command exited before explicit completion"}, &Task{})
+		var completed Task
+		if err := request("POST", "/api/tasks/"+taskID+"/complete", map[string]any{"summary": summary}, &completed); err != nil {
+			return err
+		}
+		return print(completed, false)
 	}
-	var completed Task
-	if err := request("POST", "/api/tasks/"+taskID+"/complete", map[string]any{"summary": summary}, &completed); err != nil {
+	_ = appendRunContext(taskID, "summary", summary)
+	var claimed Task
+	if err := request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "success", "finish_reason": "agent command exited"}, &claimed); err != nil {
 		return err
 	}
-	return print(completed, false)
+	return print(claimed, false)
 }
 
 func appendRunContext(taskID, kind, content string) error {
@@ -317,7 +334,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}, mu *sync.Mutex) {
+func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}, mu *sync.Mutex, lastSnapshotAt *time.Time, pendingSnapshotEntries *int) {
 	if interval <= 0 {
 		return
 	}
@@ -331,10 +348,29 @@ func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset
 			return
 		case <-ticker.C:
 			mu.Lock()
-			importRunContextSince(taskID, contextPath, contextOffset)
+			imported := importRunContextSince(taskID, contextPath, contextOffset)
+			if imported > 0 {
+				*pendingSnapshotEntries += imported
+				if *pendingSnapshotEntries >= 5 || time.Since(*lastSnapshotAt) >= time.Minute {
+					if generateRunSnapshot(taskID, "periodic") == nil {
+						*lastSnapshotAt = time.Now().UTC()
+						*pendingSnapshotEntries = 0
+					}
+				}
+			}
 			mu.Unlock()
 		}
 	}
+}
+
+func generateRunSnapshot(taskID, snapshotType string) error {
+	var out ContextSnapshot
+	return request("POST", "/api/tasks/"+taskID+"/snapshots", map[string]any{"snapshot_type": snapshotType}, &out)
+}
+
+func generateRunHandoffPacket(taskID, handoffID, status string) error {
+	var out HandoffPacket
+	return request("POST", "/api/tasks/"+taskID+"/handoff-packet/generate", map[string]any{"handoff_id": handoffID, "status": status}, &out)
 }
 
 func createRunContextFile(taskID string) (string, func(), error) {
@@ -511,13 +547,31 @@ While working:
 - If live taskpilot CLI/server access fails from inside the agent runtime, continue from the injected context files.
 - Write useful updates immediately to ` + runContextPath + `.
 
+Write context that would let a different agent continue the work without reading this chat. Prefer short, specific entries over vague status updates.
+
 Accepted update lines for ` + runContextPath + `:
-- summary: what you found or completed
-- decision: decision made and why
-- risk: risk or caveat
-- blocker: what blocks progress
-- output_ref: changed files, PRs, docs, or other references
-- next: next step for another agent or human
+- summary: concrete work completed, current state, or root cause found
+- finding: important observation discovered during investigation
+- decision: decision made plus the reason and tradeoff
+- rationale: why the current approach is being used
+- rejected: approach considered but not used, and why
+- risk: risk, caveat, assumption, or possible regression
+- blocker: what blocks progress and what is needed to unblock
+- files: files, modules, APIs, commands, PRs, docs, or artifacts touched
+- verification: tests, commands, checks, or manual validation performed
+- next: specific next step another agent or human should take
+
+Useful examples:
+- summary: Traced invite signup failure to expiry comparison after token lookup.
+- finding: Token format is reused by existing invite links, so changing it would break old emails.
+- decision: Patch expiry comparison only; keep token format unchanged to preserve compatibility.
+- rationale: The failure is after validation, so DB schema changes are unnecessary.
+- rejected: Rejected adding a new invite_tokens table because the existing token record has enough state.
+- risk: Timezone handling may still be fragile around midnight UTC.
+- blocker: Need a real expired invite sample before changing cleanup behavior.
+- files: src/auth/invite.go, src/auth/invite_test.go
+- verification: go test ./src/auth passed after adding invited-user regression coverage.
+- next: Add one regression test for already-used invite tokens.
 
 Do not upload or write secrets, raw private logs, customer data, private prompts, or raw local files into TaskPilot context.`
 }
@@ -859,23 +913,62 @@ func parseRunContextLine(line string) (runContextEntry, bool) {
 	}
 	var entry runContextEntry
 	if strings.HasPrefix(line, "{") && json.Unmarshal([]byte(line), &entry) == nil {
-		entry.Kind = normalizeContextKind(entry.Kind)
 		entry.Content = strings.TrimSpace(entry.Content)
+		entry.Kind, entry.Content = normalizeRunContextEntry(entry.Kind, entry.Content)
 		return entry, entry.Content != ""
 	}
 	parts := strings.SplitN(line, ":", 2)
 	if len(parts) == 2 {
-		entry.Kind = normalizeContextKind(parts[0])
 		entry.Content = strings.TrimSpace(parts[1])
+		entry.Kind, entry.Content = normalizeRunContextEntry(parts[0], entry.Content)
 		return entry, entry.Content != ""
 	}
 	return runContextEntry{Kind: "note", Content: line}, true
 }
 
+func normalizeRunContextEntry(kind, content string) (string, string) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	content = strings.TrimSpace(content)
+	label := func(prefix string) string {
+		if content == "" {
+			return ""
+		}
+		return prefix + ": " + content
+	}
+	switch kind {
+	case "summary", "completed", "completion":
+		return "summary", content
+	case "finding", "findings", "root_cause", "root-cause", "cause":
+		return "summary", label("Finding")
+	case "decision":
+		return "decision", content
+	case "rationale", "reasoning", "reason", "why":
+		return "note", label("Rationale")
+	case "rejected", "rejected_approach", "rejected-approach", "alternative", "alternatives":
+		return "decision", label("Rejected approach")
+	case "constraint", "assumption", "assumptions", "caveat":
+		return "risk", label("Assumption")
+	case "risk":
+		return "risk", content
+	case "blocker", "blocked":
+		return "blocker", content
+	case "output_ref", "output", "artifact", "file", "files", "changed", "changed_files", "changed-files", "touched", "touched_files", "touched-files":
+		return "output_ref", content
+	case "verification", "verified", "test", "tests", "check", "checks", "validation":
+		return "note", label("Verification")
+	case "next", "next_step", "next-step", "todo", "followup", "follow_up", "follow-up":
+		return "next", content
+	case "progress", "note", "":
+		return "note", content
+	default:
+		return "note", label(kind)
+	}
+}
+
 func normalizeContextKind(kind string) string {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	switch kind {
-	case "summary", "decision", "note", "risk", "blocker", "output_ref":
+	case "summary", "decision", "note", "risk", "blocker", "output_ref", "next":
 		return kind
 	case "output", "artifact", "file", "files":
 		return "output_ref"
@@ -1063,7 +1156,7 @@ func mcpTools() []map[string]any {
 		mcpTool("read_task", "Read full TaskPilot task detail.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("claim_task", "Claim a TaskPilot task.", map[string]any{"task_id": mcpString("Task ID"), "force": map[string]any{"type": "boolean"}, "reason": mcpString("Reason for force claim")}, []string{"task_id"}),
 		mcpTool("heartbeat_task", "Renew active task ownership heartbeat.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
-		mcpTool("append_context", "Append sanitized task context.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref"), "content": mcpString("Sanitized context content")}, []string{"task_id", "content"}),
+		mcpTool("append_context", "Append sanitized task context.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content")}, []string{"task_id", "content"}),
 		mcpTool("complete_task", "Complete a task with a summary.", map[string]any{"task_id": mcpString("Task ID"), "summary": mcpString("Completion summary")}, []string{"task_id"}),
 	}
 }
@@ -1170,21 +1263,29 @@ Required workflow:
 
 Write useful updates to TASKPILOT_RUN_CONTEXT_FILE as soon as each meaningful unit of work finishes. Do not wait until the whole session ends.
 
+Write context that would let a different agent continue the work without reading this chat. Prefer short, specific entries over vague status updates.
+
 Accepted context formats:
-- summary: Found that expiry validation fails after invite token lookup
-- decision: Keep token format unchanged
-- risk: Changing DB schema may break existing invite links
-- blocker: Need reproduction data for expired invite token
-- output_ref: Touched src/auth/token.go and src/auth/token_test.go
-- next: Add regression coverage for invited-user signup
-- {"kind":"decision","content":"Patch expiry comparison only"}
+- summary: Traced invite signup failure to expiry comparison after token lookup.
+- finding: Token format is reused by existing invite links, so changing it would break old emails.
+- decision: Patch expiry comparison only; keep token format unchanged to preserve compatibility.
+- rationale: The failure is after validation, so DB schema changes are unnecessary.
+- rejected: Rejected adding a new invite_tokens table because the existing token record has enough state.
+- risk: Timezone handling may still be fragile around midnight UTC.
+- blocker: Need a real expired invite sample before changing cleanup behavior.
+- files: src/auth/invite.go, src/auth/invite_test.go
+- verification: go test ./src/auth passed after adding invited-user regression coverage.
+- next: Add one regression test for already-used invite tokens.
+- {"kind":"decision","content":"Patch expiry comparison only because expiry validation is the failing boundary."}
 
 Recommended update timing:
-- After reading important task context, write a short summary if it changes your plan.
-- After finding a root cause, write a summary.
-- After making a decision, write a decision with the reason.
-- After discovering a risk or blocker, write it immediately.
-- After changing files or creating outputs, write an output_ref.
+- After reading important task context, write a summary only if it changes the plan.
+- After finding a root cause, write a finding or summary.
+- After making a decision, write a decision and include the reason/tradeoff.
+- After rejecting an approach, write a rejected entry so the next agent does not repeat it.
+- After discovering a risk, assumption, or blocker, write it immediately.
+- After changing files or creating outputs, write files or output_ref.
+- After running tests/checks, write verification.
 - Before handing off or stopping, write next steps.
 
 When possible, use the TaskPilot CLI directly:
@@ -1521,16 +1622,38 @@ func runLogin(args []string) error {
 }
 
 func runConfig(args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: taskpilot config set-server|set-token|set-api-key <value> OR taskpilot config set-actor <actor-id> <actor-secret>")
+	if len(args) < 1 {
+		return fmt.Errorf("usage: taskpilot config show|set-server|set-token|set-api-key <value> OR taskpilot config set-actor <actor-id> <actor-secret>")
 	}
 	cfg, _ := loadConfig()
 	switch args[0] {
+	case "show":
+		safe := map[string]any{
+			"server":     cfg.Server,
+			"actor_id":   cfg.ActorID,
+			"has_secret": cfg.ActorSecret != "",
+			"auth":       "team_token",
+		}
+		if cfg.APIKey != "" {
+			safe["auth"] = "api_key"
+		}
+		b, _ := json.MarshalIndent(safe, "", "  ")
+		fmt.Println(string(b))
+		return nil
 	case "set-server":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: taskpilot config set-server <url>")
+		}
 		cfg.Server = strings.TrimRight(args[1], "/")
 	case "set-token":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: taskpilot config set-token <token>")
+		}
 		cfg.Token = args[1]
 	case "set-api-key":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: taskpilot config set-api-key <key>")
+		}
 		cfg.APIKey = args[1]
 	case "set-actor":
 		if len(args) < 3 {
@@ -2004,6 +2127,28 @@ func request(method, path string, body any, out any) error {
 
 func requestNoActor(method, path string, body any, out any) error {
 	return doRequest(method, path, body, out, false)
+}
+
+func taskRunOwnershipError(taskID string, cfg Config, detail TaskDetail, cause error) error {
+	if detail.Task.OwnerID == "" || detail.Task.OwnerID == cfg.ActorID || !strings.Contains(cause.Error(), "actively owned") {
+		return cause
+	}
+	owner := detail.Task.OwnerID
+	if detail.Owner != nil {
+		owner = fmt.Sprintf("%s (%s, %s)", detail.Owner.Name, detail.Owner.Kind, detail.Owner.ID)
+	}
+	current := cfg.ActorID
+	if current == "" {
+		current = "no actor configured"
+	}
+	return fmt.Errorf(
+		"%w\n\nTaskPilot run is configured as actor %s, but task %s is currently owned by %s.\n"+
+			"Accept the handoff with the same CLI actor, or intentionally transfer the task first:\n"+
+			"  taskpilot task claim %s --force --reason \"continue handoff from CLI agent\"\n"+
+			"To inspect local CLI identity, run:\n"+
+			"  taskpilot config show",
+		cause, current, taskID, owner, taskID,
+	)
 }
 
 func doRequest(method, path string, body any, out any, includeActor bool) error {

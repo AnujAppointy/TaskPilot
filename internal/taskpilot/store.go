@@ -154,7 +154,7 @@ func (s *Store) Stats(ctx context.Context) (StoreStats, error) {
 	}{
 		{`SELECT COUNT(*) FROM tasks`, &out.Tasks},
 		{`SELECT COUNT(*) FROM actors`, &out.Actors},
-		{`SELECT COUNT(*) FROM locks WHERE released_at IS NULL AND expires_at > ?`, &out.ActiveLocks},
+		{`SELECT COUNT(*) FROM locks WHERE released_at IS NULL AND status IN ('active','stale')`, &out.ActiveLocks},
 		{`SELECT COUNT(*) FROM handoffs`, &out.Handoffs},
 		{`SELECT COUNT(*) FROM events`, &out.Events},
 	}
@@ -239,7 +239,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS locks (
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, owner_id TEXT NOT NULL, scope TEXT NOT NULL,
-			scope_type TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, released_at TEXT
+			scope_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+			expires_at TEXT NOT NULL, last_heartbeat_at TEXT NOT NULL,
+			created_at TEXT NOT NULL, released_at TEXT, released_by TEXT, release_reason TEXT,
+			overridden_at TEXT, overridden_by TEXT, override_reason TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS conflicts (
 			id TEXT PRIMARY KEY, task_id TEXT, actor_id TEXT, conflict_type TEXT NOT NULL,
@@ -252,6 +255,22 @@ func (s *Store) migrate(ctx context.Context) error {
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, from_actor_id TEXT NOT NULL, to_actor_id TEXT,
 			status TEXT NOT NULL, resume_summary TEXT NOT NULL, next_steps_json TEXT NOT NULL,
 			created_at TEXT NOT NULL, accepted_at TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS context_snapshots (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, author_id TEXT NOT NULL,
+			source TEXT NOT NULL, snapshot_type TEXT NOT NULL, status_at_time TEXT NOT NULL,
+			summary_json TEXT NOT NULL, markdown_cache TEXT NOT NULL,
+			source_context_ids_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS handoff_packets (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, handoff_id TEXT, generated_by TEXT NOT NULL,
+			status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, packet_json TEXT NOT NULL, markdown_cache TEXT NOT NULL,
+			source_snapshot_ids_json TEXT NOT NULL, source_context_ids_json TEXT NOT NULL,
+			edited_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS task_sessions (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+			started_at TEXT NOT NULL, ended_at TEXT, exit_status TEXT, finish_reason TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS task_dependencies (
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, depends_on_id TEXT NOT NULL,
@@ -273,6 +292,19 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN repo_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN workspace_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN parent_task_id TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN last_heartbeat_at TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN released_by TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN release_reason TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN overridden_at TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN overridden_by TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN override_reason TEXT`)
+	_, _ = s.exec(ctx, `UPDATE locks SET status='active' WHERE status='' OR status IS NULL`)
+	_, _ = s.exec(ctx, `UPDATE locks SET last_heartbeat_at=created_at WHERE last_heartbeat_at='' OR last_heartbeat_at IS NULL`)
+	_, _ = s.exec(ctx, `UPDATE locks SET status='released' WHERE released_at IS NOT NULL AND status='active'`)
+	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
+	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='published' WHERE status='ready' AND handoff_id IS NOT NULL AND handoff_id<>''`)
+	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='draft' WHERE status='ready' AND (handoff_id IS NULL OR handoff_id='')`)
 	if err := s.ensureDefaultProject(ctx); err != nil {
 		return err
 	}
@@ -670,6 +702,8 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 	gitRefs, _ := s.ListGitRefs(ctx, id)
 	l, _ := s.ListLocks(ctx, id, false)
 	h, _ := s.ListHandoffs(ctx, id)
+	snapshots, _ := s.ListContextSnapshots(ctx, id)
+	packet, _ := s.LatestHandoffPacket(ctx, id)
 	e, _ := s.ListEvents(ctx, 0, id)
 	subtasks, _ := s.ListSubtasks(ctx, id)
 	dependencies, _ := s.ListTaskDependencies(ctx, id)
@@ -680,7 +714,11 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 			parent = &p
 		}
 	}
-	return TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Events: e}, nil
+	var latestSnapshot *ContextSnapshot
+	if len(snapshots) > 0 {
+		latestSnapshot = &snapshots[len(snapshots)-1]
+	}
+	return TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, Events: e}, nil
 }
 
 func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput, reason string) (Task, error) {
@@ -688,6 +726,7 @@ func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput
 	if err != nil {
 		return Task{}, err
 	}
+	oldStatus := t.Status
 	if in.Title != "" {
 		t.Title = in.Title
 	}
@@ -698,6 +737,9 @@ func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput
 		t.Type = in.Type
 	}
 	if in.Status != "" {
+		if in.Status == "completed" && reason != "completed" {
+			return Task{}, userErr("validation", "completed status requires the complete action")
+		}
 		if err := validateStatusTransition(t.Status, in.Status); err != nil {
 			return Task{}, err
 		}
@@ -762,6 +804,9 @@ func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput
 	if err != nil {
 		return Task{}, err
 	}
+	if oldStatus != t.Status {
+		_ = s.addEvent(ctx, t.ID, actorID, "task.status_changed", map[string]any{"from": oldStatus, "to": t.Status, "reason": reason})
+	}
 	return t, s.addEvent(ctx, t.ID, actorID, "task.updated", map[string]any{"task": t, "reason": reason})
 }
 
@@ -778,6 +823,13 @@ func (s *Store) ClaimTask(ctx context.Context, actorID, id, reason string, force
 	if force && t.OwnerID != "" && t.OwnerID != actorID && strings.TrimSpace(reason) == "" {
 		return Task{}, userErr("validation", "reason is required to force reassign an active task")
 	}
+	if force && t.OwnerID != "" && t.OwnerID != actorID {
+		_, _ = s.exec(ctx, `UPDATE locks SET owner_id=?, status='active', last_heartbeat_at=?, expires_at=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+			actorID, ts(now), ts(now.Add(DefaultLockTTL)), t.ID, t.OwnerID)
+	}
+	if err := s.ensureTaskLockable(ctx, actorID, t); err != nil {
+		return Task{}, err
+	}
 	exp := now.Add(DefaultClaimTTL)
 	t.OwnerID = actorID
 	t.Status = "claimed"
@@ -792,6 +844,9 @@ func (s *Store) ClaimTask(ctx context.Context, actorID, id, reason string, force
 	etype := "task.claimed"
 	if force {
 		etype = "task.reassigned"
+	}
+	if err := s.ensureTaskLocks(ctx, actorID, t); err != nil {
+		return Task{}, err
 	}
 	return t, s.addEvent(ctx, t.ID, actorID, etype, map[string]any{"owner_id": actorID, "reason": reason})
 }
@@ -814,6 +869,9 @@ func (s *Store) ReleaseTask(ctx context.Context, actorID, id string) (Task, erro
 	if err != nil {
 		return Task{}, err
 	}
+	_, _ = s.exec(ctx, `UPDATE locks SET status='released', released_at=?, released_by=?, release_reason=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+		ts(now), actorID, "task released", t.ID, actorID)
+	_ = s.addEvent(ctx, t.ID, actorID, "claim.released_by_user", map[string]any{"task_id": t.ID})
 	return t, s.addEvent(ctx, t.ID, actorID, "task.released", nil)
 }
 
@@ -834,7 +892,67 @@ func (s *Store) HeartbeatTask(ctx context.Context, actorID, id string) (Task, er
 	if err != nil {
 		return Task{}, err
 	}
+	if err := s.renewTaskLocks(ctx, actorID, t.ID, now); err != nil {
+		return Task{}, err
+	}
 	return t, s.addEvent(ctx, t.ID, actorID, "task.heartbeat", map[string]any{"claim_expires_at": exp})
+}
+
+func (s *Store) StartTaskSession(ctx context.Context, actorID, taskID string) (TaskSession, error) {
+	t, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return TaskSession{}, err
+	}
+	if t.OwnerID == "" || t.OwnerID != actorID {
+		if _, err := s.ClaimTask(ctx, actorID, taskID, "session start", false); err != nil {
+			return TaskSession{}, err
+		}
+	}
+	if err := s.ensureTaskLockable(ctx, actorID, t); err != nil {
+		return TaskSession{}, err
+	}
+	if err := s.ensureTaskLocks(ctx, actorID, t); err != nil {
+		return TaskSession{}, err
+	}
+	if _, err := s.UpdateTask(ctx, actorID, taskID, TaskInput{Status: "in_progress"}, "session started"); err != nil {
+		return TaskSession{}, err
+	}
+	now := time.Now().UTC()
+	session := TaskSession{ID: newID("session"), TaskID: taskID, ActorID: actorID, StartedAt: now}
+	_, err = s.exec(ctx, `INSERT INTO task_sessions (id,task_id,actor_id,started_at) VALUES (?,?,?,?)`,
+		session.ID, session.TaskID, session.ActorID, ts(session.StartedAt))
+	if err != nil {
+		return TaskSession{}, err
+	}
+	return session, s.addEvent(ctx, taskID, actorID, "task.session_started", session)
+}
+
+func (s *Store) FinishTaskSession(ctx context.Context, actorID, taskID, sessionID, exitStatus, reason string) (Task, error) {
+	now := time.Now().UTC()
+	if sessionID != "" {
+		_, _ = s.exec(ctx, `UPDATE task_sessions SET ended_at=?,exit_status=?,finish_reason=? WHERE id=?`,
+			ts(now), exitStatus, reason, sessionID)
+	}
+	t, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return Task{}, err
+	}
+	if t.OwnerID != actorID {
+		return Task{}, userErr("forbidden", "only the owner can finish this task session")
+	}
+	nextStatus := "claimed"
+	if t.Status == "completed" || t.Status == "blocked" || t.Status == "handoff_ready" || t.Status == "in_review" || t.Status == "cancelled" {
+		nextStatus = t.Status
+	}
+	out, err := s.UpdateTask(ctx, actorID, taskID, TaskInput{Status: nextStatus}, reason)
+	if err != nil {
+		return Task{}, err
+	}
+	eventType := "task.session_finished"
+	if exitStatus != "" && exitStatus != "success" {
+		eventType = "task.session_failed"
+	}
+	return out, s.addEvent(ctx, taskID, actorID, eventType, map[string]any{"session_id": sessionID, "exit_status": exitStatus, "reason": reason})
 }
 
 func (s *Store) CompleteTask(ctx context.Context, actorID, id, summary string) (Task, error) {
@@ -849,7 +967,11 @@ func (s *Store) CompleteTask(ctx context.Context, actorID, id, summary string) (
 			return Task{}, err
 		}
 	}
-	return s.UpdateTask(ctx, actorID, id, TaskInput{Status: "completed"}, "completed")
+	t, err := s.UpdateTask(ctx, actorID, id, TaskInput{Status: "completed"}, "completed")
+	if err != nil {
+		return Task{}, err
+	}
+	return t, s.addEvent(ctx, id, actorID, "task.completed", map[string]any{"summary": summary})
 }
 
 func (s *Store) AddTaskDependency(ctx context.Context, actorID, taskID, dependsOnID string) (TaskDependency, error) {
@@ -979,7 +1101,7 @@ func (s *Store) AppendContext(ctx context.Context, actorID, taskID, kind, conten
 	if kind == "" {
 		kind = "note"
 	}
-	if !oneOf(kind, "summary", "decision", "note", "risk", "blocker", "output_ref") {
+	if !oneOf(kind, "summary", "decision", "note", "risk", "blocker", "output_ref", "next") {
 		return ContextEntry{}, userErr("validation", "invalid context kind")
 	}
 	if _, err := s.GetTask(ctx, taskID); err != nil {
@@ -1012,6 +1134,221 @@ func (s *Store) ListContext(ctx context.Context, taskID string) ([]ContextEntry,
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CreateContextSnapshot(ctx context.Context, actorID, taskID, snapshotType string) (ContextSnapshot, error) {
+	if snapshotType == "" {
+		snapshotType = "periodic"
+	}
+	if !oneOf(snapshotType, "periodic", "milestone", "manual", "final") {
+		return ContextSnapshot{}, userErr("validation", "invalid snapshot type")
+	}
+	detail, err := s.TaskDetail(ctx, taskID)
+	if err != nil {
+		return ContextSnapshot{}, err
+	}
+	since := time.Time{}
+	if last, err := s.latestSnapshotCreatedAt(ctx, taskID); err == nil {
+		since = last
+	}
+	entries := []ContextEntry{}
+	for _, entry := range detail.Context {
+		if entry.CreatedAt.After(since) || snapshotType == "manual" || snapshotType == "final" {
+			entries = append(entries, entry)
+		}
+	}
+	if len(entries) == 0 && snapshotType == "periodic" {
+		return ContextSnapshot{}, userErr("validation", "no new context available for snapshot")
+	}
+	content, sourceContextIDs := buildSnapshotContent(detail, entries)
+	markdown := renderSnapshotMarkdown(content)
+	now := time.Now().UTC()
+	out := ContextSnapshot{
+		ID:               newID("snapshot"),
+		TaskID:           taskID,
+		AuthorID:         actorID,
+		Source:           "system",
+		SnapshotType:     snapshotType,
+		StatusAtTime:     detail.Task.Status,
+		Summary:          content,
+		Markdown:         markdown,
+		SourceContextIDs: sourceContextIDs,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	_, err = s.exec(ctx, `INSERT INTO context_snapshots (id,task_id,author_id,source,snapshot_type,status_at_time,summary_json,markdown_cache,source_context_ids_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		out.ID, out.TaskID, out.AuthorID, out.Source, out.SnapshotType, out.StatusAtTime, js(out.Summary), out.Markdown, js(out.SourceContextIDs), ts(out.CreatedAt), ts(out.UpdatedAt))
+	if err != nil {
+		return ContextSnapshot{}, err
+	}
+	return out, s.addEvent(ctx, taskID, actorID, "context.snapshot_created", out)
+}
+
+func (s *Store) ListContextSnapshots(ctx context.Context, taskID string) ([]ContextSnapshot, error) {
+	rows, err := s.query(ctx, `SELECT id,task_id,author_id,source,snapshot_type,status_at_time,summary_json,markdown_cache,source_context_ids_json,created_at,updated_at FROM context_snapshots WHERE task_id=? ORDER BY created_at ASC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ContextSnapshot{}
+	for rows.Next() {
+		snapshot, err := scanContextSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, snapshot)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateContextSnapshotMarkdown(ctx context.Context, actorID, snapshotID, markdown string) (ContextSnapshot, error) {
+	snapshot, err := s.getContextSnapshot(ctx, snapshotID)
+	if err != nil {
+		return ContextSnapshot{}, err
+	}
+	summary, err := parseSnapshotMarkdownStrict(markdown)
+	if err != nil {
+		return ContextSnapshot{}, err
+	}
+	snapshot.Summary = summary
+	snapshot.Markdown = renderSnapshotMarkdown(snapshot.Summary)
+	snapshot.UpdatedAt = time.Now().UTC()
+	_, err = s.exec(ctx, `UPDATE context_snapshots SET summary_json=?,markdown_cache=?,updated_at=? WHERE id=?`, js(snapshot.Summary), snapshot.Markdown, ts(snapshot.UpdatedAt), snapshot.ID)
+	if err != nil {
+		return ContextSnapshot{}, err
+	}
+	return snapshot, s.addEvent(ctx, snapshot.TaskID, actorID, "context.snapshot_edited", map[string]any{"id": snapshot.ID})
+}
+
+func (s *Store) GenerateHandoffPacket(ctx context.Context, actorID, taskID, handoffID, status string) (HandoffPacket, error) {
+	if status == "" {
+		status = "draft"
+	}
+	if status == "ready" {
+		status = "published"
+	}
+	if !oneOf(status, "draft", "published", "accepted", "rejected", "superseded") {
+		return HandoffPacket{}, userErr("validation", "invalid handoff packet status")
+	}
+	detail, err := s.TaskDetail(ctx, taskID)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	snapshots := detail.Snapshots
+	if len(snapshots) == 0 {
+		if snapshot, err := s.CreateContextSnapshot(ctx, actorID, taskID, "final"); err == nil {
+			snapshots = []ContextSnapshot{snapshot}
+		}
+	}
+	packetContent, sourceSnapshotIDs, sourceContextIDs := buildHandoffPacketContent(detail, snapshots)
+	markdown := renderHandoffMarkdown(packetContent)
+	now := time.Now().UTC()
+	out := HandoffPacket{
+		ID:                newID("packet"),
+		TaskID:            taskID,
+		HandoffID:         handoffID,
+		GeneratedBy:       actorID,
+		Status:            status,
+		Version:           1,
+		Packet:            packetContent,
+		Markdown:          markdown,
+		SourceSnapshotIDs: sourceSnapshotIDs,
+		SourceContextIDs:  sourceContextIDs,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='superseded' WHERE task_id=? AND status IN ('draft','published')`, taskID)
+	_, err = s.exec(ctx, `INSERT INTO handoff_packets (id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,edited_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		out.ID, out.TaskID, nullableString(out.HandoffID), out.GeneratedBy, out.Status, out.Version, js(out.Packet), out.Markdown, js(out.SourceSnapshotIDs), js(out.SourceContextIDs), nil, ts(out.CreatedAt), ts(out.UpdatedAt))
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	return out, s.addEvent(ctx, taskID, actorID, "handoff.packet_generated", out)
+}
+
+func (s *Store) LatestHandoffPacket(ctx context.Context, taskID string) (*HandoffPacket, error) {
+	row := s.queryRow(ctx, `SELECT id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,edited_by,created_at,updated_at FROM handoff_packets WHERE task_id=? ORDER BY updated_at DESC LIMIT 1`, taskID)
+	packet, err := scanHandoffPacket(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &packet, nil
+}
+
+func (s *Store) UpdateHandoffPacketMarkdown(ctx context.Context, actorID, packetID, markdown string) (HandoffPacket, error) {
+	packet, err := s.getHandoffPacket(ctx, packetID)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	content, err := parseHandoffMarkdownStrict(markdown, false)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	packet.Packet = content
+	packet.Markdown = renderHandoffMarkdown(packet.Packet)
+	packet.EditedBy = actorID
+	packet.Version++
+	packet.UpdatedAt = time.Now().UTC()
+	_, err = s.exec(ctx, `UPDATE handoff_packets SET packet_json=?,markdown_cache=?,edited_by=?,version=?,updated_at=? WHERE id=?`, js(packet.Packet), packet.Markdown, actorID, packet.Version, ts(packet.UpdatedAt), packet.ID)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	return packet, s.addEvent(ctx, packet.TaskID, actorID, "handoff.packet_edited", map[string]any{"id": packet.ID})
+}
+
+func (s *Store) PublishHandoffPacket(ctx context.Context, actorID, packetID string) (HandoffPacket, error) {
+	packet, err := s.getHandoffPacket(ctx, packetID)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	content, err := parseHandoffMarkdownStrict(packet.Markdown, true)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	packet.Packet = content
+	if len(packet.Packet.SuggestedNextSteps) == 0 {
+		packet.Packet.SuggestedNextSteps = []string{"Review this handoff, verify the current task state, then continue the next useful step."}
+	}
+	if packet.HandoffID == "" {
+		summary := strings.TrimSpace(packet.Packet.HandoffMessage)
+		if summary == "" {
+			summary = strings.TrimSpace(packet.Packet.TaskObjective)
+		}
+		if summary == "" {
+			summary = "Handoff prepared from TaskPilot memory."
+		}
+		h := Handoff{ID: newID("handoff"), TaskID: packet.TaskID, FromActorID: actorID, Status: "prepared", ResumeSummary: summary, NextSteps: packet.Packet.SuggestedNextSteps, CreatedAt: time.Now().UTC()}
+		_, err := s.exec(ctx, `INSERT INTO handoffs (id,task_id,from_actor_id,to_actor_id,status,resume_summary,next_steps_json,created_at,accepted_at) VALUES (?,?,?,?,?,?,?,?,NULL)`,
+			h.ID, h.TaskID, h.FromActorID, h.ToActorID, h.Status, h.ResumeSummary, js(h.NextSteps), ts(h.CreatedAt))
+		if err != nil {
+			return HandoffPacket{}, err
+		}
+		packet.HandoffID = h.ID
+	}
+	packet.Status = "published"
+	packet.Version++
+	packet.Markdown = renderHandoffMarkdown(packet.Packet)
+	packet.UpdatedAt = time.Now().UTC()
+	_, err = s.exec(ctx, `UPDATE handoff_packets SET handoff_id=?,status='published',version=?,packet_json=?,markdown_cache=?,edited_by=?,updated_at=? WHERE id=?`,
+		nullableString(packet.HandoffID), packet.Version, js(packet.Packet), packet.Markdown, actorID, ts(packet.UpdatedAt), packet.ID)
+	if err != nil {
+		return HandoffPacket{}, err
+	}
+	if _, err := s.UpdateTask(ctx, actorID, packet.TaskID, TaskInput{Status: "handoff_ready"}, "handoff packet published"); err != nil {
+		return HandoffPacket{}, err
+	}
+	return packet, s.addEvent(ctx, packet.TaskID, actorID, "handoff.packet_published", packet)
+}
+
+func (s *Store) latestSnapshotCreatedAt(ctx context.Context, taskID string) (time.Time, error) {
+	var created string
+	if err := s.queryRow(ctx, `SELECT created_at FROM context_snapshots WHERE task_id=? ORDER BY created_at DESC LIMIT 1`, taskID).Scan(&created); err != nil {
+		return time.Time{}, err
+	}
+	return parseTS(created), nil
 }
 
 func (s *Store) AddDecision(ctx context.Context, actorID, taskID, decision string, alternatives []string, reason, impact string) (DecisionRecord, error) {
@@ -1258,6 +1595,55 @@ func (s *Store) ListConflicts(ctx context.Context, status string) ([]Conflict, e
 			}
 		}
 	}
+	if status == "open" {
+		filtered := out[:0]
+		for _, c := range out {
+			if c.Task != nil && !isActiveConflictTaskStatus(c.Task.Status) {
+				continue
+			}
+			if c.OtherTask != nil && !isActiveConflictTaskStatus(c.OtherTask.Status) {
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		out = filtered
+	}
+	return out, nil
+}
+
+func (s *Store) ListStaleClaims(ctx context.Context) ([]StaleClaim, error) {
+	now := time.Now().UTC()
+	tasks, err := s.ListTasks(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	out := []StaleClaim{}
+	for _, task := range tasks {
+		if task.OwnerID == "" || task.ClaimExpiresAt == nil || task.ClaimExpiresAt.After(now) || !isActiveConflictTaskStatus(task.Status) {
+			continue
+		}
+		var owner *Actor
+		if a, err := s.GetActor(ctx, task.OwnerID); err == nil {
+			owner = a
+		}
+		last := task.LastHeartbeatAt
+		if last == nil {
+			last = &task.UpdatedAt
+		}
+		age := now.Sub(*last).Round(time.Second)
+		claim := task.UpdatedAt
+		stale := StaleClaim{
+			Task:             task,
+			Owner:            owner,
+			ClaimedAt:        &claim,
+			LastActivityAt:   last,
+			ClaimExpiresAt:   task.ClaimExpiresAt,
+			StaleThreshold:   DefaultClaimTTL.String(),
+			Reason:           fmt.Sprintf("Claim expired because last activity was %s ago; threshold is %s.", age, DefaultClaimTTL),
+			SuggestedActions: []string{"wait", "contact_owner", "release_claim", "reassign"},
+		}
+		out = append(out, stale)
+	}
 	return out, nil
 }
 
@@ -1310,6 +1696,8 @@ func (s *Store) applyConflictResolution(ctx context.Context, actorID string, c C
 			return userErr("validation", "target_actor_id is required for transfer_ownership")
 		}
 		if taskID != "" {
+			_, _ = s.exec(ctx, `UPDATE locks SET owner_id=?, status='active', last_heartbeat_at=?, expires_at=? WHERE task_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+				target, ts(time.Now().UTC()), ts(time.Now().UTC().Add(DefaultLockTTL)), taskID)
 			if _, err := s.ClaimTask(ctx, target, taskID, "conflict resolution by "+actorID+": "+note, true); err != nil {
 				return err
 			}
@@ -1365,6 +1753,7 @@ func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeTy
 	if _, err := s.GetTask(ctx, taskID); err != nil {
 		return Lock{}, nil, err
 	}
+	_ = s.markStaleLocks(ctx, time.Now().UTC())
 	conflicts, err := s.FindLockConflicts(ctx, actorID, scope, scopeType)
 	if err != nil {
 		return Lock{}, nil, err
@@ -1386,9 +1775,9 @@ func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeTy
 		return Lock{}, conflicts, userErr("conflict", "active overlapping lock exists")
 	}
 	now := time.Now().UTC()
-	l := Lock{ID: newID("lock"), TaskID: taskID, OwnerID: actorID, Scope: scope, ScopeType: scopeType, ExpiresAt: now.Add(DefaultLockTTL), CreatedAt: now}
-	_, err = s.exec(ctx, `INSERT INTO locks (id,task_id,owner_id,scope,scope_type,expires_at,created_at,released_at) VALUES (?,?,?,?,?,?,?,NULL)`,
-		l.ID, l.TaskID, l.OwnerID, l.Scope, l.ScopeType, ts(l.ExpiresAt), ts(l.CreatedAt))
+	l := Lock{ID: newID("lock"), TaskID: taskID, OwnerID: actorID, Scope: scope, ScopeType: scopeType, Status: "active", ExpiresAt: now.Add(DefaultLockTTL), LastHeartbeatAt: now, CreatedAt: now}
+	_, err = s.exec(ctx, `INSERT INTO locks (id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at) VALUES (?,?,?,?,?,?,?,?,?,NULL)`,
+		l.ID, l.TaskID, l.OwnerID, l.Scope, l.ScopeType, l.Status, ts(l.ExpiresAt), ts(l.LastHeartbeatAt), ts(l.CreatedAt))
 	if err != nil {
 		return Lock{}, nil, err
 	}
@@ -1396,7 +1785,8 @@ func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeTy
 }
 
 func (s *Store) ListLocks(ctx context.Context, taskID string, activeOnly bool) ([]Lock, error) {
-	q := `SELECT id,task_id,owner_id,scope,scope_type,expires_at,created_at,released_at FROM locks`
+	_ = s.markStaleLocks(ctx, time.Now().UTC())
+	q := `SELECT id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at,released_by,release_reason,overridden_at,overridden_by,override_reason FROM locks`
 	args := []any{}
 	clauses := []string{}
 	if taskID != "" {
@@ -1404,8 +1794,7 @@ func (s *Store) ListLocks(ctx context.Context, taskID string, activeOnly bool) (
 		args = append(args, taskID)
 	}
 	if activeOnly {
-		clauses = append(clauses, "released_at IS NULL AND expires_at>?")
-		args = append(args, ts(time.Now().UTC()))
+		clauses = append(clauses, "released_at IS NULL AND status IN ('active','stale')")
 	}
 	if len(clauses) > 0 {
 		q += " WHERE " + strings.Join(clauses, " AND ")
@@ -1422,6 +1811,7 @@ func (s *Store) ListLocks(ctx context.Context, taskID string, activeOnly bool) (
 		if err != nil {
 			return nil, err
 		}
+		s.hydrateLockDisplay(ctx, &l)
 		out = append(out, l)
 	}
 	return out, rows.Err()
@@ -1438,6 +1828,7 @@ func (s *Store) FindLockConflicts(ctx context.Context, actorID, scope, scopeType
 			continue
 		}
 		if scopesOverlap(scopeType, scope, l.ScopeType, l.Scope) {
+			s.hydrateLockDisplay(ctx, &l)
 			conflicts = append(conflicts, l)
 		}
 	}
@@ -1445,6 +1836,10 @@ func (s *Store) FindLockConflicts(ctx context.Context, actorID, scope, scopeType
 }
 
 func (s *Store) ReleaseLock(ctx context.Context, actorID, lockID string) (Lock, error) {
+	return s.ReleaseLockWithReason(ctx, actorID, lockID, "")
+}
+
+func (s *Store) ReleaseLockWithReason(ctx context.Context, actorID, lockID, reason string) (Lock, error) {
 	l, err := s.getLock(ctx, lockID)
 	if err != nil {
 		return Lock{}, err
@@ -1454,7 +1849,10 @@ func (s *Store) ReleaseLock(ctx context.Context, actorID, lockID string) (Lock, 
 	}
 	now := time.Now().UTC()
 	l.ReleasedAt = &now
-	_, err = s.exec(ctx, `UPDATE locks SET released_at=? WHERE id=?`, ts(now), lockID)
+	l.ReleasedBy = actorID
+	l.ReleaseReason = strings.TrimSpace(reason)
+	l.Status = "released"
+	_, err = s.exec(ctx, `UPDATE locks SET released_at=?, released_by=?, release_reason=?, status='released' WHERE id=?`, ts(now), actorID, l.ReleaseReason, lockID)
 	if err != nil {
 		return Lock{}, err
 	}
@@ -1469,12 +1867,154 @@ func (s *Store) RenewLock(ctx context.Context, actorID, lockID string) (Lock, er
 	if l.OwnerID != actorID {
 		return Lock{}, userErr("forbidden", "only the lock owner can renew this lock")
 	}
-	l.ExpiresAt = time.Now().UTC().Add(DefaultLockTTL)
-	_, err = s.exec(ctx, `UPDATE locks SET expires_at=? WHERE id=?`, ts(l.ExpiresAt), lockID)
+	now := time.Now().UTC()
+	l.ExpiresAt = now.Add(DefaultLockTTL)
+	l.LastHeartbeatAt = now
+	l.Status = "active"
+	_, err = s.exec(ctx, `UPDATE locks SET expires_at=?, last_heartbeat_at=?, status='active' WHERE id=?`, ts(l.ExpiresAt), ts(l.LastHeartbeatAt), lockID)
 	if err != nil {
 		return Lock{}, err
 	}
 	return l, s.addEvent(ctx, l.TaskID, actorID, "lock.renewed", l)
+}
+
+func (s *Store) OverrideLock(ctx context.Context, actorID, lockID, reason string) (Lock, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return Lock{}, userErr("validation", "override reason is required")
+	}
+	l, err := s.getLock(ctx, lockID)
+	if err != nil {
+		return Lock{}, err
+	}
+	now := time.Now().UTC()
+	l.Status = "overridden"
+	l.OverriddenAt = &now
+	l.OverriddenBy = actorID
+	l.OverrideReason = reason
+	_, err = s.exec(ctx, `UPDATE locks SET status='overridden', overridden_at=?, overridden_by=?, override_reason=? WHERE id=?`,
+		ts(now), actorID, reason, lockID)
+	if err != nil {
+		return Lock{}, err
+	}
+	return l, s.addEvent(ctx, l.TaskID, actorID, "lock.overridden", l)
+}
+
+func (s *Store) ensureTaskLockable(ctx context.Context, actorID string, task Task) error {
+	for _, scope := range taskLockScopes(task) {
+		conflicts, err := s.FindLockConflicts(ctx, actorID, scope.scope, scope.scopeType)
+		if err != nil {
+			return err
+		}
+		if len(conflicts) > 0 {
+			for _, lockConflict := range conflicts {
+				_, _ = s.addConflict(ctx, Conflict{
+					TaskID:            task.ID,
+					ActorID:           actorID,
+					ConflictType:      "lock_overlap",
+					Scope:             scope.scope,
+					ScopeType:         scope.scopeType,
+					CurrentOwnerID:    lockConflict.OwnerID,
+					OtherActorID:      actorID,
+					OtherTaskID:       lockConflict.TaskID,
+					ConflictingLockID: lockConflict.ID,
+				})
+			}
+			return userErr("conflict", lockConflictMessage(conflicts[0]))
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureTaskLocks(ctx context.Context, actorID string, task Task) error {
+	for _, scope := range taskLockScopes(task) {
+		if err := s.ensureOwnedLock(ctx, actorID, task.ID, scope.scope, scope.scopeType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureOwnedLock(ctx context.Context, actorID, taskID, scope, scopeType string) error {
+	locks, err := s.ListLocks(ctx, taskID, true)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, l := range locks {
+		if l.OwnerID == actorID && l.Scope == scope && l.ScopeType == scopeType {
+			_, err := s.exec(ctx, `UPDATE locks SET status='active', expires_at=?, last_heartbeat_at=? WHERE id=?`,
+				ts(now.Add(DefaultLockTTL)), ts(now), l.ID)
+			return err
+		}
+	}
+	_, _, err = s.AcquireLock(ctx, actorID, taskID, scope, scopeType)
+	return err
+}
+
+func (s *Store) renewTaskLocks(ctx context.Context, actorID, taskID string, now time.Time) error {
+	_, err := s.exec(ctx, `UPDATE locks SET status='active', expires_at=?, last_heartbeat_at=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+		ts(now.Add(DefaultLockTTL)), ts(now), taskID, actorID)
+	return err
+}
+
+func (s *Store) markStaleLocks(ctx context.Context, now time.Time) error {
+	_, err := s.exec(ctx, `UPDATE locks SET status='stale' WHERE released_at IS NULL AND status='active' AND expires_at<=?`, ts(now))
+	return err
+}
+
+func taskLockScopes(task Task) []struct {
+	scope     string
+	scopeType string
+} {
+	if len(task.Scope) == 0 {
+		return []struct {
+			scope     string
+			scopeType string
+		}{{scope: "task:" + task.ID, scopeType: "semantic_area"}}
+	}
+	out := make([]struct {
+		scope     string
+		scopeType string
+	}, 0, len(task.Scope))
+	for _, scope := range task.Scope {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		out = append(out, struct {
+			scope     string
+			scopeType string
+		}{scope: scope, scopeType: "file_glob"})
+	}
+	if len(out) == 0 {
+		out = append(out, struct {
+			scope     string
+			scopeType string
+		}{scope: "task:" + task.ID, scopeType: "semantic_area"})
+	}
+	return out
+}
+
+func lockConflictMessage(lock Lock) string {
+	owner := lock.OwnerName
+	if owner == "" {
+		owner = lock.OwnerID
+	}
+	return fmt.Sprintf("This task/scope is currently being worked on by %s. Please wait, or coordinate with the owner to release the lock.", owner)
+}
+
+func (s *Store) hydrateLockDisplay(ctx context.Context, l *Lock) {
+	if l == nil {
+		return
+	}
+	if actor, err := s.GetActor(ctx, l.OwnerID); err == nil {
+		l.OwnerName = actor.Name
+	}
+	if task, err := s.GetTask(ctx, l.TaskID); err == nil {
+		l.TaskTitle = task.Title
+	}
+	l.Message = lockConflictMessage(*l)
 }
 
 func (s *Store) PrepareHandoff(ctx context.Context, actorID, taskID, toActorID, summary string, next []string) (Handoff, error) {
@@ -1512,13 +2052,14 @@ func (s *Store) AcceptHandoff(ctx context.Context, actorID, handoffID string) (H
 	if err != nil {
 		return Handoff{}, err
 	}
+	if _, err := s.exec(ctx, `UPDATE locks SET owner_id=?, status='active', last_heartbeat_at=?, expires_at=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+		actorID, ts(now), ts(now.Add(DefaultLockTTL)), h.TaskID, h.FromActorID); err != nil {
+		return Handoff{}, err
+	}
 	if _, err := s.ClaimTask(ctx, actorID, h.TaskID, "handoff accepted", true); err != nil {
 		return Handoff{}, err
 	}
-	if _, err := s.exec(ctx, `UPDATE locks SET owner_id=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND expires_at>?`,
-		actorID, h.TaskID, h.FromActorID, ts(time.Now().UTC())); err != nil {
-		return Handoff{}, err
-	}
+	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='accepted' WHERE handoff_id=?`, h.ID)
 	_ = s.addEvent(ctx, h.TaskID, actorID, "lock.transferred", map[string]any{"from_actor_id": h.FromActorID, "to_actor_id": actorID})
 	return h, s.addEvent(ctx, h.TaskID, actorID, "handoff.accepted", h)
 }
@@ -1533,6 +2074,7 @@ func (s *Store) RejectHandoff(ctx context.Context, actorID, handoffID string) (H
 	if err != nil {
 		return Handoff{}, err
 	}
+	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='rejected' WHERE handoff_id=?`, h.ID)
 	return h, s.addEvent(ctx, h.TaskID, actorID, "handoff.rejected", h)
 }
 
@@ -1554,6 +2096,12 @@ func (s *Store) ListHandoffs(ctx context.Context, taskID string) ([]Handoff, err
 		h, err := scanHandoff(rows)
 		if err != nil {
 			return nil, err
+		}
+		if t, err := s.GetTask(ctx, h.TaskID); err == nil {
+			h.Task = &t
+		}
+		if p, err := s.LatestHandoffPacket(ctx, h.TaskID); err == nil {
+			h.Packet = p
 		}
 		out = append(out, h)
 	}
@@ -1599,7 +2147,7 @@ func (s *Store) addEvent(ctx context.Context, taskID, actorID, typ string, paylo
 }
 
 func (s *Store) getLock(ctx context.Context, id string) (Lock, error) {
-	row := s.queryRow(ctx, `SELECT id,task_id,owner_id,scope,scope_type,expires_at,created_at,released_at FROM locks WHERE id=?`, id)
+	row := s.queryRow(ctx, `SELECT id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at,released_by,release_reason,overridden_at,overridden_by,override_reason FROM locks WHERE id=?`, id)
 	l, err := scanLock(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Lock{}, userErr("not_found", "lock not found")
@@ -1616,9 +2164,27 @@ func (s *Store) getHandoff(ctx context.Context, id string) (Handoff, error) {
 	return h, err
 }
 
+func (s *Store) getContextSnapshot(ctx context.Context, id string) (ContextSnapshot, error) {
+	row := s.queryRow(ctx, `SELECT id,task_id,author_id,source,snapshot_type,status_at_time,summary_json,markdown_cache,source_context_ids_json,created_at,updated_at FROM context_snapshots WHERE id=?`, id)
+	snapshot, err := scanContextSnapshot(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ContextSnapshot{}, userErr("not_found", "context snapshot not found")
+	}
+	return snapshot, err
+}
+
+func (s *Store) getHandoffPacket(ctx context.Context, id string) (HandoffPacket, error) {
+	row := s.queryRow(ctx, `SELECT id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,edited_by,created_at,updated_at FROM handoff_packets WHERE id=?`, id)
+	packet, err := scanHandoffPacket(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return HandoffPacket{}, userErr("not_found", "handoff packet not found")
+	}
+	return packet, err
+}
+
 func (s *Store) countActiveLocks(ctx context.Context, taskID string) int {
 	var n int
-	_ = s.queryRow(ctx, `SELECT COUNT(*) FROM locks WHERE task_id=? AND released_at IS NULL AND expires_at>?`, taskID, ts(time.Now().UTC())).Scan(&n)
+	_ = s.queryRow(ctx, `SELECT COUNT(*) FROM locks WHERE task_id=? AND released_at IS NULL AND status IN ('active','stale')`, taskID).Scan(&n)
 	return n
 }
 
@@ -1741,17 +2307,29 @@ func scanTask(row scanner) (Task, error) {
 
 func scanLock(row scanner) (Lock, error) {
 	var l Lock
-	var exp, created string
-	var released sql.NullString
-	if err := row.Scan(&l.ID, &l.TaskID, &l.OwnerID, &l.Scope, &l.ScopeType, &exp, &created, &released); err != nil {
+	var exp, heartbeat, created string
+	var released, releasedBy, releaseReason, overriddenAt, overriddenBy, overrideReason sql.NullString
+	if err := row.Scan(&l.ID, &l.TaskID, &l.OwnerID, &l.Scope, &l.ScopeType, &l.Status, &exp, &heartbeat, &created, &released, &releasedBy, &releaseReason, &overriddenAt, &overriddenBy, &overrideReason); err != nil {
 		return Lock{}, err
 	}
+	if l.Status == "" {
+		l.Status = "active"
+	}
 	l.ExpiresAt = parseTS(exp)
+	l.LastHeartbeatAt = parseTS(heartbeat)
 	l.CreatedAt = parseTS(created)
 	if released.Valid {
 		v := parseTS(released.String)
 		l.ReleasedAt = &v
 	}
+	l.ReleasedBy = releasedBy.String
+	l.ReleaseReason = releaseReason.String
+	if overriddenAt.Valid {
+		v := parseTS(overriddenAt.String)
+		l.OverriddenAt = &v
+	}
+	l.OverriddenBy = overriddenBy.String
+	l.OverrideReason = overrideReason.String
 	return l, nil
 }
 
@@ -1797,6 +2375,39 @@ func scanHandoff(row scanner) (Handoff, error) {
 		h.AcceptedAt = &v
 	}
 	return h, nil
+}
+
+func scanContextSnapshot(row scanner) (ContextSnapshot, error) {
+	var s ContextSnapshot
+	var summary, sourceIDs, created, updated string
+	if err := row.Scan(&s.ID, &s.TaskID, &s.AuthorID, &s.Source, &s.SnapshotType, &s.StatusAtTime, &summary, &s.Markdown, &sourceIDs, &created, &updated); err != nil {
+		return ContextSnapshot{}, err
+	}
+	fromJS(summary, &s.Summary)
+	fromJS(sourceIDs, &s.SourceContextIDs)
+	s.CreatedAt = parseTS(created)
+	s.UpdatedAt = parseTS(updated)
+	return s, nil
+}
+
+func scanHandoffPacket(row scanner) (HandoffPacket, error) {
+	var p HandoffPacket
+	var handoffID, editedBy sql.NullString
+	var packet, snapshotIDs, contextIDs, created, updated string
+	if err := row.Scan(&p.ID, &p.TaskID, &handoffID, &p.GeneratedBy, &p.Status, &p.Version, &packet, &p.Markdown, &snapshotIDs, &contextIDs, &editedBy, &created, &updated); err != nil {
+		return HandoffPacket{}, err
+	}
+	if p.Version == 0 {
+		p.Version = 1
+	}
+	p.HandoffID = handoffID.String
+	p.EditedBy = editedBy.String
+	fromJS(packet, &p.Packet)
+	fromJS(snapshotIDs, &p.SourceSnapshotIDs)
+	fromJS(contextIDs, &p.SourceContextIDs)
+	p.CreatedAt = parseTS(created)
+	p.UpdatedAt = parseTS(updated)
+	return p, nil
 }
 
 func cleanStrings(in []string) []string {
@@ -1847,6 +2458,10 @@ func validateStatusTransition(from, to string) error {
 		return userErr("validation", "cancelled tasks can only be reopened to ready")
 	}
 	return nil
+}
+
+func isActiveConflictTaskStatus(status string) bool {
+	return status == "ready" || status == "claimed" || status == "in_progress"
 }
 
 func scopesOverlap(at, a, bt, b string) bool {

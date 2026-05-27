@@ -174,14 +174,24 @@ type GitRef struct {
 }
 
 type Lock struct {
-	ID         string     `json:"id"`
-	TaskID     string     `json:"task_id"`
-	OwnerID    string     `json:"owner_id"`
-	Scope      string     `json:"scope"`
-	ScopeType  string     `json:"scope_type"`
-	ExpiresAt  time.Time  `json:"expires_at"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ReleasedAt *time.Time `json:"released_at,omitempty"`
+	ID              string     `json:"id"`
+	TaskID          string     `json:"task_id"`
+	OwnerID         string     `json:"owner_id"`
+	OwnerName       string     `json:"owner_name,omitempty"`
+	TaskTitle       string     `json:"task_title,omitempty"`
+	Scope           string     `json:"scope"`
+	ScopeType       string     `json:"scope_type"`
+	Status          string     `json:"status"`
+	ExpiresAt       time.Time  `json:"expires_at"`
+	LastHeartbeatAt time.Time  `json:"last_heartbeat_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	ReleasedAt      *time.Time `json:"released_at,omitempty"`
+	ReleasedBy      string     `json:"released_by,omitempty"`
+	ReleaseReason   string     `json:"release_reason,omitempty"`
+	OverriddenAt    *time.Time `json:"overridden_at,omitempty"`
+	OverriddenBy    string     `json:"overridden_by,omitempty"`
+	OverrideReason  string     `json:"override_reason,omitempty"`
+	Message         string     `json:"message,omitempty"`
 }
 
 type Conflict struct {
@@ -207,15 +217,103 @@ type Conflict struct {
 }
 
 type Handoff struct {
-	ID            string     `json:"id"`
-	TaskID        string     `json:"task_id"`
-	FromActorID   string     `json:"from_actor_id"`
-	ToActorID     string     `json:"to_actor_id,omitempty"`
-	Status        string     `json:"status"`
-	ResumeSummary string     `json:"resume_summary"`
-	NextSteps     []string   `json:"next_steps"`
-	CreatedAt     time.Time  `json:"created_at"`
-	AcceptedAt    *time.Time `json:"accepted_at,omitempty"`
+	ID            string         `json:"id"`
+	TaskID        string         `json:"task_id"`
+	FromActorID   string         `json:"from_actor_id"`
+	ToActorID     string         `json:"to_actor_id,omitempty"`
+	Status        string         `json:"status"`
+	ResumeSummary string         `json:"resume_summary"`
+	NextSteps     []string       `json:"next_steps"`
+	CreatedAt     time.Time      `json:"created_at"`
+	AcceptedAt    *time.Time     `json:"accepted_at,omitempty"`
+	Task          *Task          `json:"task,omitempty"`
+	Packet        *HandoffPacket `json:"packet,omitempty"`
+}
+
+type SnapshotContent struct {
+	RecentChanges           []string `json:"recent_changes"`
+	KeyDecisions            []string `json:"key_decisions"`
+	Reasoning               []string `json:"reasoning"`
+	OpenQuestions           []string `json:"open_questions"`
+	ImplementationDirection string   `json:"implementation_direction"`
+	FilesOrComponents       []string `json:"files_or_components"`
+	Risks                   []string `json:"risks"`
+	Blockers                []string `json:"blockers"`
+	Assumptions             []string `json:"assumptions"`
+	NextRecommendedActions  []string `json:"next_recommended_actions"`
+	ExtraSections           []string `json:"extra_sections,omitempty"`
+}
+
+type ContextSnapshot struct {
+	ID               string          `json:"id"`
+	TaskID           string          `json:"task_id"`
+	AuthorID         string          `json:"author_id"`
+	Source           string          `json:"source"`
+	SnapshotType     string          `json:"snapshot_type"`
+	StatusAtTime     string          `json:"status_at_time"`
+	Summary          SnapshotContent `json:"summary"`
+	Markdown         string          `json:"markdown"`
+	SourceContextIDs []string        `json:"source_context_ids"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+type HandoffPacketContent struct {
+	TaskObjective           string   `json:"task_objective"`
+	OriginalRequirements    []string `json:"original_requirements"`
+	CurrentStatus           string   `json:"current_status"`
+	HandoffTimeline         []string `json:"handoff_timeline,omitempty"`
+	CompletedWork           []string `json:"completed_work"`
+	ImportantDecisions      []string `json:"important_decisions"`
+	RejectedApproaches      []string `json:"rejected_approaches"`
+	ArchitectureNotes       []string `json:"architecture_notes"`
+	ImplementationNotes     []string `json:"implementation_notes"`
+	FilesComponentsAffected []string `json:"files_components_affected"`
+	KnownIssues             []string `json:"known_issues"`
+	RemainingWork           []string `json:"remaining_work"`
+	SuggestedNextSteps      []string `json:"suggested_next_steps"`
+	Assumptions             []string `json:"assumptions"`
+	Risks                   []string `json:"risks"`
+	Dependencies            []string `json:"dependencies"`
+	HandoffMessage          string   `json:"handoff_message"`
+	ExtraSections           []string `json:"extra_sections,omitempty"`
+}
+
+type HandoffPacket struct {
+	ID                string               `json:"id"`
+	TaskID            string               `json:"task_id"`
+	HandoffID         string               `json:"handoff_id,omitempty"`
+	GeneratedBy       string               `json:"generated_by"`
+	Status            string               `json:"status"`
+	Version           int                  `json:"version"`
+	Packet            HandoffPacketContent `json:"packet"`
+	Markdown          string               `json:"markdown"`
+	SourceSnapshotIDs []string             `json:"source_snapshot_ids"`
+	SourceContextIDs  []string             `json:"source_context_ids"`
+	EditedBy          string               `json:"edited_by,omitempty"`
+	CreatedAt         time.Time            `json:"created_at"`
+	UpdatedAt         time.Time            `json:"updated_at"`
+}
+
+type StaleClaim struct {
+	Task             Task       `json:"task"`
+	Owner            *Actor     `json:"owner,omitempty"`
+	ClaimedAt        *time.Time `json:"claim_timestamp,omitempty"`
+	LastActivityAt   *time.Time `json:"last_activity_timestamp,omitempty"`
+	ClaimExpiresAt   *time.Time `json:"claim_expires_at,omitempty"`
+	StaleThreshold   string     `json:"stale_threshold"`
+	Reason           string     `json:"reason"`
+	SuggestedActions []string   `json:"suggested_actions"`
+}
+
+type TaskSession struct {
+	ID           string     `json:"id"`
+	TaskID       string     `json:"task_id"`
+	ActorID      string     `json:"actor_id"`
+	StartedAt    time.Time  `json:"started_at"`
+	EndedAt      *time.Time `json:"ended_at,omitempty"`
+	ExitStatus   string     `json:"exit_status,omitempty"`
+	FinishReason string     `json:"finish_reason,omitempty"`
 }
 
 type Event struct {
@@ -228,23 +326,32 @@ type Event struct {
 }
 
 type TaskDetail struct {
-	Task         Task             `json:"task"`
-	Owner        *Actor           `json:"owner,omitempty"`
-	Parent       *Task            `json:"parent,omitempty"`
-	Subtasks     []Task           `json:"subtasks"`
-	Dependencies []TaskDependency `json:"dependencies"`
-	Dependents   []TaskDependency `json:"dependents"`
-	Context      []ContextEntry   `json:"context"`
-	Decisions    []DecisionRecord `json:"decisions"`
-	Comments     []Comment        `json:"comments"`
-	Artifacts    []Artifact       `json:"artifacts"`
-	GitRefs      []GitRef         `json:"git_refs"`
-	Locks        []Lock           `json:"locks"`
-	Handoffs     []Handoff        `json:"handoffs"`
-	Events       []Event          `json:"events"`
+	Task           Task              `json:"task"`
+	Owner          *Actor            `json:"owner,omitempty"`
+	Parent         *Task             `json:"parent,omitempty"`
+	Subtasks       []Task            `json:"subtasks"`
+	Dependencies   []TaskDependency  `json:"dependencies"`
+	Dependents     []TaskDependency  `json:"dependents"`
+	Context        []ContextEntry    `json:"context"`
+	Decisions      []DecisionRecord  `json:"decisions"`
+	Comments       []Comment         `json:"comments"`
+	Artifacts      []Artifact        `json:"artifacts"`
+	GitRefs        []GitRef          `json:"git_refs"`
+	Locks          []Lock            `json:"locks"`
+	Handoffs       []Handoff         `json:"handoffs"`
+	Snapshots      []ContextSnapshot `json:"snapshots"`
+	LatestSnapshot *ContextSnapshot  `json:"latest_snapshot,omitempty"`
+	HandoffPacket  *HandoffPacket    `json:"handoff_packet,omitempty"`
+	Events         []Event           `json:"events"`
 }
 
 type APIError struct {
 	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+type MarkdownValidationError struct {
+	Section string `json:"section,omitempty"`
+	Line    int    `json:"line,omitempty"`
 	Message string `json:"message"`
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTaskClaimConflictAndExpiry(t *testing.T) {
@@ -70,6 +71,13 @@ func TestHandoffTransfersTaskAndActiveLocks(t *testing.T) {
 	h, err := s.PrepareHandoff(ctx, a.ID, task.ID, b.ID, "resume here", []string{"continue"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	packets, err := s.ListHandoffs(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packets) != 1 || packets[0].Packet != nil {
+		t.Fatalf("expected simple handoff to create one visible handoff without a generated packet, got %+v", packets)
 	}
 	if _, err := s.AcceptHandoff(ctx, b.ID, h.ID); err != nil {
 		t.Fatal(err)
@@ -541,6 +549,312 @@ func TestArtifactReferencesAndGitMetadata(t *testing.T) {
 	}
 	if !foundArtifact || !foundGit {
 		t.Fatalf("expected artifact/git audit events, got %+v", events)
+	}
+}
+
+func TestContextSnapshotsAndHandoffPacket(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a, err := s.RegisterActor(ctx, "Agent A", "agent", "mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Memory Task", Goal: "Keep reliable handoff memory", Scope: []string{"README.md"}, Requirements: []string{"Document architecture"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Added architecture overview"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "decision", "Keep TaskPilot vendor-neutral"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "risk", "Build target may be stale"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddDecision(ctx, a.ID, task.ID, "Use context files for injection", nil, "Agents may not reach localhost", "Reliable handoff across runtimes"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.CreateContextSnapshot(ctx, a.ID, task.ID, "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Markdown == "" || len(snapshot.Summary.KeyDecisions) == 0 || len(snapshot.SourceContextIDs) != 3 {
+		t.Fatalf("unexpected snapshot: %+v", snapshot)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Markdown == "" || packet.Packet.TaskObjective != "Keep reliable handoff memory" || len(packet.Packet.ImportantDecisions) == 0 {
+		t.Fatalf("unexpected handoff packet: %+v", packet)
+	}
+	updated, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Task Handoff\n\n## Objective\nEdited objective\n\n## Current Status\nready\n\n## Suggested Next Steps\n- Continue from edited packet\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Packet.TaskObjective != "Edited objective" || len(updated.Packet.SuggestedNextSteps) != 1 {
+		t.Fatalf("expected markdown edit to update JSON, got %+v", updated.Packet)
+	}
+	detail, err := s.TaskDetail(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.LatestSnapshot == nil || detail.HandoffPacket == nil {
+		t.Fatalf("expected task detail memory fields, got snapshot=%v packet=%v", detail.LatestSnapshot, detail.HandoffPacket)
+	}
+}
+
+func TestMarkdownValidationAndPublishHandoff(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Handoff Task", Goal: "Prepare clean handoff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Wrong\n\n## Objective\nBad\n"); err == nil {
+		t.Fatal("expected markdown heading validation error")
+	}
+	edited, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Task Handoff\n\n## Objective\nEdited objective\n\n## Current Status\nclaimed\n\n## Suggested Next Steps\n- Continue safely\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edited.Packet.TaskObjective != "Edited objective" || edited.Version != packet.Version+1 {
+		t.Fatalf("expected markdown edit to sync JSON and increment version, got %+v", edited)
+	}
+	published, err := s.PublishHandoffPacket(ctx, a.ID, edited.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.Status != "published" || published.HandoffID == "" {
+		t.Fatalf("expected published packet with linked handoff, got %+v", published)
+	}
+	updated, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "handoff_ready" {
+		t.Fatalf("expected handoff_ready task, got %+v", updated)
+	}
+}
+
+func TestNextContextFeedsSnapshotsAndHandoffSteps(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Next Context", Goal: "Preserve next steps"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "next", "Add invited-user regression test"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.CreateContextSnapshot(ctx, a.ID, task.ID, "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Summary.NextRecommendedActions) != 1 || snapshot.Summary.NextRecommendedActions[0] != "Add invited-user regression test" {
+		t.Fatalf("expected next context in snapshot actions, got %+v", snapshot.Summary.NextRecommendedActions)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packet.Packet.SuggestedNextSteps) != 1 || packet.Packet.SuggestedNextSteps[0] != "Add invited-user regression test" {
+		t.Fatalf("expected next context in handoff suggested steps, got %+v", packet.Packet.SuggestedNextSteps)
+	}
+}
+
+func TestHandoffPacketSeparatesTimelineFromCurrentNextSteps(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Multi Handoff", Goal: "Continue across agents"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "taskpilot run started agent command: gemini"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Completed initial README review"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "decision", "Keep the architecture overview vendor-neutral"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareHandoff(ctx, a.ID, task.ID, "", "First handoff after README review", []string{"Old next step should stay historical"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Completed execution plan outline"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "next", "Current context next step"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareHandoff(ctx, a.ID, task.ID, "", "Second handoff after execution plan", []string{"Current next step only"}); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packet.Packet.HandoffTimeline) != 2 {
+		t.Fatalf("expected two handoff timeline entries, got %+v", packet.Packet.HandoffTimeline)
+	}
+	timeline := strings.Join(packet.Packet.HandoffTimeline, "\n")
+	if !strings.Contains(timeline, "Handoff 1") || !strings.Contains(timeline, "First handoff") || !strings.Contains(timeline, "Handoff 2") || !strings.Contains(timeline, "Second handoff") {
+		t.Fatalf("timeline missing handoff chronology:\n%s", timeline)
+	}
+	if contains(strings.Join(packet.Packet.CompletedWork, "\n"), "taskpilot run started agent command") {
+		t.Fatalf("expected noisy run-start context filtered from completed work: %+v", packet.Packet.CompletedWork)
+	}
+	if !contains(strings.Join(packet.Packet.SuggestedNextSteps, "\n"), "Current next step only") {
+		t.Fatalf("expected latest handoff next step in current suggestions, got %+v", packet.Packet.SuggestedNextSteps)
+	}
+	if contains(strings.Join(packet.Packet.SuggestedNextSteps, "\n"), "Old next step should stay historical") {
+		t.Fatalf("old handoff next step should not remain current, got %+v", packet.Packet.SuggestedNextSteps)
+	}
+}
+
+func TestPublishHandoffToleratesWrappedFilesAndEmptyNextSteps(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Execution doc", Goal: "Prepare execution plan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := `# Task Handoff
+
+## Objective
+Prepare execution plan
+
+## Current Status
+claimed
+
+## Files / Components Affected
+- Touched files detected by git status after taskpilot run:
+Newly changed during run:
+EXECUTION_PLAN.md
+Already changed before or still changed after run:
+README.md
+
+## Suggested Next Steps
+- None recorded.
+`
+	edited, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, markdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edited.Packet.FilesComponentsAffected) != 1 || !strings.Contains(edited.Packet.FilesComponentsAffected[0], "EXECUTION_PLAN.md") {
+		t.Fatalf("expected wrapped file section to stay as one useful item, got %+v", edited.Packet.FilesComponentsAffected)
+	}
+	published, err := s.PublishHandoffPacket(ctx, a.ID, edited.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.Status != "published" || published.HandoffID == "" {
+		t.Fatalf("expected published packet, got %+v", published)
+	}
+	if len(published.Packet.SuggestedNextSteps) == 0 {
+		t.Fatalf("expected fallback suggested next step, got %+v", published.Packet)
+	}
+}
+
+func TestTaskSessionLifecycleReturnsToClaimed(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Long Session", Goal: "Run agent", Scope: []string{"README.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := s.StartTaskSession(ctx, a.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != "in_progress" {
+		t.Fatalf("expected in_progress while session runs, got %+v", started)
+	}
+	finished, err := s.FinishTaskSession(ctx, a.ID, task.ID, session.ID, "success", "agent exited")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != "claimed" || finished.OwnerID != a.ID {
+		t.Fatalf("expected session exit to return to claimed owner, got %+v", finished)
+	}
+	locks, err := s.ListLocks(ctx, task.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) == 0 || locks[0].OwnerID != a.ID || locks[0].Status != "active" {
+		t.Fatalf("expected owned lock to remain active, got %+v", locks)
+	}
+}
+
+func TestCompletedTasksAreFilteredFromOpenConflicts(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	b := testActor(t, s, "Agent B")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Conflict Done", Goal: "Finish conflict"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimTask(ctx, a.ID, task.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimTask(ctx, b.ID, task.ID, "", false); err == nil {
+		t.Fatal("expected claim conflict")
+	}
+	if _, err := s.CompleteTask(ctx, a.ID, task.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := s.ListConflicts(ctx, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("expected completed task conflicts hidden from open list, got %+v", open)
+	}
+}
+
+func TestStaleClaimDetails(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Stale Task", Goal: "Show stale details"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimTask(ctx, a.ID, task.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().UTC().Add(-DefaultClaimTTL * 2)
+	_, err = s.exec(ctx, `UPDATE tasks SET claim_expires_at=?, last_heartbeat_at=? WHERE id=?`, ts(past), ts(past), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.ListStaleClaims(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0].Task.ID != task.ID || stale[0].Owner == nil || stale[0].Reason == "" || len(stale[0].SuggestedActions) == 0 {
+		t.Fatalf("expected detailed stale claim, got %+v", stale)
 	}
 }
 

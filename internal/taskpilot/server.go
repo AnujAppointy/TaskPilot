@@ -88,9 +88,18 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/tasks/{id}/claim", s.requireScope("task:write", s.handleClaimTask))
 	s.mux.Handle("POST /api/tasks/{id}/release", s.requireScope("task:write", s.handleReleaseTask))
 	s.mux.Handle("POST /api/tasks/{id}/heartbeat", s.requireScope("task:write", s.handleHeartbeatTask))
+	s.mux.Handle("POST /api/tasks/{id}/sessions/start", s.requireScope("task:write", s.handleStartTaskSession))
+	s.mux.Handle("POST /api/tasks/{id}/sessions/finish", s.requireScope("task:write", s.handleFinishTaskSession))
 	s.mux.Handle("POST /api/tasks/{id}/complete", s.requireScope("task:write", s.handleCompleteTask))
 	s.mux.Handle("POST /api/tasks/{id}/context", s.requireScope("context:write", s.handleAppendContext))
 	s.mux.Handle("GET /api/tasks/{id}/context", s.requireScope("task:read", s.handleContext))
+	s.mux.Handle("POST /api/tasks/{id}/snapshots", s.requireScope("context:write", s.handleCreateSnapshot))
+	s.mux.Handle("GET /api/tasks/{id}/snapshots", s.requireScope("task:read", s.handleSnapshots))
+	s.mux.Handle("PATCH /api/snapshots/{id}", s.requireScope("context:write", s.handleUpdateSnapshot))
+	s.mux.Handle("POST /api/tasks/{id}/handoff-packet/generate", s.requireScope("handoff:write", s.handleGenerateHandoffPacket))
+	s.mux.Handle("GET /api/tasks/{id}/handoff-packet", s.requireScope("task:read", s.handleLatestHandoffPacket))
+	s.mux.Handle("PATCH /api/handoff-packets/{id}", s.requireScope("handoff:write", s.handleUpdateHandoffPacket))
+	s.mux.Handle("POST /api/handoff-packets/{id}/publish", s.requireScope("handoff:write", s.handlePublishHandoffPacket))
 	s.mux.Handle("POST /api/tasks/{id}/decisions", s.requireScope("context:write", s.handleAddDecision))
 	s.mux.Handle("GET /api/tasks/{id}/decisions", s.requireScope("task:read", s.handleDecisions))
 	s.mux.Handle("POST /api/tasks/{id}/comments", s.requireScope("context:write", s.handleAddComment))
@@ -103,11 +112,13 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/tasks/{id}/locks", s.requireScope("task:read", s.handleLocks))
 	s.mux.Handle("POST /api/locks/{id}/release", s.requireScope("lock:write", s.handleReleaseLock))
 	s.mux.Handle("POST /api/locks/{id}/renew", s.requireScope("lock:write", s.handleRenewLock))
+	s.mux.Handle("POST /api/locks/{id}/override", s.requireScope("lock:write", s.handleOverrideLock))
 	s.mux.Handle("POST /api/tasks/{id}/handoff", s.requireScope("handoff:write", s.handlePrepareHandoff))
 	s.mux.Handle("POST /api/handoffs/{id}/accept", s.requireScope("handoff:write", s.handleAcceptHandoff))
 	s.mux.Handle("POST /api/handoffs/{id}/reject", s.requireScope("handoff:write", s.handleRejectHandoff))
 	s.mux.Handle("DELETE /api/dependencies/{id}", s.requireScope("task:write", s.handleRemoveDependency))
 	s.mux.Handle("GET /api/conflicts", s.requireScope("task:read", s.handleConflicts))
+	s.mux.Handle("GET /api/conflicts/stale-claims", s.requireScope("task:read", s.handleStaleClaims))
 	s.mux.Handle("POST /api/conflicts/{id}/resolve", s.requireScope("task:write", s.handleResolveConflict))
 	s.mux.Handle("GET /api/handoffs", s.requireScope("task:read", s.handleHandoffs))
 	s.mux.Handle("GET /api/events", s.requireScope("task:read", s.handleEvents))
@@ -515,6 +526,24 @@ func (s *Server) handleHeartbeatTask(w http.ResponseWriter, r *http.Request) {
 	writeResult(w, out, err)
 }
 
+func (s *Server) handleStartTaskSession(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.StartTaskSession(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleFinishTaskSession(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		SessionID    string `json:"session_id"`
+		ExitStatus   string `json:"exit_status"`
+		FinishReason string `json:"finish_reason"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.FinishTaskSession(r.Context(), actorID(r), r.PathValue("id"), in.SessionID, in.ExitStatus, in.FinishReason)
+	writeResult(w, out, err)
+}
+
 func (s *Server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Summary string `json:"summary"`
@@ -538,6 +567,66 @@ func (s *Server) handleAppendContext(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	out, err := s.store.ListContext(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		SnapshotType string `json:"snapshot_type"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.CreateContextSnapshot(r.Context(), actorID(r), r.PathValue("id"), in.SnapshotType)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListContextSnapshots(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleUpdateSnapshot(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Markdown string `json:"markdown"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.UpdateContextSnapshotMarkdown(r.Context(), actorID(r), r.PathValue("id"), in.Markdown)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleGenerateHandoffPacket(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		HandoffID string `json:"handoff_id"`
+		Status    string `json:"status"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.GenerateHandoffPacket(r.Context(), actorID(r), r.PathValue("id"), in.HandoffID, in.Status)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleLatestHandoffPacket(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.LatestHandoffPacket(r.Context(), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleUpdateHandoffPacket(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Markdown string `json:"markdown"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.UpdateHandoffPacketMarkdown(r.Context(), actorID(r), r.PathValue("id"), in.Markdown)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handlePublishHandoffPacket(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.PublishHandoffPacket(r.Context(), actorID(r), r.PathValue("id"))
 	writeResult(w, out, err)
 }
 
@@ -626,7 +715,11 @@ func (s *Server) handleAcquireLock(w http.ResponseWriter, r *http.Request) {
 	}
 	out, conflicts, err := s.store.AcquireLock(r.Context(), actorID(r), r.PathValue("id"), in.Scope, in.ScopeType)
 	if err != nil && len(conflicts) > 0 {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "conflict", "message": err.Error(), "conflicts": conflicts})
+		msg := err.Error()
+		if conflicts[0].Message != "" {
+			msg = conflicts[0].Message
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "conflict", "message": msg, "conflicts": conflicts})
 		return
 	}
 	writeResult(w, out, err)
@@ -639,13 +732,33 @@ func (s *Server) handleLocks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReleaseLock(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.ReleaseLock(r.Context(), actorID(r), r.PathValue("id"))
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	out, err := s.store.ReleaseLockWithReason(r.Context(), actorID(r), r.PathValue("id"), in.Reason)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleOverrideLock(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.OverrideLock(r.Context(), actorID(r), r.PathValue("id"), in.Reason)
 	writeResult(w, out, err)
 }
 
 func (s *Server) handleConflicts(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	out, err := s.store.ListConflicts(r.Context(), status)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleStaleClaims(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListStaleClaims(r.Context())
 	writeResult(w, out, err)
 }
 
@@ -763,6 +876,11 @@ func decode(w http.ResponseWriter, r *http.Request, out any) bool {
 
 func writeResult(w http.ResponseWriter, out any, err error) {
 	if err != nil {
+		var mdErrs markdownValidationErrors
+		if errors.As(err, &mdErrs) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "validation", "message": "markdown validation failed", "errors": []MarkdownValidationError(mdErrs)})
+			return
+		}
 		status := http.StatusInternalServerError
 		switch errorCode(err) {
 		case "validation", "bad_request":

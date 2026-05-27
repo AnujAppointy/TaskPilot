@@ -129,6 +129,88 @@ textarea { min-height: 76px; resize: vertical; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .detail { display: grid; gap: 12px; }
 .section { border-top: 1px solid var(--line); padding-top: 12px; }
+.task-memory {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #c7d2fe;
+  background: #f8fbff;
+  border-radius: 8px;
+  padding: 12px;
+}
+.markdown-doc {
+  white-space: pre-wrap;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  overflow-x: auto;
+}
+.error-box {
+  white-space: pre-wrap;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fff1f2;
+  color: #991b1b;
+}
+.memory-editor {
+  min-height: 360px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.memory-edit {
+  display: grid;
+  gap: 8px;
+}
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(15, 23, 42, 0.38);
+}
+.modal-card {
+  width: min(620px, 100%);
+  display: grid;
+  gap: 10px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.22);
+}
+.modal-card h2 {
+  margin: 0 0 4px;
+}
+.modal-card label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.modal-card textarea {
+  min-height: 96px;
+}
+.modal-actions {
+  justify-content: flex-end;
+}
+.button-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.button-row button {
+  width: auto;
+}
+.snapshot-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
 .timeline { display: grid; gap: 8px; }
 .event { border-left: 3px solid var(--line); padding-left: 10px; color: var(--muted); }
 .list { display: grid; gap: 8px; }
@@ -168,6 +250,13 @@ textarea { min-height: 76px; resize: vertical; }
 .mini-card strong {
   display: block;
   margin: 4px 0;
+}
+.compact-list {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+.compact-list li {
+  margin: 3px 0;
 }
 .error { color: var(--red); }
 .login {
