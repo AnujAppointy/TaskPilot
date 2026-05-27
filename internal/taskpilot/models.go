@@ -270,6 +270,7 @@ type HandoffPacketContent struct {
 	ImplementationNotes     []string `json:"implementation_notes"`
 	FilesComponentsAffected []string `json:"files_components_affected"`
 	KnownIssues             []string `json:"known_issues"`
+	FailedSessions          []string `json:"failed_sessions,omitempty"`
 	RemainingWork           []string `json:"remaining_work"`
 	SuggestedNextSteps      []string `json:"suggested_next_steps"`
 	Assumptions             []string `json:"assumptions"`

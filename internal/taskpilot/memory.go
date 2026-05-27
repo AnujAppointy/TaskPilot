@@ -38,6 +38,7 @@ var handoffMarkdownSections = []struct {
 	{"Implementation Notes", "implementation_notes"},
 	{"Files / Components Affected", "files_components_affected"},
 	{"Known Issues", "known_issues"},
+	{"Failed / Interrupted Sessions", "failed_sessions"},
 	{"Remaining Work", "remaining_work"},
 	{"Suggested Next Steps", "suggested_next_steps"},
 	{"Assumptions", "assumptions"},
@@ -65,7 +66,7 @@ func buildSnapshotContent(detail TaskDetail, entries []ContextEntry) (SnapshotCo
 		case "blocker":
 			out.Blockers = append(out.Blockers, content)
 		case "output_ref":
-			out.FilesOrComponents = append(out.FilesOrComponents, content)
+			out.FilesOrComponents = appendUseful(out.FilesOrComponents, conciseOutputRef(content))
 		case "note":
 			out.Reasoning = append(out.Reasoning, content)
 		case "next":
@@ -126,8 +127,16 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 		if snapshot.Summary.ImplementationDirection != "" && !isNoisyContext(snapshot.Summary.ImplementationDirection) {
 			out.ImplementationNotes = append(out.ImplementationNotes, "Direction: "+snapshot.Summary.ImplementationDirection)
 		}
-		out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, snapshot.Summary.FilesOrComponents...)
-		out.KnownIssues = appendUseful(out.KnownIssues, snapshot.Summary.Blockers...)
+		for _, item := range snapshot.Summary.FilesOrComponents {
+			out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, conciseOutputRef(item))
+		}
+		for _, blocker := range snapshot.Summary.Blockers {
+			if isFailedRunContext(blocker) {
+				out.FailedSessions = appendUseful(out.FailedSessions, normalizeFailedRunContext(blocker))
+			} else {
+				out.KnownIssues = appendUseful(out.KnownIssues, blocker)
+			}
+		}
 		out.Risks = appendUseful(out.Risks, snapshot.Summary.Risks...)
 		out.Assumptions = appendUseful(out.Assumptions, snapshot.Summary.Assumptions...)
 	}
@@ -146,9 +155,13 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 		case "risk":
 			out.Risks = appendUseful(out.Risks, entry.Content)
 		case "blocker":
-			out.KnownIssues = appendUseful(out.KnownIssues, entry.Content)
+			if isFailedRunContext(entry.Content) {
+				out.FailedSessions = appendUseful(out.FailedSessions, normalizeFailedRunContext(entry.Content))
+			} else {
+				out.KnownIssues = appendUseful(out.KnownIssues, entry.Content)
+			}
 		case "output_ref":
-			out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, entry.Content)
+			out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, conciseOutputRef(entry.Content))
 		case "note":
 			out.ImplementationNotes = appendUseful(out.ImplementationNotes, entry.Content)
 		case "next":
@@ -180,7 +193,7 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 		out.FilesComponentsAffected = append(out.FilesComponentsAffected, fmt.Sprintf("%s: %s (%s)", artifact.Kind, artifact.Title, artifact.URI))
 	}
 	for _, handoff := range detail.Handoffs {
-		if handoff.ResumeSummary != "" {
+		if isUsefulHandoffMessage(handoff.ResumeSummary, detail.Task.Goal) {
 			out.HandoffMessage = handoff.ResumeSummary
 		}
 	}
@@ -190,7 +203,13 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 	}
 	out.SuggestedNextSteps = appendUseful(out.SuggestedNextSteps, nextFromContext...)
 	out.Risks = appendUseful(out.Risks, detail.Task.Risks...)
-	out.KnownIssues = appendUseful(out.KnownIssues, detail.Task.Blockers...)
+	for _, blocker := range detail.Task.Blockers {
+		if isFailedRunContext(blocker) {
+			out.FailedSessions = appendUseful(out.FailedSessions, normalizeFailedRunContext(blocker))
+		} else {
+			out.KnownIssues = appendUseful(out.KnownIssues, blocker)
+		}
+	}
 	if len(out.SuggestedNextSteps) == 0 && detail.Task.Status != "completed" {
 		out.SuggestedNextSteps = append(out.SuggestedNextSteps, "Continue from the latest task context and verify completion criteria.")
 	}
@@ -202,8 +221,9 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 	out.ImplementationNotes = limitStrings(uniqueStrings(out.ImplementationNotes), 20)
 	out.FilesComponentsAffected = limitStrings(uniqueStrings(out.FilesComponentsAffected), 24)
 	out.KnownIssues = limitStrings(uniqueStrings(out.KnownIssues), 16)
+	out.FailedSessions = limitStrings(uniqueStrings(out.FailedSessions), 8)
 	out.RemainingWork = limitStrings(uniqueStrings(out.RemainingWork), 16)
-	out.SuggestedNextSteps = limitStrings(uniqueStrings(out.SuggestedNextSteps), 16)
+	out.SuggestedNextSteps = limitStrings(latestActionableNextSteps(out.SuggestedNextSteps), 8)
 	out.Assumptions = limitStrings(uniqueStrings(out.Assumptions), 12)
 	out.Risks = limitStrings(uniqueStrings(out.Risks), 16)
 	out.Dependencies = limitStrings(uniqueStrings(out.Dependencies), 12)
@@ -245,6 +265,7 @@ func renderHandoffMarkdown(content HandoffPacketContent) string {
 	writeMarkdownList(&b, "Implementation Notes", content.ImplementationNotes)
 	writeMarkdownList(&b, "Files / Components Affected", content.FilesComponentsAffected)
 	writeMarkdownList(&b, "Known Issues", content.KnownIssues)
+	writeMarkdownList(&b, "Failed / Interrupted Sessions", content.FailedSessions)
 	writeMarkdownList(&b, "Remaining Work", content.RemainingWork)
 	writeMarkdownList(&b, "Suggested Next Steps", content.SuggestedNextSteps)
 	writeMarkdownList(&b, "Assumptions", content.Assumptions)
@@ -319,6 +340,7 @@ func parseHandoffMarkdownStrict(markdown string, publish bool) (HandoffPacketCon
 		ImplementationNotes:     sectionsList(sections, "Implementation Notes"),
 		FilesComponentsAffected: sectionsList(sections, "Files / Components Affected"),
 		KnownIssues:             sectionsList(sections, "Known Issues"),
+		FailedSessions:          sectionsList(sections, "Failed / Interrupted Sessions"),
 		RemainingWork:           sectionsList(sections, "Remaining Work"),
 		SuggestedNextSteps:      sectionsList(sections, "Suggested Next Steps"),
 		Assumptions:             sectionsList(sections, "Assumptions"),
@@ -607,7 +629,7 @@ func buildHandoffTimeline(detail TaskDetail) []string {
 			start.t = handoffs[i-1].CreatedAt
 			start.ok = true
 		}
-		block := handoffTimelineBlock(i+1, handoff, entriesBetween(detail.Context, start, handoff.CreatedAt))
+		block := handoffTimelineBlock(i+1, handoff, detail.Task.Goal, entriesBetween(detail.Context, start, handoff.CreatedAt))
 		if block != "" {
 			out = append(out, block)
 		}
@@ -637,7 +659,7 @@ func entriesBetween(entries []ContextEntry, start timeFloor, end time.Time) []Co
 	return out
 }
 
-func handoffTimelineBlock(n int, handoff Handoff, entries []ContextEntry) string {
+func handoffTimelineBlock(n int, handoff Handoff, taskGoal string, entries []ContextEntry) string {
 	context := []string{}
 	completed := []string{}
 	decisions := []string{}
@@ -651,13 +673,21 @@ func handoffTimelineBlock(n int, handoff Handoff, entries []ContextEntry) string
 			decisions = appendUseful(decisions, entry.Content)
 		case "note":
 			reasoning = appendUseful(reasoning, entry.Content)
-		case "risk", "blocker", "next":
+		case "risk":
+			open = appendUseful(open, entry.Content)
+		case "blocker":
+			if isFailedRunContext(entry.Content) {
+				reasoning = appendUseful(reasoning, normalizeFailedRunContext(entry.Content))
+			} else {
+				open = appendUseful(open, entry.Content)
+			}
+		case "next":
 			open = appendUseful(open, entry.Content)
 		case "output_ref":
-			context = appendUseful(context, entry.Content)
+			context = appendUseful(context, conciseOutputRef(entry.Content))
 		}
 	}
-	if handoff.ResumeSummary != "" {
+	if isUsefulHandoffMessage(handoff.ResumeSummary, taskGoal) {
 		context = appendUseful(context, handoff.ResumeSummary)
 	}
 	open = appendUseful(open, handoff.NextSteps...)
@@ -680,4 +710,118 @@ func appendTimelineSection(lines []string, title string, values []string) []stri
 		lines = append(lines, "- "+value)
 	}
 	return lines
+}
+
+func latestActionableNextSteps(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || isNoisyContext(value) || !isActionableNextStep(value) {
+			continue
+		}
+		out = append(out, value)
+	}
+	return uniqueStrings(out)
+}
+
+func isActionableNextStep(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	nonActionable := []string{
+		"if further refinement is needed",
+		"if desired",
+		"if needed",
+		"if further work is needed",
+		"no further action",
+		"nothing else",
+		"task appears completed",
+	}
+	for _, phrase := range nonActionable {
+		if strings.Contains(lower, phrase) {
+			return false
+		}
+	}
+	return true
+}
+
+func isFailedRunContext(content string) bool {
+	return strings.Contains(strings.ToLower(content), "taskpilot run command failed")
+}
+
+func normalizeFailedRunContext(content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(content), "failed run:") {
+		return content
+	}
+	return "Failed run: " + content
+}
+
+func isUsefulHandoffMessage(message, goal string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" || isNoisyContext(message) {
+		return false
+	}
+	normalizedMessage := normalizeComparableText(message)
+	normalizedGoal := normalizeComparableText(goal)
+	if normalizedGoal != "" && normalizedMessage == normalizedGoal {
+		return false
+	}
+	return true
+}
+
+func normalizeComparableText(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
+}
+
+func conciseOutputRef(content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	header := strings.ToLower(lines[0])
+	if strings.Contains(header, "files changed during this run") {
+		files := []string{}
+		for _, raw := range lines[1:] {
+			line := strings.TrimSpace(raw)
+			if strings.HasPrefix(line, "- ") {
+				files = append(files, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
+			}
+		}
+		if len(files) == 0 {
+			return ""
+		}
+		return strings.Join(uniqueStrings(files), ", ")
+	}
+	if !strings.Contains(header, "touched files detected by git status after taskpilot run") {
+		return content
+	}
+	files := []string{}
+	inNew := false
+	inExisting := false
+	for _, raw := range lines[1:] {
+		line := strings.TrimSpace(raw)
+		switch strings.ToLower(line) {
+		case "newly changed during run:":
+			inNew = true
+			inExisting = false
+			continue
+		case "already changed before or still changed after run:", "pre-existing dirty worktree files:":
+			inNew = false
+			inExisting = true
+			continue
+		}
+		if strings.HasPrefix(line, "- ") && inNew && !inExisting {
+			files = append(files, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
+		}
+	}
+	if len(files) == 0 {
+		return ""
+	}
+	return "Files changed during this run: " + strings.Join(uniqueStrings(files), ", ")
 }

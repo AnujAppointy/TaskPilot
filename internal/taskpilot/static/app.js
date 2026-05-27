@@ -672,7 +672,7 @@ function closeHandoffModal() {
 
 function parseHandoffNextSteps(text) {
   return (text || "")
-    .split(/\n|,/)
+    .split(/\n/)
     .map(s => s.trim())
     .filter(Boolean);
 }

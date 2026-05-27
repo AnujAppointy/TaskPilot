@@ -42,10 +42,15 @@ func TestParseRunContextLine(t *testing.T) {
 func TestTouchedFilesSummary(t *testing.T) {
 	before := map[string]bool{"auth/old.go": true}
 	after := map[string]bool{"auth/old.go": true, "auth/new.go": true}
-	summary := touchedFilesSummary(before, after)
-	for _, want := range []string{"Touched files detected", "Newly changed during run:", "- auth/new.go", "Already changed before", "- auth/old.go"} {
+	summary, warning := touchedFilesSummary(before, after)
+	for _, want := range []string{"Files changed during this run:", "- auth/new.go"} {
 		if !strings.Contains(summary, want) {
 			t.Fatalf("summary missing %q:\n%s", want, summary)
+		}
+	}
+	for _, want := range []string{"Pre-existing dirty worktree files", "- auth/old.go"} {
+		if !strings.Contains(warning, want) {
+			t.Fatalf("warning missing %q:\n%s", want, warning)
 		}
 	}
 }

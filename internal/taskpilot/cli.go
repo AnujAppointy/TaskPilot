@@ -258,10 +258,13 @@ func runAgentCommand(args []string) error {
 		_ = generateRunSnapshot(taskID, "final")
 	}
 	contextMu.Unlock()
-	changed := touchedFilesSummary(beforeFiles, gitChangedFiles())
+	changed, preExisting := touchedFilesSummary(beforeFiles, gitChangedFiles())
 	if changed != "" {
 		_ = appendRunContext(taskID, "output_ref", changed)
 		_ = generateRunSnapshot(taskID, "final")
+	}
+	if preExisting != "" {
+		_ = appendRunContext(taskID, "risk", preExisting)
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "agent command exited with error: %v\n", err)
@@ -1029,9 +1032,9 @@ func currentGitCommit() string {
 	return strings.TrimSpace(string(out))
 }
 
-func touchedFilesSummary(before, after map[string]bool) string {
+func touchedFilesSummary(before, after map[string]bool) (string, string) {
 	if len(after) == 0 {
-		return ""
+		return "", ""
 	}
 	newOrChanged := []string{}
 	existing := []string{}
@@ -1044,23 +1047,23 @@ func touchedFilesSummary(before, after map[string]bool) string {
 	}
 	sort.Strings(newOrChanged)
 	sort.Strings(existing)
-	if len(newOrChanged) == 0 && len(existing) == 0 {
-		return ""
-	}
-	lines := []string{"Touched files detected by git status after taskpilot run:"}
+	affected := ""
 	if len(newOrChanged) > 0 {
-		lines = append(lines, "Newly changed during run:")
+		lines := []string{"Files changed during this run:"}
 		for _, path := range newOrChanged {
 			lines = append(lines, "- "+path)
 		}
+		affected = strings.Join(lines, "\n")
 	}
+	warning := ""
 	if len(existing) > 0 {
-		lines = append(lines, "Already changed before or still changed after run:")
+		lines := []string{"Pre-existing dirty worktree files were present before this run and are not treated as this task's affected files:"}
 		for _, path := range existing {
 			lines = append(lines, "- "+path)
 		}
+		warning = strings.Join(lines, "\n")
 	}
-	return strings.Join(lines, "\n")
+	return affected, warning
 }
 
 func runAgent(args []string) error {

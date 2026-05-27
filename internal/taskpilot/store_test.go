@@ -697,6 +697,12 @@ func TestHandoffPacketSeparatesTimelineFromCurrentNextSteps(t *testing.T) {
 	if _, err := s.AppendContext(ctx, a.ID, task.ID, "next", "Current context next step"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "blocker", "taskpilot run command failed: exit status 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "output_ref", "Touched files detected by git status after taskpilot run:\nAlready changed before or still changed after run:\n- README.md\n- cli/root.go"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.PrepareHandoff(ctx, a.ID, task.ID, "", "Second handoff after execution plan", []string{"Current next step only"}); err != nil {
 		t.Fatal(err)
 	}
@@ -719,6 +725,12 @@ func TestHandoffPacketSeparatesTimelineFromCurrentNextSteps(t *testing.T) {
 	}
 	if contains(strings.Join(packet.Packet.SuggestedNextSteps, "\n"), "Old next step should stay historical") {
 		t.Fatalf("old handoff next step should not remain current, got %+v", packet.Packet.SuggestedNextSteps)
+	}
+	if contains(strings.Join(packet.Packet.FilesComponentsAffected, "\n"), "README.md") || contains(strings.Join(packet.Packet.FilesComponentsAffected, "\n"), "cli/root.go") {
+		t.Fatalf("pre-existing dirty files should not be treated as affected files, got %+v", packet.Packet.FilesComponentsAffected)
+	}
+	if len(packet.Packet.FailedSessions) != 1 || !contains(packet.Packet.FailedSessions[0], "exit status 1") {
+		t.Fatalf("expected failed run context in failed sessions, got %+v", packet.Packet.FailedSessions)
 	}
 }
 
