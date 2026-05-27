@@ -617,11 +617,15 @@ func (s *Server) handleLatestHandoffPacket(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleUpdateHandoffPacket(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Markdown string `json:"markdown"`
+		Source   string `json:"source"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	out, err := s.store.UpdateHandoffPacketMarkdown(r.Context(), actorID(r), r.PathValue("id"), in.Markdown)
+	if in.Source == "" {
+		in.Source = "manually_edited"
+	}
+	out, err := s.store.UpdateHandoffPacketMarkdownWithSource(r.Context(), actorID(r), r.PathValue("id"), in.Markdown, in.Source)
 	writeResult(w, out, err)
 }
 

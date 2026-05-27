@@ -30,6 +30,7 @@ var handoffMarkdownSections = []struct {
 	{"Objective", "task_objective"},
 	{"Original Requirements", "original_requirements"},
 	{"Current Status", "current_status"},
+	{"Current State", "current_state"},
 	{"Handoff Timeline", "handoff_timeline"},
 	{"Completed Work", "completed_work"},
 	{"Important Decisions", "important_decisions"},
@@ -115,6 +116,7 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 		TaskObjective:        strings.TrimSpace(detail.Task.Goal),
 		OriginalRequirements: append([]string{}, detail.Task.Requirements...),
 		CurrentStatus:        detail.Task.Status,
+		CurrentState:         inferHandoffCurrentState(detail),
 	}
 	sourceSnapshotIDs := []string{}
 	sourceContextIDs := []string{}
@@ -257,6 +259,7 @@ func renderHandoffMarkdown(content HandoffPacketContent) string {
 	writeMarkdownText(&b, "Objective", content.TaskObjective)
 	writeMarkdownList(&b, "Original Requirements", content.OriginalRequirements)
 	writeMarkdownText(&b, "Current Status", content.CurrentStatus)
+	writeMarkdownText(&b, "Current State", content.CurrentState)
 	writeMarkdownBlocks(&b, "Handoff Timeline", content.HandoffTimeline)
 	writeMarkdownList(&b, "Completed Work", content.CompletedWork)
 	writeMarkdownList(&b, "Important Decisions", content.ImportantDecisions)
@@ -332,6 +335,7 @@ func parseHandoffMarkdownStrict(markdown string, publish bool) (HandoffPacketCon
 		TaskObjective:           sectionsText(sections, "Objective"),
 		OriginalRequirements:    sectionsList(sections, "Original Requirements"),
 		CurrentStatus:           sectionsText(sections, "Current Status"),
+		CurrentState:            sectionsText(sections, "Current State"),
 		HandoffTimeline:         sectionsBlocks(sections, "Handoff Timeline"),
 		CompletedWork:           sectionsList(sections, "Completed Work"),
 		ImportantDecisions:      sectionsList(sections, "Important Decisions"),
@@ -572,6 +576,111 @@ func inferImplementationDirection(detail TaskDetail, content SnapshotContent) st
 		return "Task appears completed; verify final outputs and close any follow-up work."
 	}
 	return "Continue toward the task goal using the latest decisions, risks, blockers, and outputs."
+}
+
+func inferHandoffCurrentState(detail TaskDetail) string {
+	if detail.Task.Status == "completed" {
+		return "Task is marked completed; verify final outputs before reopening or continuing."
+	}
+	if detail.Task.Status == "blocked" && len(detail.Task.Blockers) > 0 {
+		return "Task is blocked: " + strings.Join(detail.Task.Blockers, "; ")
+	}
+	for i := len(detail.Context) - 1; i >= 0; i-- {
+		entry := detail.Context[i]
+		if entry.Kind == "summary" && !isNoisyContext(entry.Content) {
+			return strings.TrimSpace(entry.Content)
+		}
+	}
+	return "Task is " + detail.Task.Status + "; continue from the latest task memory and verify the current repository state."
+}
+
+func validateHandoffQuality(content HandoffPacketContent) []MarkdownValidationError {
+	errs := []MarkdownValidationError{}
+	if strings.TrimSpace(content.TaskObjective) == "" {
+		errs = append(errs, MarkdownValidationError{Section: "Objective", Message: "objective is required"})
+	}
+	if strings.TrimSpace(content.CurrentStatus) == "" {
+		errs = append(errs, MarkdownValidationError{Section: "Current Status", Message: "current status is required"})
+	}
+	if strings.TrimSpace(content.CurrentState) == "" || isHandoffPlaceholder(content.CurrentState) {
+		errs = append(errs, MarkdownValidationError{Section: "Current State", Message: "current state is required"})
+	}
+	if listMissingOrPlaceholder(content.CompletedWork) {
+		errs = append(errs, MarkdownValidationError{Section: "Completed Work", Message: "completed work is required; list what was actually done"})
+	}
+	if !hasDecisionState(content.ImportantDecisions) {
+		errs = append(errs, MarkdownValidationError{Section: "Important Decisions", Message: "important decisions are required, or explicitly state: No material decision made; work followed existing requirements."})
+	}
+	if listMissingOrPlaceholder(content.RemainingWork) {
+		errs = append(errs, MarkdownValidationError{Section: "Remaining Work", Message: "remaining work is required; use an explicit completion statement if nothing remains"})
+	}
+	if listMissingOrPlaceholder(content.SuggestedNextSteps) {
+		errs = append(errs, MarkdownValidationError{Section: "Suggested Next Steps", Message: "suggested next steps are required"})
+	}
+	if strings.TrimSpace(content.HandoffMessage) == "" || isHandoffPlaceholder(content.HandoffMessage) {
+		errs = append(errs, MarkdownValidationError{Section: "Handoff Message", Message: "handoff message is required"})
+	}
+	return errs
+}
+
+func hasDecisionState(decisions []string) bool {
+	for _, decision := range decisions {
+		normalized := strings.ToLower(strings.TrimSpace(decision))
+		if normalized == "" {
+			continue
+		}
+		if isHandoffPlaceholder(normalized) {
+			continue
+		}
+		if strings.Contains(normalized, "no material decision made") {
+			return true
+		}
+		return true
+	}
+	return false
+}
+
+func listMissingOrPlaceholder(items []string) bool {
+	items = cleanStrings(items)
+	if len(items) == 0 {
+		return true
+	}
+	for _, item := range items {
+		if !isHandoffPlaceholder(item) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHandoffPlaceholder(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(value, "replace this ") || strings.Contains(value, "write a concise message")
+}
+
+func handoffSupportingEvidence(content HandoffPacketContent) []string {
+	out := []string{}
+	for _, item := range content.FilesComponentsAffected {
+		out = appendUseful(out, "File/component: "+item)
+	}
+	for _, item := range content.HandoffTimeline {
+		out = appendUseful(out, "Timeline: "+firstLine(item))
+	}
+	for _, item := range content.KnownIssues {
+		out = appendUseful(out, "Known issue: "+item)
+	}
+	for _, item := range content.Risks {
+		out = appendUseful(out, "Risk: "+item)
+	}
+	return limitStrings(uniqueStrings(out), 20)
+}
+
+func firstLine(value string) string {
+	value = strings.TrimSpace(value)
+	if idx := strings.IndexByte(value, '\n'); idx >= 0 {
+		return strings.TrimSpace(value[:idx])
+	}
+	return value
 }
 
 func isNoisyContext(content string) bool {

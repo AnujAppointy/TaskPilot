@@ -589,7 +589,7 @@ func TestContextSnapshotsAndHandoffPacket(t *testing.T) {
 	if packet.Markdown == "" || packet.Packet.TaskObjective != "Keep reliable handoff memory" || len(packet.Packet.ImportantDecisions) == 0 {
 		t.Fatalf("unexpected handoff packet: %+v", packet)
 	}
-	updated, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Task Handoff\n\n## Objective\nEdited objective\n\n## Current Status\nready\n\n## Suggested Next Steps\n- Continue from edited packet\n")
+	updated, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Task Handoff\n\n## Objective\nEdited objective\n\n## Current Status\nready\n\n## Current State\nImplementation is ready for continuation.\n\n## Completed Work\n- Added architecture overview\n\n## Important Decisions\n- Keep TaskPilot vendor-neutral\n\n## Remaining Work\n- Review final wording\n\n## Suggested Next Steps\n- Continue from edited packet\n\n## Handoff Message\nContinue from the edited packet.\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +620,7 @@ func TestMarkdownValidationAndPublishHandoff(t *testing.T) {
 	if _, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Wrong\n\n## Objective\nBad\n"); err == nil {
 		t.Fatal("expected markdown heading validation error")
 	}
-	edited, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Task Handoff\n\n## Objective\nEdited objective\n\n## Current Status\nclaimed\n\n## Suggested Next Steps\n- Continue safely\n")
+	edited, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, "# Task Handoff\n\n## Objective\nEdited objective\n\n## Current Status\nclaimed\n\n## Current State\nThe task is claimed and ready for handoff.\n\n## Completed Work\n- Prepared the clean handoff draft\n\n## Important Decisions\n- No material decision made; work followed existing requirements.\n\n## Remaining Work\n- Continue implementation safely\n\n## Suggested Next Steps\n- Continue safely\n\n## Handoff Message\nReady for the next agent.\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,6 +754,15 @@ Prepare execution plan
 ## Current Status
 claimed
 
+## Current State
+The execution plan has been prepared and needs review.
+
+## Completed Work
+- Created EXECUTION_PLAN.md
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
 ## Files / Components Affected
 - Touched files detected by git status after taskpilot run:
 Newly changed during run:
@@ -763,6 +772,12 @@ README.md
 
 ## Suggested Next Steps
 - None recorded.
+
+## Remaining Work
+- Review the execution plan.
+
+## Handoff Message
+Execution plan draft is ready for review.
 `
 	edited, err := s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, markdown)
 	if err != nil {
@@ -770,6 +785,13 @@ README.md
 	}
 	if len(edited.Packet.FilesComponentsAffected) != 1 || !strings.Contains(edited.Packet.FilesComponentsAffected[0], "EXECUTION_PLAN.md") {
 		t.Fatalf("expected wrapped file section to stay as one useful item, got %+v", edited.Packet.FilesComponentsAffected)
+	}
+	if _, err := s.PublishHandoffPacket(ctx, a.ID, edited.ID); err == nil {
+		t.Fatal("expected publish to require useful next steps")
+	}
+	edited, err = s.UpdateHandoffPacketMarkdown(ctx, a.ID, packet.ID, strings.Replace(markdown, "- None recorded.", "- Verify the execution plan against implementation phases.", 1))
+	if err != nil {
+		t.Fatal(err)
 	}
 	published, err := s.PublishHandoffPacket(ctx, a.ID, edited.ID)
 	if err != nil {
@@ -780,6 +802,84 @@ README.md
 	}
 	if len(published.Packet.SuggestedNextSteps) == 0 {
 		t.Fatalf("expected fallback suggested next step, got %+v", published.Packet)
+	}
+}
+
+func TestAgentAuthoredHandoffDraftValidationAndPublish(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Planning", Goal: "Create robust planning doc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	incomplete := `# Task Handoff
+
+## Objective
+Create robust planning doc
+
+## Current Status
+in_progress
+
+## Current State
+Planning document was explored.
+`
+	draft, err := s.UpdateHandoffPacketMarkdownWithSource(ctx, a.ID, packet.ID, incomplete, "agent_authored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft.Source != "agent_authored" || len(draft.ValidationErrors) == 0 {
+		t.Fatalf("expected incomplete agent-authored draft with validation errors, got %+v", draft)
+	}
+	if _, err := s.PublishHandoffPacket(ctx, a.ID, draft.ID); err == nil {
+		t.Fatal("expected publish to fail for incomplete agent-authored handoff")
+	}
+	complete := `# Task Handoff
+
+## Objective
+Create robust planning doc
+
+## Current Status
+in_progress
+
+## Current State
+PLANNING.md now contains the implementation phases and needs review.
+
+## Completed Work
+- Created PLANNING.md with a brief but robust implementation plan.
+
+## Important Decisions
+- Kept the plan brief and phase-oriented so another agent can execute it quickly.
+
+## Remaining Work
+- Review wording and align it with final delivery phases.
+
+## Suggested Next Steps
+- Review PLANNING.md and mark the task ready for review if it matches the goal.
+
+## Handoff Message
+Planning draft is ready for the next agent to review and tighten.
+`
+	draft, err = s.UpdateHandoffPacketMarkdownWithSource(ctx, a.ID, packet.ID, complete, "agent_authored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(draft.ValidationErrors) != 0 {
+		t.Fatalf("expected complete draft without validation errors, got %+v", draft.ValidationErrors)
+	}
+	published, err := s.PublishHandoffPacket(ctx, a.ID, draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.Source != "agent_authored" || published.Status != "published" {
+		t.Fatalf("expected published agent-authored handoff, got %+v", published)
+	}
+	if !strings.Contains(strings.Join(published.Packet.CompletedWork, "\n"), "PLANNING.md") {
+		t.Fatalf("expected agent-authored completed work to survive publish, got %+v", published.Packet.CompletedWork)
 	}
 }
 

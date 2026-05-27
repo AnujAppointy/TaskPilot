@@ -186,7 +186,7 @@ func runAgentCommand(args []string) error {
 	if err := request("GET", "/api/tasks/"+taskID, nil, &detail); err != nil {
 		return err
 	}
-	beforeFiles := gitChangedFiles()
+	beforeFiles := gitChangedFileSnapshot()
 	contextPath, cleanup, err := createRunContextFile(taskID)
 	if err != nil {
 		return err
@@ -216,7 +216,16 @@ func runAgentCommand(args []string) error {
 		return err
 	}
 	defer contextCleanup()
-	startupPrompt := agentStartupPrompt(taskID, taskContextPath, relatedContextPath, contextPath)
+	handoffPacket, err := createRunHandoffPacket(taskID, "", "draft")
+	if err != nil {
+		return err
+	}
+	handoffPath, handoffCleanup, err := createAgentHandoffFile(taskID, detail, handoffPacket)
+	if err != nil {
+		return err
+	}
+	defer handoffCleanup()
+	startupPrompt := agentStartupPrompt(taskID, taskContextPath, relatedContextPath, contextPath, handoffPath)
 	promptPath, promptCleanup, err := createTextTemp("taskpilot-"+taskID+"-prompt-*.txt", startupPrompt)
 	if err != nil {
 		return err
@@ -232,7 +241,7 @@ func runAgentCommand(args []string) error {
 	lastSnapshotAt := time.Now().UTC()
 	pendingSnapshotEntries := 0
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done, &contextMu, &lastSnapshotAt, &pendingSnapshotEntries)
+	go progressLoop(ctx, taskID, contextPath, &contextOffset, handoffPacket.ID, handoffPath, *progressEvery, done, &contextMu, &lastSnapshotAt, &pendingSnapshotEntries)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -245,6 +254,7 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_REPO_ID="+detail.Task.RepoID,
 		"TASKPILOT_WORKSPACE_ID="+detail.Task.WorkspaceID,
 		"TASKPILOT_RUN_CONTEXT_FILE="+contextPath,
+		"TASKPILOT_HANDOFF_FILE="+handoffPath,
 		"TASKPILOT_TASK_CONTEXT_FILE="+taskContextPath,
 		"TASKPILOT_RELATED_CONTEXT_FILE="+relatedContextPath,
 		"TASKPILOT_AGENT_PROMPT_FILE="+promptPath,
@@ -257,20 +267,24 @@ func runAgentCommand(args []string) error {
 	if imported > 0 {
 		_ = generateRunSnapshot(taskID, "final")
 	}
+	_ = syncRunHandoffDraft(handoffPacket.ID, handoffPath)
 	contextMu.Unlock()
-	changed, preExisting := touchedFilesSummary(beforeFiles, gitChangedFiles())
+	changed, preExisting, changedFiles := touchedFilesSummary(beforeFiles, gitChangedFileSnapshot())
 	if changed != "" {
 		_ = appendRunContext(taskID, "output_ref", changed)
-		_ = generateRunSnapshot(taskID, "final")
+		_ = appendRunContext(taskID, "summary", "Updated task files: "+strings.Join(changedFiles, ", "))
 	}
 	if preExisting != "" {
 		_ = appendRunContext(taskID, "risk", preExisting)
+	}
+	if changed != "" || preExisting != "" {
+		_ = generateRunSnapshot(taskID, "final")
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "agent command exited with error: %v\n", err)
 		_ = appendRunContext(taskID, "blocker", "taskpilot run command failed: "+err.Error())
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "failed", "finish_reason": err.Error()}, &Task{})
-		_ = generateRunHandoffPacket(taskID, "", "draft")
+		_ = syncRunHandoffDraft(handoffPacket.ID, handoffPath)
 		if *handoffOnFailure && *handoffTo != "" {
 			_, _ = prepareRunHandoff(taskID, *handoffTo, err.Error(), changed, imported)
 		}
@@ -285,7 +299,7 @@ func runAgentCommand(args []string) error {
 		summary = "Agent command completed successfully through taskpilot run."
 	}
 	_ = generateRunSnapshot(taskID, "final")
-	_ = generateRunHandoffPacket(taskID, "", "draft")
+	_ = syncRunHandoffDraft(handoffPacket.ID, handoffPath)
 	if *completeOnSuccess && !*noComplete {
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "success", "finish_reason": "agent command exited before explicit completion"}, &Task{})
 		var completed Task
@@ -337,7 +351,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}, mu *sync.Mutex, lastSnapshotAt *time.Time, pendingSnapshotEntries *int) {
+func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, handoffPacketID, handoffPath string, interval time.Duration, done <-chan struct{}, mu *sync.Mutex, lastSnapshotAt *time.Time, pendingSnapshotEntries *int) {
 	if interval <= 0 {
 		return
 	}
@@ -361,6 +375,9 @@ func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset
 					}
 				}
 			}
+			if handoffPacketID != "" && handoffPath != "" {
+				_ = syncRunHandoffDraft(handoffPacketID, handoffPath)
+			}
 			mu.Unlock()
 		}
 	}
@@ -372,8 +389,23 @@ func generateRunSnapshot(taskID, snapshotType string) error {
 }
 
 func generateRunHandoffPacket(taskID, handoffID, status string) error {
+	_, err := createRunHandoffPacket(taskID, handoffID, status)
+	return err
+}
+
+func createRunHandoffPacket(taskID, handoffID, status string) (HandoffPacket, error) {
 	var out HandoffPacket
-	return request("POST", "/api/tasks/"+taskID+"/handoff-packet/generate", map[string]any{"handoff_id": handoffID, "status": status}, &out)
+	err := request("POST", "/api/tasks/"+taskID+"/handoff-packet/generate", map[string]any{"handoff_id": handoffID, "status": status}, &out)
+	return out, err
+}
+
+func syncRunHandoffDraft(packetID, handoffPath string) error {
+	data, err := os.ReadFile(handoffPath)
+	if err != nil {
+		return err
+	}
+	var out HandoffPacket
+	return request("PATCH", "/api/handoff-packets/"+packetID, map[string]any{"markdown": string(data), "source": "agent_authored"}, &out)
 }
 
 func createRunContextFile(taskID string) (string, func(), error) {
@@ -386,6 +418,42 @@ func createRunContextFile(taskID string) (string, func(), error) {
 		return "", nil, err
 	}
 	return path, func() { _ = os.Remove(path) }, nil
+}
+
+func createAgentHandoffFile(taskID string, detail TaskDetail, packet HandoffPacket) (string, func(), error) {
+	markdown := agentHandoffTemplate(taskID, detail, packet)
+	return createTextTemp("taskpilot-"+taskID+"-handoff-*.md", markdown)
+}
+
+func agentHandoffTemplate(taskID string, detail TaskDetail, packet HandoffPacket) string {
+	content := packet.Packet
+	if content.TaskObjective == "" {
+		content.TaskObjective = detail.Task.Goal
+	}
+	if content.CurrentStatus == "" {
+		content.CurrentStatus = detail.Task.Status
+	}
+	if content.CurrentState == "" {
+		content.CurrentState = "Describe the current state of the work after this session."
+	}
+	if content.HandoffMessage == "" {
+		content.HandoffMessage = "Write a concise message for the next agent before stopping."
+	}
+	if len(content.CompletedWork) == 0 {
+		content.CompletedWork = []string{"Replace this with concrete work completed during this session."}
+	}
+	if len(content.ImportantDecisions) == 0 {
+		content.ImportantDecisions = []string{"Replace this with decisions made and why, or write: No material decision made; work followed existing requirements."}
+	}
+	if len(content.RemainingWork) == 0 {
+		content.RemainingWork = []string{"Replace this with remaining work, or state that no known work remains."}
+	}
+	if len(content.SuggestedNextSteps) == 0 {
+		content.SuggestedNextSteps = []string{"Replace this with the next concrete action for another agent or human."}
+	}
+	body := renderHandoffMarkdown(content)
+	header := fmt.Sprintf("<!-- TaskPilot handoff draft for %s. Keep this file updated during work. Required before publish: Completed Work, Important Decisions, Current State, Remaining Work, Suggested Next Steps, Handoff Message. -->\n\n", taskID)
+	return header + body
 }
 
 type agentTaskContextFile struct {
@@ -531,7 +599,7 @@ func isAgentResumeCommand(commandArgs []string) bool {
 	return false
 }
 
-func agentStartupPrompt(taskID, taskContextPath, relatedContextPath, runContextPath string) string {
+func agentStartupPrompt(taskID, taskContextPath, relatedContextPath, runContextPath, handoffPath string) string {
 	return `Work on the current TaskPilot task.
 
 You are launched by taskpilot run. Do not infer the task from repo-local files or stale local databases.
@@ -548,7 +616,8 @@ While working:
 - Follow the current task goal, scope, locks, blockers, decisions, and handoff state from the context files.
 - Use related context only when it is relevant to the current task. Do not pull unrelated task history into the answer.
 - If live taskpilot CLI/server access fails from inside the agent runtime, continue from the injected context files.
-- Write useful updates immediately to ` + runContextPath + `.
+- Write useful incremental updates immediately to ` + runContextPath + `.
+- Keep the transfer-ready handoff draft updated in ` + handoffPath + `.
 
 Write context that would let a different agent continue the work without reading this chat. Prefer short, specific entries over vague status updates.
 
@@ -563,6 +632,16 @@ Accepted update lines for ` + runContextPath + `:
 - files: files, modules, APIs, commands, PRs, docs, or artifacts touched
 - verification: tests, commands, checks, or manual validation performed
 - next: specific next step another agent or human should take
+
+Handoff draft rules for ` + handoffPath + `:
+- Treat this as the main memory another agent will read.
+- Update it after each meaningful work unit and before stopping.
+- Completed Work must list what is actually done so the next agent does not repeat it.
+- Important Decisions must list decisions and reasons. If no material decision was made, write exactly: No material decision made; work followed existing requirements.
+- Current State must say where the task stands right now.
+- Remaining Work and Suggested Next Steps must include only still-pending work.
+- Handoff Message must be a concise message to the next agent.
+- Do not leave placeholder text in required sections.
 
 Useful examples:
 - summary: Traced invite signup failure to expiry comparison after token lookup.
@@ -984,6 +1063,20 @@ func normalizeContextKind(kind string) string {
 
 func gitChangedFiles() map[string]bool {
 	out := map[string]bool{}
+	for path := range gitChangedFileSnapshot() {
+		out[path] = true
+	}
+	return out
+}
+
+type gitFileState struct {
+	Status  string
+	ModTime int64
+	Size    int64
+}
+
+func gitChangedFileSnapshot() map[string]gitFileState {
+	out := map[string]gitFileState{}
 	cmd := exec.Command("git", "status", "--porcelain")
 	data, err := cmd.Output()
 	if err != nil {
@@ -995,13 +1088,20 @@ func gitChangedFiles() map[string]bool {
 		if len(line) < 4 {
 			continue
 		}
+		status := strings.TrimSpace(line[:2])
 		path := strings.TrimSpace(line[3:])
 		if strings.Contains(path, " -> ") {
 			parts := strings.Split(path, " -> ")
 			path = parts[len(parts)-1]
 		}
 		if path != "" {
-			out[path] = true
+			out[path] = gitFileState{Status: status}
+			if info, err := os.Stat(path); err == nil {
+				state := out[path]
+				state.ModTime = info.ModTime().UnixNano()
+				state.Size = info.Size()
+				out[path] = state
+			}
 		}
 	}
 	return out
@@ -1032,14 +1132,14 @@ func currentGitCommit() string {
 	return strings.TrimSpace(string(out))
 }
 
-func touchedFilesSummary(before, after map[string]bool) (string, string) {
+func touchedFilesSummary(before, after map[string]gitFileState) (string, string, []string) {
 	if len(after) == 0 {
-		return "", ""
+		return "", "", nil
 	}
 	newOrChanged := []string{}
 	existing := []string{}
-	for path := range after {
-		if before[path] {
+	for path, afterState := range after {
+		if beforeState, ok := before[path]; ok && beforeState == afterState {
 			existing = append(existing, path)
 		} else {
 			newOrChanged = append(newOrChanged, path)
@@ -1063,7 +1163,7 @@ func touchedFilesSummary(before, after map[string]bool) (string, string) {
 		}
 		warning = strings.Join(lines, "\n")
 	}
-	return affected, warning
+	return affected, warning, newOrChanged
 }
 
 func runAgent(args []string) error {
@@ -1252,6 +1352,7 @@ Current task:
 - Read TASKPILOT_TASK_CONTEXT_FILE for the current task snapshot.
 - Read TASKPILOT_RELATED_CONTEXT_FILE for selected prior/linked work context.
 - Write task progress to TASKPILOT_RUN_CONTEXT_FILE.
+- Keep TASKPILOT_HANDOFF_FILE updated as the transfer-ready memory for the next agent.
 
 Required workflow:
 1. Read TASKPILOT_TASK_CONTEXT_FILE before making assumptions.
@@ -1265,6 +1366,7 @@ Required workflow:
 9. Before stopping, leave enough context for another agent to continue without asking a human to re-explain.
 
 Write useful updates to TASKPILOT_RUN_CONTEXT_FILE as soon as each meaningful unit of work finishes. Do not wait until the whole session ends.
+Update TASKPILOT_HANDOFF_FILE after meaningful work and before stopping. This file is the authoritative handoff draft. It must include completed work, important decisions, current state, remaining work, suggested next steps, and a handoff message. If no material decision was made, write exactly: No material decision made; work followed existing requirements.
 
 Write context that would let a different agent continue the work without reading this chat. Prefer short, specific entries over vague status updates.
 

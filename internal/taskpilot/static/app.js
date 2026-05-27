@@ -610,7 +610,8 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
   const snapshotMarkdown = latestSnapshot && latestSnapshot.markdown ? latestSnapshot.markdown : "";
   const markdown = packetMarkdown || snapshotMarkdown || "# Task Memory\n\nNo handoff packet or context snapshot has been generated yet.\n";
   const editor = h("textarea", { class: "memory-editor", value: markdown });
-  const source = packetMarkdown ? `Handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}` : "No memory document yet";
+  const sourceLabel = handoffPacket && handoffPacket.source ? handoffPacket.source.replaceAll("_", " ") : "";
+  const source = packetMarkdown ? `Handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1}${sourceLabel ? ` · ${sourceLabel}` : ""} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}` : "No memory document yet";
   const saveMarkdown = async () => {
     apiState.memoryError = "";
     try {
@@ -630,6 +631,8 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
     h("strong", {}, `${s.snapshot_type} · ${s.status_at_time}`),
     h("p", { class: "meta" }, `${new Date(s.created_at).toLocaleString()} · ${s.source_context_ids ? s.source_context_ids.length : 0} context items`)
   ));
+  const validationItems = handoffPacket && Array.isArray(handoffPacket.validation_errors) ? handoffPacket.validation_errors : [];
+  const evidenceItems = handoffPacket && Array.isArray(handoffPacket.supporting_evidence) ? handoffPacket.supporting_evidence : [];
   return h("div", { class: "section task-memory" },
     h("div", { class: "item-head" },
       h("div", {}, h("h3", {}, "Task Memory"), h("p", { class: "meta" }, source)),
@@ -639,6 +642,14 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
       ) : null
     ),
     h("pre", { class: "markdown-doc" }, markdown),
+    validationItems.length ? h("div", { class: "error-box" },
+      h("strong", {}, "Handoff needs stronger content before publish:"),
+      h("ul", {}, validationItems.map(e => h("li", {}, `${e.section || "Document"}: ${e.message}`)))
+    ) : null,
+    evidenceItems.length ? h("details", {},
+      h("summary", {}, "Supporting evidence"),
+      h("ul", {}, evidenceItems.map(item => h("li", {}, item)))
+    ) : null,
     apiState.memoryError ? h("pre", { class: "error-box" }, apiState.memoryError) : null,
     canWrite() ? h("details", { class: "memory-edit" },
       h("summary", {}, "Edit Markdown"),

@@ -266,6 +266,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, handoff_id TEXT, generated_by TEXT NOT NULL,
 			status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, packet_json TEXT NOT NULL, markdown_cache TEXT NOT NULL,
 			source_snapshot_ids_json TEXT NOT NULL, source_context_ids_json TEXT NOT NULL,
+			source TEXT NOT NULL DEFAULT 'generated_fallback', validation_errors_json TEXT NOT NULL DEFAULT '[]',
+			supporting_evidence_json TEXT NOT NULL DEFAULT '[]',
 			edited_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS task_sessions (
@@ -303,6 +305,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, _ = s.exec(ctx, `UPDATE locks SET last_heartbeat_at=created_at WHERE last_heartbeat_at='' OR last_heartbeat_at IS NULL`)
 	_, _ = s.exec(ctx, `UPDATE locks SET status='released' WHERE released_at IS NOT NULL AND status='active'`)
 	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
+	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN source TEXT NOT NULL DEFAULT 'generated_fallback'`)
+	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN validation_errors_json TEXT NOT NULL DEFAULT '[]'`)
+	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN supporting_evidence_json TEXT NOT NULL DEFAULT '[]'`)
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='published' WHERE status='ready' AND handoff_id IS NOT NULL AND handoff_id<>''`)
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='draft' WHERE status='ready' AND (handoff_id IS NULL OR handoff_id='')`)
 	if err := s.ensureDefaultProject(ctx); err != nil {
@@ -1244,22 +1249,25 @@ func (s *Store) GenerateHandoffPacket(ctx context.Context, actorID, taskID, hand
 	markdown := renderHandoffMarkdown(packetContent)
 	now := time.Now().UTC()
 	out := HandoffPacket{
-		ID:                newID("packet"),
-		TaskID:            taskID,
-		HandoffID:         handoffID,
-		GeneratedBy:       actorID,
-		Status:            status,
-		Version:           1,
-		Packet:            packetContent,
-		Markdown:          markdown,
-		SourceSnapshotIDs: sourceSnapshotIDs,
-		SourceContextIDs:  sourceContextIDs,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+		ID:                 newID("packet"),
+		TaskID:             taskID,
+		HandoffID:          handoffID,
+		GeneratedBy:        actorID,
+		Status:             status,
+		Version:            1,
+		Source:             "generated_fallback",
+		ValidationErrors:   validateHandoffQuality(packetContent),
+		SupportingEvidence: handoffSupportingEvidence(packetContent),
+		Packet:             packetContent,
+		Markdown:           markdown,
+		SourceSnapshotIDs:  sourceSnapshotIDs,
+		SourceContextIDs:   sourceContextIDs,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='superseded' WHERE task_id=? AND status IN ('draft','published')`, taskID)
-	_, err = s.exec(ctx, `INSERT INTO handoff_packets (id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,edited_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		out.ID, out.TaskID, nullableString(out.HandoffID), out.GeneratedBy, out.Status, out.Version, js(out.Packet), out.Markdown, js(out.SourceSnapshotIDs), js(out.SourceContextIDs), nil, ts(out.CreatedAt), ts(out.UpdatedAt))
+	_, err = s.exec(ctx, `INSERT INTO handoff_packets (id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,source,validation_errors_json,supporting_evidence_json,edited_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		out.ID, out.TaskID, nullableString(out.HandoffID), out.GeneratedBy, out.Status, out.Version, js(out.Packet), out.Markdown, js(out.SourceSnapshotIDs), js(out.SourceContextIDs), out.Source, js(out.ValidationErrors), js(out.SupportingEvidence), nil, ts(out.CreatedAt), ts(out.UpdatedAt))
 	if err != nil {
 		return HandoffPacket{}, err
 	}
@@ -1267,7 +1275,7 @@ func (s *Store) GenerateHandoffPacket(ctx context.Context, actorID, taskID, hand
 }
 
 func (s *Store) LatestHandoffPacket(ctx context.Context, taskID string) (*HandoffPacket, error) {
-	row := s.queryRow(ctx, `SELECT id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,edited_by,created_at,updated_at FROM handoff_packets WHERE task_id=? ORDER BY updated_at DESC LIMIT 1`, taskID)
+	row := s.queryRow(ctx, `SELECT id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,source,validation_errors_json,supporting_evidence_json,edited_by,created_at,updated_at FROM handoff_packets WHERE task_id=? ORDER BY updated_at DESC LIMIT 1`, taskID)
 	packet, err := scanHandoffPacket(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1279,20 +1287,32 @@ func (s *Store) LatestHandoffPacket(ctx context.Context, taskID string) (*Handof
 }
 
 func (s *Store) UpdateHandoffPacketMarkdown(ctx context.Context, actorID, packetID, markdown string) (HandoffPacket, error) {
+	return s.UpdateHandoffPacketMarkdownWithSource(ctx, actorID, packetID, markdown, "manually_edited")
+}
+
+func (s *Store) UpdateHandoffPacketMarkdownWithSource(ctx context.Context, actorID, packetID, markdown, source string) (HandoffPacket, error) {
 	packet, err := s.getHandoffPacket(ctx, packetID)
 	if err != nil {
 		return HandoffPacket{}, err
+	}
+	if !oneOf(source, "agent_authored", "generated_fallback", "manually_edited") {
+		source = "manually_edited"
 	}
 	content, err := parseHandoffMarkdownStrict(markdown, false)
 	if err != nil {
 		return HandoffPacket{}, err
 	}
 	packet.Packet = content
+	packet.Source = source
+	packet.ValidationErrors = validateHandoffQuality(content)
+	if len(packet.SupportingEvidence) == 0 {
+		packet.SupportingEvidence = handoffSupportingEvidence(content)
+	}
 	packet.Markdown = renderHandoffMarkdown(packet.Packet)
 	packet.EditedBy = actorID
 	packet.Version++
 	packet.UpdatedAt = time.Now().UTC()
-	_, err = s.exec(ctx, `UPDATE handoff_packets SET packet_json=?,markdown_cache=?,edited_by=?,version=?,updated_at=? WHERE id=?`, js(packet.Packet), packet.Markdown, actorID, packet.Version, ts(packet.UpdatedAt), packet.ID)
+	_, err = s.exec(ctx, `UPDATE handoff_packets SET packet_json=?,markdown_cache=?,source=?,validation_errors_json=?,supporting_evidence_json=?,edited_by=?,version=?,updated_at=? WHERE id=?`, js(packet.Packet), packet.Markdown, packet.Source, js(packet.ValidationErrors), js(packet.SupportingEvidence), actorID, packet.Version, ts(packet.UpdatedAt), packet.ID)
 	if err != nil {
 		return HandoffPacket{}, err
 	}
@@ -1309,8 +1329,9 @@ func (s *Store) PublishHandoffPacket(ctx context.Context, actorID, packetID stri
 		return HandoffPacket{}, err
 	}
 	packet.Packet = content
-	if len(packet.Packet.SuggestedNextSteps) == 0 {
-		packet.Packet.SuggestedNextSteps = []string{"Review this handoff, verify the current task state, then continue the next useful step."}
+	packet.ValidationErrors = validateHandoffQuality(content)
+	if len(packet.ValidationErrors) > 0 {
+		return HandoffPacket{}, markdownValidationErrors(packet.ValidationErrors)
 	}
 	if packet.HandoffID == "" {
 		summary := strings.TrimSpace(packet.Packet.HandoffMessage)
@@ -1332,8 +1353,8 @@ func (s *Store) PublishHandoffPacket(ctx context.Context, actorID, packetID stri
 	packet.Version++
 	packet.Markdown = renderHandoffMarkdown(packet.Packet)
 	packet.UpdatedAt = time.Now().UTC()
-	_, err = s.exec(ctx, `UPDATE handoff_packets SET handoff_id=?,status='published',version=?,packet_json=?,markdown_cache=?,edited_by=?,updated_at=? WHERE id=?`,
-		nullableString(packet.HandoffID), packet.Version, js(packet.Packet), packet.Markdown, actorID, ts(packet.UpdatedAt), packet.ID)
+	_, err = s.exec(ctx, `UPDATE handoff_packets SET handoff_id=?,status='published',version=?,packet_json=?,markdown_cache=?,source=?,validation_errors_json=?,supporting_evidence_json=?,edited_by=?,updated_at=? WHERE id=?`,
+		nullableString(packet.HandoffID), packet.Version, js(packet.Packet), packet.Markdown, packet.Source, js(packet.ValidationErrors), js(packet.SupportingEvidence), actorID, ts(packet.UpdatedAt), packet.ID)
 	if err != nil {
 		return HandoffPacket{}, err
 	}
@@ -2174,7 +2195,7 @@ func (s *Store) getContextSnapshot(ctx context.Context, id string) (ContextSnaps
 }
 
 func (s *Store) getHandoffPacket(ctx context.Context, id string) (HandoffPacket, error) {
-	row := s.queryRow(ctx, `SELECT id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,edited_by,created_at,updated_at FROM handoff_packets WHERE id=?`, id)
+	row := s.queryRow(ctx, `SELECT id,task_id,handoff_id,generated_by,status,version,packet_json,markdown_cache,source_snapshot_ids_json,source_context_ids_json,source,validation_errors_json,supporting_evidence_json,edited_by,created_at,updated_at FROM handoff_packets WHERE id=?`, id)
 	packet, err := scanHandoffPacket(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return HandoffPacket{}, userErr("not_found", "handoff packet not found")
@@ -2393,18 +2414,23 @@ func scanContextSnapshot(row scanner) (ContextSnapshot, error) {
 func scanHandoffPacket(row scanner) (HandoffPacket, error) {
 	var p HandoffPacket
 	var handoffID, editedBy sql.NullString
-	var packet, snapshotIDs, contextIDs, created, updated string
-	if err := row.Scan(&p.ID, &p.TaskID, &handoffID, &p.GeneratedBy, &p.Status, &p.Version, &packet, &p.Markdown, &snapshotIDs, &contextIDs, &editedBy, &created, &updated); err != nil {
+	var packet, snapshotIDs, contextIDs, validationErrors, supportingEvidence, created, updated string
+	if err := row.Scan(&p.ID, &p.TaskID, &handoffID, &p.GeneratedBy, &p.Status, &p.Version, &packet, &p.Markdown, &snapshotIDs, &contextIDs, &p.Source, &validationErrors, &supportingEvidence, &editedBy, &created, &updated); err != nil {
 		return HandoffPacket{}, err
 	}
 	if p.Version == 0 {
 		p.Version = 1
+	}
+	if p.Source == "" {
+		p.Source = "generated_fallback"
 	}
 	p.HandoffID = handoffID.String
 	p.EditedBy = editedBy.String
 	fromJS(packet, &p.Packet)
 	fromJS(snapshotIDs, &p.SourceSnapshotIDs)
 	fromJS(contextIDs, &p.SourceContextIDs)
+	fromJS(validationErrors, &p.ValidationErrors)
+	fromJS(supportingEvidence, &p.SupportingEvidence)
 	p.CreatedAt = parseTS(created)
 	p.UpdatedAt = parseTS(updated)
 	return p, nil

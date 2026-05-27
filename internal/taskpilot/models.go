@@ -262,6 +262,7 @@ type HandoffPacketContent struct {
 	TaskObjective           string   `json:"task_objective"`
 	OriginalRequirements    []string `json:"original_requirements"`
 	CurrentStatus           string   `json:"current_status"`
+	CurrentState            string   `json:"current_state,omitempty"`
 	HandoffTimeline         []string `json:"handoff_timeline,omitempty"`
 	CompletedWork           []string `json:"completed_work"`
 	ImportantDecisions      []string `json:"important_decisions"`
@@ -281,19 +282,22 @@ type HandoffPacketContent struct {
 }
 
 type HandoffPacket struct {
-	ID                string               `json:"id"`
-	TaskID            string               `json:"task_id"`
-	HandoffID         string               `json:"handoff_id,omitempty"`
-	GeneratedBy       string               `json:"generated_by"`
-	Status            string               `json:"status"`
-	Version           int                  `json:"version"`
-	Packet            HandoffPacketContent `json:"packet"`
-	Markdown          string               `json:"markdown"`
-	SourceSnapshotIDs []string             `json:"source_snapshot_ids"`
-	SourceContextIDs  []string             `json:"source_context_ids"`
-	EditedBy          string               `json:"edited_by,omitempty"`
-	CreatedAt         time.Time            `json:"created_at"`
-	UpdatedAt         time.Time            `json:"updated_at"`
+	ID                 string                    `json:"id"`
+	TaskID             string                    `json:"task_id"`
+	HandoffID          string                    `json:"handoff_id,omitempty"`
+	GeneratedBy        string                    `json:"generated_by"`
+	Status             string                    `json:"status"`
+	Version            int                       `json:"version"`
+	Source             string                    `json:"source,omitempty"`
+	ValidationErrors   []MarkdownValidationError `json:"validation_errors,omitempty"`
+	SupportingEvidence []string                  `json:"supporting_evidence,omitempty"`
+	Packet             HandoffPacketContent      `json:"packet"`
+	Markdown           string                    `json:"markdown"`
+	SourceSnapshotIDs  []string                  `json:"source_snapshot_ids"`
+	SourceContextIDs   []string                  `json:"source_context_ids"`
+	EditedBy           string                    `json:"edited_by,omitempty"`
+	CreatedAt          time.Time                 `json:"created_at"`
+	UpdatedAt          time.Time                 `json:"updated_at"`
 }
 
 type StaleClaim struct {
