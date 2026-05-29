@@ -215,6 +215,23 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 	if len(out.SuggestedNextSteps) == 0 && detail.Task.Status != "completed" {
 		out.SuggestedNextSteps = append(out.SuggestedNextSteps, "Continue from the latest task context and verify completion criteria.")
 	}
+	if len(out.CompletedWork) > 0 && !hasDecisionState(out.ImportantDecisions) {
+		out.ImportantDecisions = append(out.ImportantDecisions, "No material decision made; work followed existing requirements.")
+	}
+	if len(out.RemainingWork) == 0 && len(out.CompletedWork) > 0 {
+		if detail.Task.Status == "handoff_ready" {
+			out.RemainingWork = append(out.RemainingWork, "No known document work remains; next agent should verify the handoff context and continue only if new requirements are added.")
+		} else {
+			out.RemainingWork = append(out.RemainingWork, "Verify the recorded work and decide whether to continue, send to review, publish a handoff, or mark complete.")
+		}
+	}
+	if strings.TrimSpace(out.HandoffMessage) == "" && len(out.CompletedWork) > 0 {
+		target := "the task"
+		if len(out.FilesComponentsAffected) > 0 {
+			target = strings.Join(limitStrings(uniqueStrings(out.FilesComponentsAffected), 3), ", ")
+		}
+		out.HandoffMessage = fmt.Sprintf("Continue from the recorded work on %s. Review completed work, known issues, and suggested next steps before making changes.", target)
+	}
 	out.CompletedWork = limitStrings(uniqueStrings(out.CompletedWork), 20)
 	out.ImportantDecisions = limitStrings(uniqueStrings(out.ImportantDecisions), 20)
 	out.HandoffTimeline = limitStrings(uniqueStrings(out.HandoffTimeline), 20)

@@ -954,6 +954,44 @@ Write a concise message for the next agent before stopping.
 	}
 }
 
+func TestGeneratedHandoffFallbackFillsRequiredTransferFields(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Snake planning", Goal: "make a planning md file for a simple 2d snake game"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Created planning.md with gameplay loop, implementation steps, edge cases, and testing checklist."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Added a dedicated Logic section to planning.md."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "output_ref", "planning.md"); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listMissingOrPlaceholder(packet.Packet.CompletedWork) {
+		t.Fatalf("expected generated completed work, got %+v", packet.Packet.CompletedWork)
+	}
+	if !hasDecisionState(packet.Packet.ImportantDecisions) {
+		t.Fatalf("expected explicit decision state, got %+v", packet.Packet.ImportantDecisions)
+	}
+	if listMissingOrPlaceholder(packet.Packet.RemainingWork) {
+		t.Fatalf("expected explicit remaining work state, got %+v", packet.Packet.RemainingWork)
+	}
+	if strings.TrimSpace(packet.Packet.HandoffMessage) == "" {
+		t.Fatalf("expected generated handoff message")
+	}
+	if len(packet.ValidationErrors) != 0 {
+		t.Fatalf("expected generated fallback to be publishable, got %+v\n%s", packet.ValidationErrors, packet.Markdown)
+	}
+}
+
 func TestHandoffCheckpointsPreserveHistoryAndLatestNextSteps(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

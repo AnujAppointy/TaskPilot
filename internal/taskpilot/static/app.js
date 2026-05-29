@@ -40,6 +40,7 @@ const apiState = {
   lastEventID: 0,
   pendingRender: false,
   memoryError: "",
+  memoryMode: "auto",
   handoffModal: null,
 };
 
@@ -492,6 +493,8 @@ function taskCard(t) {
 async function selectTask(id) {
   apiState.selected = id;
   apiState.tab = "detail";
+  apiState.memoryMode = "auto";
+  apiState.memoryError = "";
   apiState.detail = await api(`/api/tasks/${id}`);
   render();
 }
@@ -610,18 +613,35 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
   const packetIsWeak = handoffPacket && Array.isArray(handoffPacket.validation_errors) && handoffPacket.validation_errors.length && !packetTimeline.length;
   const snapshotIsNewer = handoffPacket && latestSnapshot && new Date(latestSnapshot.updated_at || latestSnapshot.created_at) > new Date(handoffPacket.updated_at || handoffPacket.created_at);
   const preferSnapshot = packetIsWeak && snapshotIsNewer;
-  const packetMarkdown = !preferSnapshot && handoffPacket && handoffPacket.markdown ? handoffPacket.markdown : "";
+  const forcedHandoff = apiState.memoryMode === "handoff";
+  const forcedSnapshot = apiState.memoryMode === "snapshot";
+  const packetMarkdown = !forcedSnapshot && (forcedHandoff || !preferSnapshot) && handoffPacket && handoffPacket.markdown ? handoffPacket.markdown : "";
   const snapshotMarkdown = latestSnapshot && latestSnapshot.markdown ? latestSnapshot.markdown : "";
-  const markdown = packetMarkdown || snapshotMarkdown || "# Task Memory\n\nNo handoff packet or context snapshot has been generated yet.\n";
+  const markdown = packetMarkdown || (!forcedHandoff ? snapshotMarkdown : "") || "# Task Memory\n\nNo handoff packet or context snapshot has been generated yet.\n";
+  const activeDoc = packetMarkdown ? "handoff" : snapshotMarkdown && !forcedHandoff ? "snapshot" : "none";
   const editor = h("textarea", { class: "memory-editor", value: markdown });
   const sourceLabel = handoffPacket && handoffPacket.source ? handoffPacket.source.replaceAll("_", " ") : "";
-  const source = packetMarkdown ? `Handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1}${sourceLabel ? ` · ${sourceLabel}` : ""} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}${preferSnapshot ? " · newer than weak draft" : ""}` : "No memory document yet";
+  const source = packetMarkdown ? `Recent handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1}${sourceLabel ? ` · ${sourceLabel}` : ""} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown && !forcedHandoff ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}${preferSnapshot ? " · newer than weak draft" : ""}` : forcedHandoff ? "No recent handoff packet yet. Generate or prepare a handoff first." : "No memory document yet";
+  const showRecentHandoff = async () => {
+    apiState.memoryError = "";
+    apiState.memoryMode = "handoff";
+    try {
+      const shouldRefreshDraft = !handoffPacket || handoffPacketShouldRefreshFromMemory(handoffPacket, latestSnapshot);
+      if (shouldRefreshDraft) {
+        await api(`/api/tasks/${task.id}/handoff-packet/generate`, { method: "POST", body: JSON.stringify({ status: "draft" }) });
+      }
+      await refresh();
+    } catch (err) {
+      apiState.memoryError = err.message;
+      render();
+    }
+  };
   const saveMarkdown = async () => {
     apiState.memoryError = "";
     try {
-      if (handoffPacket) {
+      if (activeDoc === "handoff" && handoffPacket) {
         await api(`/api/handoff-packets/${handoffPacket.id}`, { method: "PATCH", body: JSON.stringify({ markdown: editor.value }) });
-      } else if (latestSnapshot) {
+      } else if (activeDoc === "snapshot" && latestSnapshot) {
         await api(`/api/snapshots/${latestSnapshot.id}`, { method: "PATCH", body: JSON.stringify({ markdown: editor.value }) });
       }
       await refresh();
@@ -641,7 +661,9 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
     h("div", { class: "item-head" },
       h("div", {}, h("h3", {}, "Task Memory"), h("p", { class: "meta" }, source)),
       canWrite() ? h("div", { class: "button-row" },
-        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/snapshots`, { method: "POST", body: JSON.stringify({ snapshot_type: "manual" }) }); await refresh(); } }, "Generate Snapshot"),
+        h("button", { onclick: async () => { apiState.memoryMode = "snapshot"; await api(`/api/tasks/${task.id}/snapshots`, { method: "POST", body: JSON.stringify({ snapshot_type: "manual" }) }); await refresh(); } }, "Generate Snapshot"),
+        h("button", { onclick: showRecentHandoff }, "Show Recent Handoff"),
+        apiState.memoryMode !== "auto" ? h("button", { onclick: () => { apiState.memoryMode = "auto"; apiState.memoryError = ""; render(); } }, "Show Best Memory") : null,
         h("button", { onclick: () => openHandoffModal(task, latestSnapshot, handoffPacket) }, "Prepare handoff for other agent")
       ) : null
     ),
@@ -659,11 +681,48 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
       h("summary", {}, "Edit Markdown"),
       editor,
       h("div", { class: "button-row" },
-        handoffPacket || latestSnapshot ? h("button", { class: "primary", onclick: saveMarkdown }, handoffPacket ? "Save Draft" : "Save Snapshot") : null
+        activeDoc !== "none" ? h("button", { class: "primary", onclick: saveMarkdown }, activeDoc === "handoff" ? "Save Handoff Draft" : "Save Snapshot") : null
       )
     ) : null,
     snapshotItems.length ? h("details", {}, h("summary", {}, "Recent snapshots"), h("div", { class: "snapshot-list" }, snapshotItems)) : null
   );
+}
+
+function handoffPacketShouldRefreshFromMemory(packet, latestSnapshot) {
+  if (!packet) return true;
+  if (packet.source && packet.source !== "generated_fallback") return false;
+  if (handoffPacketHasUsefulTransferContent(packet)) return false;
+  if (!latestSnapshot || !latestSnapshot.markdown) return true;
+  const snapshotTime = new Date(latestSnapshot.updated_at || latestSnapshot.created_at || 0).getTime();
+  const packetTime = new Date(packet.updated_at || packet.created_at || 0).getTime();
+  return snapshotTime >= packetTime || handoffPacketLooksEmpty(packet);
+}
+
+function handoffPacketHasUsefulTransferContent(packet) {
+  const p = packet && packet.packet ? packet.packet : {};
+  return usefulArray(p.completed_work).length > 0 ||
+    usefulArray(p.important_decisions).length > 0 ||
+    usefulArray(p.files_components_affected).length > 0 ||
+    usefulArray(p.handoff_timeline).length > 0 ||
+    usefulText(p.current_state) ||
+    usefulText(p.handoff_message);
+}
+
+function handoffPacketLooksEmpty(packet) {
+  const text = `${packet && packet.markdown ? packet.markdown : ""}`.toLowerCase();
+  if (!text) return true;
+  const noneCount = (text.match(/none recorded/g) || []).length;
+  return noneCount >= 6 && !handoffPacketHasUsefulTransferContent(packet);
+}
+
+function usefulArray(values) {
+  return Array.isArray(values) ? values.filter(v => usefulText(v)) : [];
+}
+
+function usefulText(value) {
+  value = `${value || ""}`.trim();
+  if (!value || value === "Not specified." || value === "None recorded.") return false;
+  return !/^(task is .*continue from the latest task memory|continue from the latest task context|not specified)$/i.test(value);
 }
 
 function openHandoffModal(task, latestSnapshot, handoffPacket) {
