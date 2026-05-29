@@ -608,8 +608,65 @@ func injectAgentStartupPrompt(commandArgs []string, prompt string) []string {
 		if len(commandArgs) == 1 || isAgentResumeCommand(commandArgs) {
 			return append(commandArgs, prompt)
 		}
+		return injectPromptIntoAgentArgs(commandArgs, prompt)
 	}
 	return commandArgs
+}
+
+func injectPromptIntoAgentArgs(commandArgs []string, prompt string) []string {
+	out := append([]string{}, commandArgs...)
+	if idx := lastAgentPromptArgIndex(out); idx > 0 {
+		out[idx] = combineTaskPilotAndUserPrompt(prompt, out[idx])
+		return out
+	}
+	return append(out, prompt)
+}
+
+func lastAgentPromptArgIndex(commandArgs []string) int {
+	valueFlags := map[string]bool{
+		"-m": true, "--model": true,
+		"-c": true, "--config": true,
+		"-C": true, "--cd": true, "--cwd": true,
+		"--profile": true, "--sandbox": true, "--approval-policy": true,
+	}
+	positional := []int{}
+	for i := 1; i < len(commandArgs); i++ {
+		arg := commandArgs[i]
+		if arg == "--" {
+			for j := i + 1; j < len(commandArgs); j++ {
+				positional = append(positional, j)
+			}
+			break
+		}
+		if strings.HasPrefix(arg, "--") {
+			if strings.Contains(arg, "=") {
+				continue
+			}
+			if valueFlags[arg] && i+1 < len(commandArgs) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			if valueFlags[arg] && i+1 < len(commandArgs) {
+				i++
+			}
+			continue
+		}
+		positional = append(positional, i)
+	}
+	if len(positional) == 0 {
+		return -1
+	}
+	return positional[len(positional)-1]
+}
+
+func combineTaskPilotAndUserPrompt(taskPilotPrompt, userPrompt string) string {
+	userPrompt = strings.TrimSpace(userPrompt)
+	if userPrompt == "" {
+		return taskPilotPrompt
+	}
+	return taskPilotPrompt + "\n\nHuman prompt for this work unit:\n" + userPrompt
 }
 
 func isAgentResumeCommand(commandArgs []string) bool {

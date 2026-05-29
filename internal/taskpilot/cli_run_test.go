@@ -77,6 +77,36 @@ func TestRunSyncIntervalCapsLongProgressInterval(t *testing.T) {
 	}
 }
 
+func TestInjectAgentStartupPromptCombinesHumanPrompt(t *testing.T) {
+	got := injectAgentStartupPrompt([]string{"codex", "add planning section"}, "TASKPILOT CONTEXT")
+	if len(got) != 2 {
+		t.Fatalf("expected two args, got %+v", got)
+	}
+	if !strings.Contains(got[1], "TASKPILOT CONTEXT") || !strings.Contains(got[1], "Human prompt for this work unit:") || !strings.Contains(got[1], "add planning section") {
+		t.Fatalf("prompt was not combined correctly: %q", got[1])
+	}
+}
+
+func TestInjectAgentStartupPromptPreservesModelFlagAndCombinesLastPrompt(t *testing.T) {
+	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5", "review README"}, "TASKPILOT CONTEXT")
+	if len(got) != 4 {
+		t.Fatalf("expected four args, got %+v", got)
+	}
+	if got[2] != "gpt-5" {
+		t.Fatalf("model flag value should be preserved, got %+v", got)
+	}
+	if !strings.Contains(got[3], "TASKPILOT CONTEXT") || !strings.Contains(got[3], "review README") {
+		t.Fatalf("last prompt arg was not combined: %+v", got)
+	}
+}
+
+func TestInjectAgentStartupPromptAppendsWhenOnlyFlagsExist(t *testing.T) {
+	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5"}, "TASKPILOT CONTEXT")
+	if len(got) != 4 || got[1] != "--model" || got[2] != "gpt-5" || got[3] != "TASKPILOT CONTEXT" {
+		t.Fatalf("expected prompt appended after flag-only command, got %+v", got)
+	}
+}
+
 func TestTouchedFilesSummary(t *testing.T) {
 	before := map[string]gitFileState{"auth/old.go": {Status: "M", ModTime: 1, Size: 10}, "planning.md": {Status: "M", ModTime: 1, Size: 20}}
 	after := map[string]gitFileState{"auth/old.go": {Status: "M", ModTime: 1, Size: 10}, "auth/new.go": {Status: "??", ModTime: 2, Size: 10}, "planning.md": {Status: "M", ModTime: 3, Size: 25}}
