@@ -270,6 +270,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			supporting_evidence_json TEXT NOT NULL DEFAULT '[]',
 			edited_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS handoff_checkpoints (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, packet_id TEXT NOT NULL, session_id TEXT,
+			actor_id TEXT NOT NULL, sequence INTEGER NOT NULL, packet_json TEXT NOT NULL,
+			markdown_cache TEXT NOT NULL, validation_errors_json TEXT NOT NULL DEFAULT '[]',
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS task_sessions (
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, actor_id TEXT NOT NULL,
 			started_at TEXT NOT NULL, ended_at TEXT, exit_status TEXT, finish_reason TEXT
@@ -709,6 +715,7 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 	h, _ := s.ListHandoffs(ctx, id)
 	snapshots, _ := s.ListContextSnapshots(ctx, id)
 	packet, _ := s.LatestHandoffPacket(ctx, id)
+	checkpoints, _ := s.ListHandoffCheckpoints(ctx, id)
 	e, _ := s.ListEvents(ctx, 0, id)
 	subtasks, _ := s.ListSubtasks(ctx, id)
 	dependencies, _ := s.ListTaskDependencies(ctx, id)
@@ -723,7 +730,7 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 	if len(snapshots) > 0 {
 		latestSnapshot = &snapshots[len(snapshots)-1]
 	}
-	return TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, Events: e}, nil
+	return TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, HandoffCheckpoints: checkpoints, Events: e}, nil
 }
 
 func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput, reason string) (Task, error) {
@@ -1239,13 +1246,15 @@ func (s *Store) GenerateHandoffPacket(ctx context.Context, actorID, taskID, hand
 	if err != nil {
 		return HandoffPacket{}, err
 	}
-	snapshots := detail.Snapshots
-	if len(snapshots) == 0 {
-		if snapshot, err := s.CreateContextSnapshot(ctx, actorID, taskID, "final"); err == nil {
-			snapshots = []ContextSnapshot{snapshot}
-		}
+	checkpoints, _ := s.ListHandoffCheckpoints(ctx, taskID)
+	packetContent := HandoffPacketContent{}
+	sourceSnapshotIDs := []string{}
+	sourceContextIDs := []string{}
+	if len(checkpoints) > 0 {
+		packetContent = buildHandoffPacketFromCheckpoints(detail, checkpoints)
+	} else {
+		packetContent, sourceSnapshotIDs, sourceContextIDs = buildHandoffPacketContent(detail, detail.Snapshots)
 	}
-	packetContent, sourceSnapshotIDs, sourceContextIDs := buildHandoffPacketContent(detail, snapshots)
 	markdown := renderHandoffMarkdown(packetContent)
 	now := time.Now().UTC()
 	out := HandoffPacket{
@@ -1304,6 +1313,13 @@ func (s *Store) UpdateHandoffPacketMarkdownWithSource(ctx context.Context, actor
 	}
 	packet.Packet = content
 	packet.Source = source
+	if source == "agent_authored" {
+		if detail, err := s.TaskDetail(ctx, packet.TaskID); err == nil {
+			content = mergeAgentAuthoredHandoffWithFallback(content, detail)
+			packet.Packet = content
+			packet.SupportingEvidence = handoffSupportingEvidence(buildHandoffFallbackContent(detail))
+		}
+	}
 	packet.ValidationErrors = validateHandoffQuality(content)
 	if len(packet.SupportingEvidence) == 0 {
 		packet.SupportingEvidence = handoffSupportingEvidence(content)
@@ -1317,6 +1333,86 @@ func (s *Store) UpdateHandoffPacketMarkdownWithSource(ctx context.Context, actor
 		return HandoffPacket{}, err
 	}
 	return packet, s.addEvent(ctx, packet.TaskID, actorID, "handoff.packet_edited", map[string]any{"id": packet.ID})
+}
+
+func (s *Store) CreateHandoffCheckpoint(ctx context.Context, actorID, taskID, packetID, sessionID, markdown string) (HandoffCheckpoint, error) {
+	detail, err := s.TaskDetail(ctx, taskID)
+	if err != nil {
+		return HandoffCheckpoint{}, err
+	}
+	var packet HandoffPacket
+	if packetID != "" {
+		packet, err = s.getHandoffPacket(ctx, packetID)
+	} else if detail.HandoffPacket != nil {
+		packet = *detail.HandoffPacket
+	} else {
+		packet, err = s.GenerateHandoffPacket(ctx, actorID, taskID, "", "draft")
+	}
+	if err != nil {
+		return HandoffCheckpoint{}, err
+	}
+	if packet.TaskID != taskID {
+		return HandoffCheckpoint{}, userErr("validation", "handoff packet belongs to another task")
+	}
+	content, err := parseHandoffMarkdownStrict(markdown, false)
+	if err != nil {
+		return HandoffCheckpoint{}, err
+	}
+	content = mergeAgentAuthoredHandoffWithFallback(content, detail)
+	validationErrors := validateHandoffQuality(content)
+	now := time.Now().UTC()
+	sequence := 1
+	_ = s.queryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM handoff_checkpoints WHERE task_id=?`, taskID).Scan(&sequence)
+	checkpoint := HandoffCheckpoint{
+		ID:               newID("checkpoint"),
+		TaskID:           taskID,
+		PacketID:         packet.ID,
+		SessionID:        sessionID,
+		ActorID:          actorID,
+		Sequence:         sequence,
+		Packet:           content,
+		Markdown:         renderHandoffMarkdown(content),
+		ValidationErrors: validationErrors,
+		CreatedAt:        now,
+	}
+	_, err = s.exec(ctx, `INSERT INTO handoff_checkpoints (id,task_id,packet_id,session_id,actor_id,sequence,packet_json,markdown_cache,validation_errors_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		checkpoint.ID, checkpoint.TaskID, checkpoint.PacketID, nullableString(checkpoint.SessionID), checkpoint.ActorID, checkpoint.Sequence, js(checkpoint.Packet), checkpoint.Markdown, js(checkpoint.ValidationErrors), ts(checkpoint.CreatedAt))
+	if err != nil {
+		return HandoffCheckpoint{}, err
+	}
+	checkpoints, _ := s.ListHandoffCheckpoints(ctx, taskID)
+	rebuilt := buildHandoffPacketFromCheckpoints(detail, checkpoints)
+	packet.Packet = rebuilt
+	packet.Markdown = renderHandoffMarkdown(packet.Packet)
+	packet.Source = "agent_authored"
+	packet.SupportingEvidence = handoffSupportingEvidence(buildHandoffFallbackContent(detail))
+	packet.ValidationErrors = validateHandoffQuality(packet.Packet)
+	packet.EditedBy = actorID
+	packet.Version++
+	packet.UpdatedAt = now
+	_, err = s.exec(ctx, `UPDATE handoff_packets SET packet_json=?,markdown_cache=?,source=?,validation_errors_json=?,supporting_evidence_json=?,edited_by=?,version=?,updated_at=? WHERE id=?`,
+		js(packet.Packet), packet.Markdown, packet.Source, js(packet.ValidationErrors), js(packet.SupportingEvidence), actorID, packet.Version, ts(packet.UpdatedAt), packet.ID)
+	if err != nil {
+		return HandoffCheckpoint{}, err
+	}
+	return checkpoint, s.addEvent(ctx, taskID, actorID, "handoff.checkpoint_created", checkpoint)
+}
+
+func (s *Store) ListHandoffCheckpoints(ctx context.Context, taskID string) ([]HandoffCheckpoint, error) {
+	rows, err := s.query(ctx, `SELECT id,task_id,packet_id,session_id,actor_id,sequence,packet_json,markdown_cache,validation_errors_json,created_at FROM handoff_checkpoints WHERE task_id=? ORDER BY sequence ASC, created_at ASC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []HandoffCheckpoint{}
+	for rows.Next() {
+		checkpoint, err := scanHandoffCheckpoint(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, checkpoint)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) PublishHandoffPacket(ctx context.Context, actorID, packetID string) (HandoffPacket, error) {
@@ -2434,6 +2530,20 @@ func scanHandoffPacket(row scanner) (HandoffPacket, error) {
 	p.CreatedAt = parseTS(created)
 	p.UpdatedAt = parseTS(updated)
 	return p, nil
+}
+
+func scanHandoffCheckpoint(row scanner) (HandoffCheckpoint, error) {
+	var c HandoffCheckpoint
+	var sessionID sql.NullString
+	var packet, validationErrors, created string
+	if err := row.Scan(&c.ID, &c.TaskID, &c.PacketID, &sessionID, &c.ActorID, &c.Sequence, &packet, &c.Markdown, &validationErrors, &created); err != nil {
+		return HandoffCheckpoint{}, err
+	}
+	c.SessionID = sessionID.String
+	fromJS(packet, &c.Packet)
+	fromJS(validationErrors, &c.ValidationErrors)
+	c.CreatedAt = parseTS(created)
+	return c, nil
 }
 
 func cleanStrings(in []string) []string {

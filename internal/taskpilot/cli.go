@@ -130,6 +130,7 @@ Agent CLI:
   taskpilot git link-branch <task-id>
   taskpilot git attach-pr <task-id> https://github.com/org/repo/pull/42
   taskpilot handoff prepare <task-id> --summary "Ready for next agent" --next "Write test" --next "Patch logic"
+  taskpilot handoff checkpoint <task-id> --file "$TASKPILOT_HANDOFF_FILE"
 
 Automation:
   taskpilot run <task-id> -- <agent-command> [args...]
@@ -163,7 +164,7 @@ func runAgentCommand(args []string) error {
 		return fmt.Errorf("usage: taskpilot run <task-id> [options] -- <agent-command> [args...]")
 	}
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	progressEvery := fs.Duration("progress-interval", progressInterval(), "sync run context to the server while the child command runs")
+	progressEvery := fs.Duration("progress-interval", progressInterval(), "sync lightweight run context to the server while the child command runs")
 	noComplete := fs.Bool("no-complete", false, "deprecated: taskpilot run no longer completes automatically")
 	completeOnSuccess := fs.Bool("complete", false, "explicitly complete the task when the child command succeeds")
 	handoffOnFailure := fs.Bool("handoff-on-failure", true, "prepare a handoff packet if the child command fails")
@@ -238,10 +239,8 @@ func runAgentCommand(args []string) error {
 	defer cancel()
 	done := make(chan struct{})
 	var contextMu sync.Mutex
-	lastSnapshotAt := time.Now().UTC()
-	pendingSnapshotEntries := 0
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, contextPath, &contextOffset, handoffPacket.ID, handoffPath, *progressEvery, done, &contextMu, &lastSnapshotAt, &pendingSnapshotEntries)
+	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done, &contextMu)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -250,6 +249,8 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_TASK_ID="+taskID,
 		"TASKPILOT_SERVER="+cfg.Server,
 		"TASKPILOT_ACTOR_ID="+cfg.ActorID,
+		"TASKPILOT_SESSION_ID="+session.ID,
+		"TASKPILOT_HANDOFF_PACKET_ID="+handoffPacket.ID,
 		"TASKPILOT_PROJECT_ID="+detail.Task.ProjectID,
 		"TASKPILOT_REPO_ID="+detail.Task.RepoID,
 		"TASKPILOT_WORKSPACE_ID="+detail.Task.WorkspaceID,
@@ -264,10 +265,7 @@ func runAgentCommand(args []string) error {
 	close(done)
 	contextMu.Lock()
 	imported := importRunContextSince(taskID, contextPath, &contextOffset)
-	if imported > 0 {
-		_ = generateRunSnapshot(taskID, "final")
-	}
-	_ = syncRunHandoffDraft(handoffPacket.ID, handoffPath)
+	_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
 	contextMu.Unlock()
 	changed, preExisting, changedFiles := touchedFilesSummary(beforeFiles, gitChangedFileSnapshot())
 	if changed != "" {
@@ -278,13 +276,13 @@ func runAgentCommand(args []string) error {
 		_ = appendRunContext(taskID, "risk", preExisting)
 	}
 	if changed != "" || preExisting != "" {
-		_ = generateRunSnapshot(taskID, "final")
+		_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "agent command exited with error: %v\n", err)
 		_ = appendRunContext(taskID, "blocker", "taskpilot run command failed: "+err.Error())
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "failed", "finish_reason": err.Error()}, &Task{})
-		_ = syncRunHandoffDraft(handoffPacket.ID, handoffPath)
+		_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
 		if *handoffOnFailure && *handoffTo != "" {
 			_, _ = prepareRunHandoff(taskID, *handoffTo, err.Error(), changed, imported)
 		}
@@ -298,8 +296,7 @@ func runAgentCommand(args []string) error {
 	if summary == "" {
 		summary = "Agent command completed successfully through taskpilot run."
 	}
-	_ = generateRunSnapshot(taskID, "final")
-	_ = syncRunHandoffDraft(handoffPacket.ID, handoffPath)
+	_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
 	if *completeOnSuccess && !*noComplete {
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "success", "finish_reason": "agent command exited before explicit completion"}, &Task{})
 		var completed Task
@@ -351,7 +348,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, handoffPacketID, handoffPath string, interval time.Duration, done <-chan struct{}, mu *sync.Mutex, lastSnapshotAt *time.Time, pendingSnapshotEntries *int) {
+func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}, mu *sync.Mutex) {
 	if interval <= 0 {
 		return
 	}
@@ -365,19 +362,7 @@ func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset
 			return
 		case <-ticker.C:
 			mu.Lock()
-			imported := importRunContextSince(taskID, contextPath, contextOffset)
-			if imported > 0 {
-				*pendingSnapshotEntries += imported
-				if *pendingSnapshotEntries >= 5 || time.Since(*lastSnapshotAt) >= time.Minute {
-					if generateRunSnapshot(taskID, "periodic") == nil {
-						*lastSnapshotAt = time.Now().UTC()
-						*pendingSnapshotEntries = 0
-					}
-				}
-			}
-			if handoffPacketID != "" && handoffPath != "" {
-				_ = syncRunHandoffDraft(handoffPacketID, handoffPath)
-			}
+			_ = importRunContextSince(taskID, contextPath, contextOffset)
 			mu.Unlock()
 		}
 	}
@@ -399,13 +384,13 @@ func createRunHandoffPacket(taskID, handoffID, status string) (HandoffPacket, er
 	return out, err
 }
 
-func syncRunHandoffDraft(packetID, handoffPath string) error {
+func checkpointRunHandoff(taskID, packetID, sessionID, handoffPath string) error {
 	data, err := os.ReadFile(handoffPath)
 	if err != nil {
 		return err
 	}
-	var out HandoffPacket
-	return request("PATCH", "/api/handoff-packets/"+packetID, map[string]any{"markdown": string(data), "source": "agent_authored"}, &out)
+	var out HandoffCheckpoint
+	return request("POST", "/api/tasks/"+taskID+"/handoff-checkpoints", map[string]any{"packet_id": packetID, "session_id": sessionID, "markdown": string(data)}, &out)
 }
 
 func createRunContextFile(taskID string) (string, func(), error) {
@@ -633,9 +618,11 @@ Accepted update lines for ` + runContextPath + `:
 - verification: tests, commands, checks, or manual validation performed
 - next: specific next step another agent or human should take
 
-Handoff draft rules for ` + handoffPath + `:
+Handoff checkpoint rules for ` + handoffPath + `:
 - Treat this as the main memory another agent will read.
-- Update it after each meaningful work unit and before stopping.
+- After each completed prompt response or meaningful unit of work, update this file and run:
+  taskpilot handoff checkpoint ` + taskID + ` --file "` + handoffPath + `"
+- Do not erase earlier completed work or decisions from this file. Add the new work, then update Current State, Remaining Work, Suggested Next Steps, and Handoff Message.
 - Completed Work must list what is actually done so the next agent does not repeat it.
 - Important Decisions must list decisions and reasons. If no material decision was made, write exactly: No material decision made; work followed existing requirements.
 - Current State must say where the task stands right now.
@@ -1080,7 +1067,7 @@ func gitChangedFileSnapshot() map[string]gitFileState {
 	cmd := exec.Command("git", "status", "--porcelain")
 	data, err := cmd.Output()
 	if err != nil {
-		return out
+		return workspaceFileSnapshot()
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
@@ -1104,6 +1091,45 @@ func gitChangedFileSnapshot() map[string]gitFileState {
 			}
 		}
 	}
+	return out
+}
+
+func workspaceFileSnapshot() map[string]gitFileState {
+	out := map[string]gitFileState{}
+	root, err := os.Getwd()
+	if err != nil {
+		return out
+	}
+	ignoredDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true, ".taskpilot": true,
+		"dist": true, "build": true, "coverage": true, ".next": true,
+	}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if ignoredDirs[name] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "~") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		out[rel] = gitFileState{Status: "workspace", ModTime: info.ModTime().UnixNano(), Size: info.Size()}
+		return nil
+	})
 	return out
 }
 
@@ -1366,7 +1392,7 @@ Required workflow:
 9. Before stopping, leave enough context for another agent to continue without asking a human to re-explain.
 
 Write useful updates to TASKPILOT_RUN_CONTEXT_FILE as soon as each meaningful unit of work finishes. Do not wait until the whole session ends.
-Update TASKPILOT_HANDOFF_FILE after meaningful work and before stopping. This file is the authoritative handoff draft. It must include completed work, important decisions, current state, remaining work, suggested next steps, and a handoff message. If no material decision was made, write exactly: No material decision made; work followed existing requirements.
+Update TASKPILOT_HANDOFF_FILE after every meaningful prompt response or work unit, then run ` + "`taskpilot handoff checkpoint $TASKPILOT_TASK_ID --file \"$TASKPILOT_HANDOFF_FILE\"`" + `. This file is the authoritative handoff draft. Do not erase previous completed work or decisions; append the new truth and update current state / remaining work / next steps. It must include completed work, important decisions, current state, remaining work, suggested next steps, and a handoff message. If no material decision was made, write exactly: No material decision made; work followed existing requirements.
 
 Write context that would let a different agent continue the work without reading this chat. Prefer short, specific entries over vague status updates.
 
@@ -2191,7 +2217,7 @@ func runLock(args []string) error {
 
 func runHandoff(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot handoff prepare|accept|reject")
+		return fmt.Errorf("usage: taskpilot handoff prepare|checkpoint|accept|reject")
 	}
 	switch args[0] {
 	case "prepare":
@@ -2208,6 +2234,29 @@ func runHandoff(args []string) error {
 		_ = fs.Parse(args[2:])
 		var out Handoff
 		if err := request("POST", "/api/tasks/"+id+"/handoff", map[string]any{"to_actor_id": *to, "summary": *summary, "next_steps": []string(next)}, &out); err != nil {
+			return err
+		}
+		return print(out, *jsonOut)
+	case "checkpoint":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: taskpilot handoff checkpoint <task-id> --file path [--packet-id id] [--session-id id] [--json]")
+		}
+		fs := flag.NewFlagSet("handoff checkpoint", flag.ExitOnError)
+		filePath := fs.String("file", "", "handoff markdown file")
+		packetID := fs.String("packet-id", os.Getenv("TASKPILOT_HANDOFF_PACKET_ID"), "handoff packet id")
+		sessionID := fs.String("session-id", os.Getenv("TASKPILOT_SESSION_ID"), "taskpilot run session id")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		id := args[1]
+		_ = fs.Parse(args[2:])
+		if *filePath == "" {
+			return fmt.Errorf("usage: taskpilot handoff checkpoint <task-id> --file path")
+		}
+		data, err := os.ReadFile(*filePath)
+		if err != nil {
+			return err
+		}
+		var out HandoffCheckpoint
+		if err := request("POST", "/api/tasks/"+id+"/handoff-checkpoints", map[string]any{"packet_id": *packetID, "session_id": *sessionID, "markdown": string(data)}, &out); err != nil {
 			return err
 		}
 		return print(out, *jsonOut)

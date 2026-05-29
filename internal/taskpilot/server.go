@@ -100,6 +100,8 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/tasks/{id}/handoff-packet", s.requireScope("task:read", s.handleLatestHandoffPacket))
 	s.mux.Handle("PATCH /api/handoff-packets/{id}", s.requireScope("handoff:write", s.handleUpdateHandoffPacket))
 	s.mux.Handle("POST /api/handoff-packets/{id}/publish", s.requireScope("handoff:write", s.handlePublishHandoffPacket))
+	s.mux.Handle("POST /api/tasks/{id}/handoff-checkpoints", s.requireScope("handoff:write", s.handleCreateHandoffCheckpoint))
+	s.mux.Handle("GET /api/tasks/{id}/handoff-checkpoints", s.requireScope("task:read", s.handleHandoffCheckpoints))
 	s.mux.Handle("POST /api/tasks/{id}/decisions", s.requireScope("context:write", s.handleAddDecision))
 	s.mux.Handle("GET /api/tasks/{id}/decisions", s.requireScope("task:read", s.handleDecisions))
 	s.mux.Handle("POST /api/tasks/{id}/comments", s.requireScope("context:write", s.handleAddComment))
@@ -631,6 +633,24 @@ func (s *Server) handleUpdateHandoffPacket(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handlePublishHandoffPacket(w http.ResponseWriter, r *http.Request) {
 	out, err := s.store.PublishHandoffPacket(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCreateHandoffCheckpoint(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		PacketID  string `json:"packet_id"`
+		SessionID string `json:"session_id"`
+		Markdown  string `json:"markdown"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.CreateHandoffCheckpoint(r.Context(), actorID(r), r.PathValue("id"), in.PacketID, in.SessionID, in.Markdown)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleHandoffCheckpoints(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.ListHandoffCheckpoints(r.Context(), r.PathValue("id"))
 	writeResult(w, out, err)
 }
 

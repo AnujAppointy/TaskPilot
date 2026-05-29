@@ -300,6 +300,19 @@ type HandoffPacket struct {
 	UpdatedAt          time.Time                 `json:"updated_at"`
 }
 
+type HandoffCheckpoint struct {
+	ID               string                    `json:"id"`
+	TaskID           string                    `json:"task_id"`
+	PacketID         string                    `json:"packet_id"`
+	SessionID        string                    `json:"session_id,omitempty"`
+	ActorID          string                    `json:"actor_id"`
+	Sequence         int                       `json:"sequence"`
+	Packet           HandoffPacketContent      `json:"packet"`
+	Markdown         string                    `json:"markdown"`
+	ValidationErrors []MarkdownValidationError `json:"validation_errors,omitempty"`
+	CreatedAt        time.Time                 `json:"created_at"`
+}
+
 type StaleClaim struct {
 	Task             Task       `json:"task"`
 	Owner            *Actor     `json:"owner,omitempty"`
@@ -331,23 +344,24 @@ type Event struct {
 }
 
 type TaskDetail struct {
-	Task           Task              `json:"task"`
-	Owner          *Actor            `json:"owner,omitempty"`
-	Parent         *Task             `json:"parent,omitempty"`
-	Subtasks       []Task            `json:"subtasks"`
-	Dependencies   []TaskDependency  `json:"dependencies"`
-	Dependents     []TaskDependency  `json:"dependents"`
-	Context        []ContextEntry    `json:"context"`
-	Decisions      []DecisionRecord  `json:"decisions"`
-	Comments       []Comment         `json:"comments"`
-	Artifacts      []Artifact        `json:"artifacts"`
-	GitRefs        []GitRef          `json:"git_refs"`
-	Locks          []Lock            `json:"locks"`
-	Handoffs       []Handoff         `json:"handoffs"`
-	Snapshots      []ContextSnapshot `json:"snapshots"`
-	LatestSnapshot *ContextSnapshot  `json:"latest_snapshot,omitempty"`
-	HandoffPacket  *HandoffPacket    `json:"handoff_packet,omitempty"`
-	Events         []Event           `json:"events"`
+	Task               Task                `json:"task"`
+	Owner              *Actor              `json:"owner,omitempty"`
+	Parent             *Task               `json:"parent,omitempty"`
+	Subtasks           []Task              `json:"subtasks"`
+	Dependencies       []TaskDependency    `json:"dependencies"`
+	Dependents         []TaskDependency    `json:"dependents"`
+	Context            []ContextEntry      `json:"context"`
+	Decisions          []DecisionRecord    `json:"decisions"`
+	Comments           []Comment           `json:"comments"`
+	Artifacts          []Artifact          `json:"artifacts"`
+	GitRefs            []GitRef            `json:"git_refs"`
+	Locks              []Lock              `json:"locks"`
+	Handoffs           []Handoff           `json:"handoffs"`
+	Snapshots          []ContextSnapshot   `json:"snapshots"`
+	LatestSnapshot     *ContextSnapshot    `json:"latest_snapshot,omitempty"`
+	HandoffPacket      *HandoffPacket      `json:"handoff_packet,omitempty"`
+	HandoffCheckpoints []HandoffCheckpoint `json:"handoff_checkpoints,omitempty"`
+	Events             []Event             `json:"events"`
 }
 
 type APIError struct {

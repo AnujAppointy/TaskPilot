@@ -2,6 +2,8 @@ package taskpilot
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -61,6 +63,27 @@ func TestTouchedFilesSummary(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFileSnapshotDetectsNonGitFileChanges(t *testing.T) {
+	dir := t.TempDir()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+	before := workspaceFileSnapshot()
+	if err := os.WriteFile(filepath.Join(dir, "PLANNING.md"), []byte("snake plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after := workspaceFileSnapshot()
+	summary, _, changed := touchedFilesSummary(before, after)
+	if !strings.Contains(summary, "PLANNING.md") || len(changed) != 1 || changed[0] != "PLANNING.md" {
+		t.Fatalf("expected non-git workspace snapshot to detect PLANNING.md, summary=%q changed=%+v", summary, changed)
+	}
+}
+
 func TestAgentHandoffTemplateRequiresRealAgentEdits(t *testing.T) {
 	detail := TaskDetail{Task: Task{ID: "task_1", Goal: "Create PLANNING.md", Status: "in_progress"}}
 	packet := HandoffPacket{Packet: HandoffPacketContent{TaskObjective: "Create PLANNING.md", CurrentStatus: "in_progress"}}
@@ -73,7 +96,7 @@ func TestAgentHandoffTemplateRequiresRealAgentEdits(t *testing.T) {
 	if len(errs) == 0 {
 		t.Fatalf("expected placeholder handoff template to require real agent edits:\n%s", markdown)
 	}
-	if !strings.Contains(agentStartupPrompt("task_1", "task.json", "related.json", "context.log", "handoff.md"), "handoff.md") || !strings.Contains(agentInstructions("task_1"), "TASKPILOT_HANDOFF_FILE") {
+	if !strings.Contains(agentStartupPrompt("task_1", "task.json", "related.json", "context.log", "handoff.md"), "handoff checkpoint") || !strings.Contains(agentInstructions("task_1"), "taskpilot handoff checkpoint") {
 		t.Fatal("startup instructions should tell the agent to maintain the handoff file")
 	}
 }

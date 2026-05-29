@@ -883,6 +883,179 @@ Planning draft is ready for the next agent to review and tighten.
 	}
 }
 
+func TestAgentAuthoredPlaceholderHandoffMergesRunEvidence(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Snake planning", Goal: "make a planning.md for the snake game with some new logic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Updated task files: PLANNING.md"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "decision", "Use a phase-based snake game plan so implementation can proceed incrementally."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "output_ref", "Files changed during this run:\n- PLANNING.md"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "next", "Review PLANNING.md and start the first implementation phase."); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	placeholder := `# Task Handoff
+
+## Objective
+make a planning.md for the snake game with some new logic
+
+## Current Status
+in_progress
+
+## Current State
+Task is in_progress; continue from the latest task memory and verify the current repository state.
+
+## Completed Work
+- Replace this with concrete work completed during this session.
+
+## Important Decisions
+- Replace this with decisions made and why, or write: No material decision made; work followed existing requirements.
+
+## Remaining Work
+- Replace this with remaining work, or state that no known work remains.
+
+## Suggested Next Steps
+- Continue from the latest task context and verify completion criteria.
+
+## Handoff Message
+Write a concise message for the next agent before stopping.
+`
+	draft, err := s.UpdateHandoffPacketMarkdownWithSource(ctx, a.ID, packet.ID, placeholder, "agent_authored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(strings.Join(draft.Packet.CompletedWork, "\n"), "Replace this") {
+		t.Fatalf("placeholder completed work should be replaced, got %+v", draft.Packet.CompletedWork)
+	}
+	if !contains(strings.Join(draft.Packet.CompletedWork, "\n"), "PLANNING.md") {
+		t.Fatalf("expected completed work to include run evidence, got %+v", draft.Packet.CompletedWork)
+	}
+	if !contains(strings.Join(draft.Packet.ImportantDecisions, "\n"), "phase-based snake game plan") {
+		t.Fatalf("expected decision evidence to replace placeholder, got %+v", draft.Packet.ImportantDecisions)
+	}
+	if !contains(strings.Join(draft.Packet.SuggestedNextSteps, "\n"), "Review PLANNING.md") {
+		t.Fatalf("expected specific next step, got %+v", draft.Packet.SuggestedNextSteps)
+	}
+	if len(draft.ValidationErrors) != 0 {
+		t.Fatalf("expected merged draft to be publishable, got %+v", draft.ValidationErrors)
+	}
+}
+
+func TestHandoffCheckpointsPreserveHistoryAndLatestNextSteps(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Snake planning", Goal: "Plan snake game logic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := `# Task Handoff
+
+## Objective
+Plan snake game logic
+
+## Current Status
+in_progress
+
+## Current State
+Created initial planning structure.
+
+## Completed Work
+- Created PLANNING.md outline.
+
+## Important Decisions
+- Use phased implementation so the next agent can build incrementally.
+
+## Remaining Work
+- Add gameplay rules.
+
+## Suggested Next Steps
+- Add gameplay rules section.
+
+## Handoff Message
+Initial planning outline is ready.
+`
+	if _, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", first); err != nil {
+		t.Fatal(err)
+	}
+	second := `# Task Handoff
+
+## Objective
+Plan snake game logic
+
+## Current Status
+in_progress
+
+## Current State
+Gameplay rules and scoring notes are now included.
+
+## Completed Work
+- Added gameplay rules and scoring notes.
+
+## Important Decisions
+- Keep power-ups optional for phase two to protect MVP scope.
+
+## Remaining Work
+- Review PLANNING.md for clarity.
+
+## Suggested Next Steps
+- Review PLANNING.md and start implementation.
+
+## Handoff Message
+Planning is ready for review.
+`
+	if _, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", second); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.LatestHandoffPacket(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil {
+		t.Fatal("expected latest handoff packet")
+	}
+	completed := strings.Join(latest.Packet.CompletedWork, "\n")
+	if !contains(completed, "Created PLANNING.md outline") || !contains(completed, "Added gameplay rules") {
+		t.Fatalf("expected completed work from both checkpoints, got %+v", latest.Packet.CompletedWork)
+	}
+	decisions := strings.Join(latest.Packet.ImportantDecisions, "\n")
+	if !contains(decisions, "phased implementation") || !contains(decisions, "power-ups optional") {
+		t.Fatalf("expected decisions from both checkpoints, got %+v", latest.Packet.ImportantDecisions)
+	}
+	next := strings.Join(latest.Packet.SuggestedNextSteps, "\n")
+	if !contains(next, "start implementation") || contains(next, "Add gameplay rules section") {
+		t.Fatalf("expected only latest next step as current, got %+v", latest.Packet.SuggestedNextSteps)
+	}
+	timeline := strings.Join(latest.Packet.HandoffTimeline, "\n")
+	if !contains(timeline, "Checkpoint 1") || !contains(timeline, "Checkpoint 2") || !contains(timeline, "Add gameplay rules section") {
+		t.Fatalf("expected chronological checkpoint timeline with old next step, got %s", timeline)
+	}
+	checkpoints, err := s.ListHandoffCheckpoints(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 2 || checkpoints[0].Sequence != 1 || checkpoints[1].Sequence != 2 {
+		t.Fatalf("expected two sequenced checkpoints, got %+v", checkpoints)
+	}
+}
+
 func TestTaskSessionLifecycleReturnsToClaimed(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

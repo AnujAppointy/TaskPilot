@@ -232,6 +232,189 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 	return out, uniqueStrings(sourceSnapshotIDs), uniqueStrings(sourceContextIDs)
 }
 
+func buildHandoffFallbackContent(detail TaskDetail) HandoffPacketContent {
+	return buildHandoffPacketContentFromDetail(detail)
+}
+
+func buildHandoffPacketContentFromDetail(detail TaskDetail) HandoffPacketContent {
+	packet, _, _ := buildHandoffPacketContent(detail, detail.Snapshots)
+	return packet
+}
+
+func mergeAgentAuthoredHandoffWithFallback(agent HandoffPacketContent, detail TaskDetail) HandoffPacketContent {
+	fallback := buildHandoffPacketContentFromDetail(detail)
+	out := agent
+	if strings.TrimSpace(out.TaskObjective) == "" {
+		out.TaskObjective = fallback.TaskObjective
+	}
+	if len(out.OriginalRequirements) == 0 {
+		out.OriginalRequirements = fallback.OriginalRequirements
+	}
+	if strings.TrimSpace(out.CurrentStatus) == "" {
+		out.CurrentStatus = fallback.CurrentStatus
+	}
+	if strings.TrimSpace(out.CurrentState) == "" || isHandoffPlaceholder(out.CurrentState) || strings.HasPrefix(strings.TrimSpace(out.CurrentState), "Task is ") {
+		out.CurrentState = fallback.CurrentState
+	}
+	if len(out.HandoffTimeline) == 0 {
+		out.HandoffTimeline = fallback.HandoffTimeline
+	}
+	if listMissingOrPlaceholder(out.CompletedWork) {
+		out.CompletedWork = fallback.CompletedWork
+		if len(out.CompletedWork) == 0 && len(fallback.FilesComponentsAffected) > 0 {
+			out.CompletedWork = append(out.CompletedWork, "Updated task files: "+strings.Join(fallback.FilesComponentsAffected, ", "))
+		}
+	}
+	if !hasDecisionState(out.ImportantDecisions) {
+		out.ImportantDecisions = fallback.ImportantDecisions
+	}
+	if len(out.RejectedApproaches) == 0 {
+		out.RejectedApproaches = fallback.RejectedApproaches
+	}
+	if len(out.ArchitectureNotes) == 0 {
+		out.ArchitectureNotes = fallback.ArchitectureNotes
+	}
+	if len(out.ImplementationNotes) == 0 || allPlaceholders(out.ImplementationNotes) {
+		out.ImplementationNotes = fallback.ImplementationNotes
+	}
+	if len(out.FilesComponentsAffected) == 0 {
+		out.FilesComponentsAffected = fallback.FilesComponentsAffected
+	}
+	if len(out.KnownIssues) == 0 {
+		out.KnownIssues = fallback.KnownIssues
+	}
+	if len(out.FailedSessions) == 0 {
+		out.FailedSessions = fallback.FailedSessions
+	}
+	if listMissingOrPlaceholder(out.RemainingWork) {
+		out.RemainingWork = fallback.RemainingWork
+		if len(out.RemainingWork) == 0 && detail.Task.Status != "completed" {
+			out.RemainingWork = []string{"Verify the generated work and decide whether to send it to review, continue, or publish a handoff."}
+		}
+	}
+	if listMissingOrPlaceholder(out.SuggestedNextSteps) || onlyGenericNextSteps(out.SuggestedNextSteps) {
+		out.SuggestedNextSteps = fallback.SuggestedNextSteps
+		if len(out.SuggestedNextSteps) == 0 {
+			out.SuggestedNextSteps = []string{"Review the changed files and continue from the current task state."}
+		}
+	}
+	if len(out.Assumptions) == 0 {
+		out.Assumptions = fallback.Assumptions
+	}
+	if len(out.Risks) == 0 {
+		out.Risks = fallback.Risks
+	}
+	if len(out.Dependencies) == 0 {
+		out.Dependencies = fallback.Dependencies
+	}
+	if strings.TrimSpace(out.HandoffMessage) == "" || isHandoffPlaceholder(out.HandoffMessage) {
+		out.HandoffMessage = fallback.HandoffMessage
+		if out.HandoffMessage == "" {
+			out.HandoffMessage = "Continue from the completed work and validation state recorded in this handoff."
+		}
+	}
+	out.CompletedWork = uniqueStrings(out.CompletedWork)
+	out.ImportantDecisions = uniqueStrings(out.ImportantDecisions)
+	out.FilesComponentsAffected = uniqueStrings(out.FilesComponentsAffected)
+	out.RemainingWork = latestActionableNextSteps(uniqueStrings(out.RemainingWork))
+	out.SuggestedNextSteps = latestActionableNextSteps(uniqueStrings(out.SuggestedNextSteps))
+	return out
+}
+
+func buildHandoffPacketFromCheckpoints(detail TaskDetail, checkpoints []HandoffCheckpoint) HandoffPacketContent {
+	out := buildHandoffPacketContentFromDetail(detail)
+	out.HandoffTimeline = nil
+	out.CompletedWork = nil
+	out.ImportantDecisions = nil
+	out.RejectedApproaches = nil
+	out.ArchitectureNotes = nil
+	out.ImplementationNotes = nil
+	out.FilesComponentsAffected = nil
+	out.KnownIssues = nil
+	out.FailedSessions = nil
+	out.RemainingWork = nil
+	out.SuggestedNextSteps = nil
+	out.Assumptions = nil
+	out.Risks = nil
+	out.Dependencies = nil
+	out.HandoffMessage = ""
+	for _, checkpoint := range checkpoints {
+		content := checkpoint.Packet
+		out.HandoffTimeline = append(out.HandoffTimeline, checkpointTimelineBlock(checkpoint))
+		out.CompletedWork = appendUseful(out.CompletedWork, content.CompletedWork...)
+		out.ImportantDecisions = appendUseful(out.ImportantDecisions, content.ImportantDecisions...)
+		out.RejectedApproaches = appendUseful(out.RejectedApproaches, content.RejectedApproaches...)
+		out.ArchitectureNotes = appendUseful(out.ArchitectureNotes, content.ArchitectureNotes...)
+		out.ImplementationNotes = appendUseful(out.ImplementationNotes, content.ImplementationNotes...)
+		out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, content.FilesComponentsAffected...)
+		out.KnownIssues = appendUseful(out.KnownIssues, content.KnownIssues...)
+		out.FailedSessions = appendUseful(out.FailedSessions, content.FailedSessions...)
+		out.Assumptions = appendUseful(out.Assumptions, content.Assumptions...)
+		out.Risks = appendUseful(out.Risks, content.Risks...)
+		out.Dependencies = appendUseful(out.Dependencies, content.Dependencies...)
+		if strings.TrimSpace(content.CurrentState) != "" && !isHandoffPlaceholder(content.CurrentState) {
+			out.CurrentState = content.CurrentState
+		}
+		if !listMissingOrPlaceholder(content.RemainingWork) {
+			out.RemainingWork = content.RemainingWork
+		}
+		if !listMissingOrPlaceholder(content.SuggestedNextSteps) {
+			out.SuggestedNextSteps = content.SuggestedNextSteps
+		}
+		if strings.TrimSpace(content.HandoffMessage) != "" && !isHandoffPlaceholder(content.HandoffMessage) {
+			out.HandoffMessage = content.HandoffMessage
+		}
+	}
+	fallback := buildHandoffPacketContentFromDetail(detail)
+	if len(out.CompletedWork) == 0 {
+		out.CompletedWork = fallback.CompletedWork
+	}
+	if len(out.ImportantDecisions) == 0 {
+		out.ImportantDecisions = fallback.ImportantDecisions
+	}
+	if len(out.FilesComponentsAffected) == 0 {
+		out.FilesComponentsAffected = fallback.FilesComponentsAffected
+	}
+	if len(out.SuggestedNextSteps) == 0 {
+		out.SuggestedNextSteps = fallback.SuggestedNextSteps
+	}
+	if len(out.RemainingWork) == 0 && detail.Task.Status != "completed" {
+		out.RemainingWork = []string{"Continue from the latest checkpoint and verify the current repository state."}
+	}
+	if out.HandoffMessage == "" {
+		out.HandoffMessage = "Continue from the latest checkpoint in this handoff."
+	}
+	out.CompletedWork = limitStrings(uniqueStrings(out.CompletedWork), 30)
+	out.ImportantDecisions = limitStrings(uniqueStrings(out.ImportantDecisions), 30)
+	out.HandoffTimeline = limitStrings(uniqueStrings(out.HandoffTimeline), 30)
+	out.RejectedApproaches = limitStrings(uniqueStrings(out.RejectedApproaches), 16)
+	out.ArchitectureNotes = limitStrings(uniqueStrings(out.ArchitectureNotes), 20)
+	out.ImplementationNotes = limitStrings(uniqueStrings(out.ImplementationNotes), 20)
+	out.FilesComponentsAffected = limitStrings(uniqueStrings(out.FilesComponentsAffected), 30)
+	out.KnownIssues = limitStrings(uniqueStrings(out.KnownIssues), 16)
+	out.FailedSessions = limitStrings(uniqueStrings(out.FailedSessions), 8)
+	out.RemainingWork = limitStrings(latestActionableNextSteps(uniqueStrings(out.RemainingWork)), 10)
+	out.SuggestedNextSteps = limitStrings(latestActionableNextSteps(uniqueStrings(out.SuggestedNextSteps)), 10)
+	out.Assumptions = limitStrings(uniqueStrings(out.Assumptions), 12)
+	out.Risks = limitStrings(uniqueStrings(out.Risks), 16)
+	out.Dependencies = limitStrings(uniqueStrings(out.Dependencies), 12)
+	return out
+}
+
+func checkpointTimelineBlock(checkpoint HandoffCheckpoint) string {
+	lines := []string{fmt.Sprintf("Checkpoint %d · %s · %s", checkpoint.Sequence, checkpoint.ActorID, checkpoint.CreatedAt.Format(time.RFC3339))}
+	lines = appendTimelineSection(lines, "Completed work", checkpoint.Packet.CompletedWork)
+	lines = appendTimelineSection(lines, "Decisions", checkpoint.Packet.ImportantDecisions)
+	state := []string{}
+	if checkpoint.Packet.CurrentState != "" {
+		state = append(state, checkpoint.Packet.CurrentState)
+	}
+	state = append(state, checkpoint.Packet.ImplementationNotes...)
+	lines = appendTimelineSection(lines, "Current state / reasoning", state)
+	lines = appendTimelineSection(lines, "Pending next steps at this checkpoint", checkpoint.Packet.SuggestedNextSteps)
+	return strings.Join(lines, "\n")
+}
+
 func renderSnapshotMarkdown(content SnapshotContent) string {
 	var b strings.Builder
 	b.WriteString("# Context Snapshot\n\n")
@@ -656,6 +839,34 @@ func listMissingOrPlaceholder(items []string) bool {
 func isHandoffPlaceholder(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	return strings.HasPrefix(value, "replace this ") || strings.Contains(value, "write a concise message")
+}
+
+func allPlaceholders(items []string) bool {
+	items = cleanStrings(items)
+	if len(items) == 0 {
+		return false
+	}
+	for _, item := range items {
+		if !isHandoffPlaceholder(item) {
+			return false
+		}
+	}
+	return true
+}
+
+func onlyGenericNextSteps(items []string) bool {
+	items = cleanStrings(items)
+	if len(items) == 0 {
+		return false
+	}
+	for _, item := range items {
+		normalized := strings.ToLower(strings.TrimSpace(item))
+		if normalized != "continue from the latest task context and verify completion criteria." &&
+			normalized != "review the changed files and continue from the current task state." {
+			return false
+		}
+	}
+	return true
 }
 
 func handoffSupportingEvidence(content HandoffPacketContent) []string {
