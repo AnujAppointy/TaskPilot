@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseRunContextLine(t *testing.T) {
@@ -38,6 +39,41 @@ func TestParseRunContextLine(t *testing.T) {
 		if got.Kind != tt.kind || got.Content != tt.content {
 			t.Fatalf("parseRunContextLine(%q)=%+v want kind=%s content=%s", tt.line, got, tt.kind, tt.content)
 		}
+	}
+}
+
+func TestReadNewRunContextEntriesSurvivesRewrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "context.log")
+	seen := map[string]bool{}
+	if err := os.WriteFile(path, []byte("summary: Created planning.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := readNewRunContextEntries(path, seen)
+	if len(first) != 1 || first[0].Kind != "summary" || first[0].Content != "Created planning.md" {
+		t.Fatalf("first import = %+v", first)
+	}
+	if err := os.WriteFile(path, []byte("summary: Created planning.md\nsummary: Added technology section\nfiles: planning.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second := readNewRunContextEntries(path, seen)
+	if len(second) != 2 {
+		t.Fatalf("second import should only include new complete lines, got %+v", second)
+	}
+	if second[0].Content != "Added technology section" || second[1].Kind != "output_ref" || second[1].Content != "planning.md" {
+		t.Fatalf("unexpected second import: %+v", second)
+	}
+	third := readNewRunContextEntries(path, seen)
+	if len(third) != 0 {
+		t.Fatalf("third import should dedupe already imported lines, got %+v", third)
+	}
+}
+
+func TestRunSyncIntervalCapsLongProgressInterval(t *testing.T) {
+	if got := runSyncInterval(5 * time.Minute); got != 2*time.Second {
+		t.Fatalf("runSyncInterval long duration = %v", got)
+	}
+	if got := runSyncInterval(500 * time.Millisecond); got != 500*time.Millisecond {
+		t.Fatalf("runSyncInterval short duration = %v", got)
 	}
 }
 
@@ -98,6 +134,71 @@ func TestAgentHandoffTemplateRequiresRealAgentEdits(t *testing.T) {
 	}
 	if !strings.Contains(agentStartupPrompt("task_1", "task.json", "related.json", "context.log", "handoff.md"), "handoff checkpoint") || !strings.Contains(agentInstructions("task_1"), "taskpilot handoff checkpoint") {
 		t.Fatal("startup instructions should tell the agent to maintain the handoff file")
+	}
+}
+
+func TestParseHandoffAcceptsTaskPilotHandoffHeading(t *testing.T) {
+	markdown := `# TaskPilot Handoff
+
+## Current State
+Planning doc is updated.
+
+## Completed Work
+- Added technology section.
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Remaining Work
+- None for this task.
+
+## Suggested Next Steps
+- Start a separate implementation task if needed.
+
+## Handoff Message
+Ready for the next agent.
+`
+	content, err := parseHandoffMarkdownStrict(markdown, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content.CompletedWork) != 1 || !strings.Contains(content.CompletedWork[0], "technology") {
+		t.Fatalf("unexpected parsed handoff content: %+v", content)
+	}
+}
+
+func TestParseHandoffKeepsIndentedBulletsWithParentItem(t *testing.T) {
+	markdown := `# Task Handoff
+
+## Completed Work
+- Created planning.md with:
+  - game logic section
+  - technology section
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Current State
+Planning doc is complete.
+
+## Remaining Work
+- None for this task.
+
+## Suggested Next Steps
+- Start implementation separately if needed.
+
+## Handoff Message
+Ready for the next agent.
+`
+	content, err := parseHandoffMarkdownStrict(markdown, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content.CompletedWork) != 1 {
+		t.Fatalf("nested bullets should stay with the parent work item, got %+v", content.CompletedWork)
+	}
+	if !strings.Contains(content.CompletedWork[0], "technology section") {
+		t.Fatalf("nested bullet detail was lost: %+v", content.CompletedWork)
 	}
 }
 

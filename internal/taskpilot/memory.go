@@ -165,7 +165,7 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 		case "output_ref":
 			out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, conciseOutputRef(entry.Content))
 		case "note":
-			out.ImplementationNotes = appendUseful(out.ImplementationNotes, entry.Content)
+			out.ImplementationNotes = appendUsefulImplementationNotes(out.ImplementationNotes, entry.Content)
 		case "next":
 			if latestHandoff == nil || entry.CreatedAt.After(latestHandoff.CreatedAt) {
 				nextFromContext = appendUseful(nextFromContext, entry.Content)
@@ -274,9 +274,7 @@ func mergeAgentAuthoredHandoffWithFallback(agent HandoffPacketContent, detail Ta
 	if len(out.ArchitectureNotes) == 0 {
 		out.ArchitectureNotes = fallback.ArchitectureNotes
 	}
-	if len(out.ImplementationNotes) == 0 || allPlaceholders(out.ImplementationNotes) {
-		out.ImplementationNotes = fallback.ImplementationNotes
-	}
+	out.ImplementationNotes = appendUsefulImplementationNotes(nil, out.ImplementationNotes...)
 	if len(out.FilesComponentsAffected) == 0 {
 		out.FilesComponentsAffected = fallback.FilesComponentsAffected
 	}
@@ -313,8 +311,14 @@ func mergeAgentAuthoredHandoffWithFallback(agent HandoffPacketContent, detail Ta
 			out.HandoffMessage = "Continue from the completed work and validation state recorded in this handoff."
 		}
 	}
-	out.CompletedWork = uniqueStrings(out.CompletedWork)
+	out = cleanHandoffPacketContent(out)
+	return out
+}
+
+func cleanHandoffPacketContent(out HandoffPacketContent) HandoffPacketContent {
+	out.CompletedWork = compactHandoffWorkItems(uniqueStrings(out.CompletedWork))
 	out.ImportantDecisions = uniqueStrings(out.ImportantDecisions)
+	out.ImplementationNotes = appendUsefulImplementationNotes(nil, uniqueStrings(out.ImplementationNotes)...)
 	out.FilesComponentsAffected = uniqueStrings(out.FilesComponentsAffected)
 	out.RemainingWork = latestActionableNextSteps(uniqueStrings(out.RemainingWork))
 	out.SuggestedNextSteps = latestActionableNextSteps(uniqueStrings(out.SuggestedNextSteps))
@@ -339,13 +343,14 @@ func buildHandoffPacketFromCheckpoints(detail TaskDetail, checkpoints []HandoffC
 	out.Dependencies = nil
 	out.HandoffMessage = ""
 	for _, checkpoint := range checkpoints {
-		content := checkpoint.Packet
+		content := cleanHandoffPacketContent(checkpoint.Packet)
+		checkpoint.Packet = content
 		out.HandoffTimeline = append(out.HandoffTimeline, checkpointTimelineBlock(checkpoint))
 		out.CompletedWork = appendUseful(out.CompletedWork, content.CompletedWork...)
 		out.ImportantDecisions = appendUseful(out.ImportantDecisions, content.ImportantDecisions...)
 		out.RejectedApproaches = appendUseful(out.RejectedApproaches, content.RejectedApproaches...)
 		out.ArchitectureNotes = appendUseful(out.ArchitectureNotes, content.ArchitectureNotes...)
-		out.ImplementationNotes = appendUseful(out.ImplementationNotes, content.ImplementationNotes...)
+		out.ImplementationNotes = appendUsefulImplementationNotes(out.ImplementationNotes, content.ImplementationNotes...)
 		out.FilesComponentsAffected = appendUseful(out.FilesComponentsAffected, content.FilesComponentsAffected...)
 		out.KnownIssues = appendUseful(out.KnownIssues, content.KnownIssues...)
 		out.FailedSessions = appendUseful(out.FailedSessions, content.FailedSessions...)
@@ -402,16 +407,17 @@ func buildHandoffPacketFromCheckpoints(detail TaskDetail, checkpoints []HandoffC
 }
 
 func checkpointTimelineBlock(checkpoint HandoffCheckpoint) string {
+	packet := cleanHandoffPacketContent(checkpoint.Packet)
 	lines := []string{fmt.Sprintf("Checkpoint %d · %s · %s", checkpoint.Sequence, checkpoint.ActorID, checkpoint.CreatedAt.Format(time.RFC3339))}
-	lines = appendTimelineSection(lines, "Completed work", checkpoint.Packet.CompletedWork)
-	lines = appendTimelineSection(lines, "Decisions", checkpoint.Packet.ImportantDecisions)
+	lines = appendTimelineSection(lines, "Completed work", packet.CompletedWork)
+	lines = appendTimelineSection(lines, "Decisions", packet.ImportantDecisions)
 	state := []string{}
-	if checkpoint.Packet.CurrentState != "" {
-		state = append(state, checkpoint.Packet.CurrentState)
+	if packet.CurrentState != "" {
+		state = append(state, packet.CurrentState)
 	}
-	state = append(state, checkpoint.Packet.ImplementationNotes...)
+	state = append(state, packet.ImplementationNotes...)
 	lines = appendTimelineSection(lines, "Current state / reasoning", state)
-	lines = appendTimelineSection(lines, "Pending next steps at this checkpoint", checkpoint.Packet.SuggestedNextSteps)
+	lines = appendTimelineSection(lines, "Pending next steps at this checkpoint", packet.SuggestedNextSteps)
 	return strings.Join(lines, "\n")
 }
 
@@ -578,7 +584,7 @@ func parseMarkdownSectionsStrict(markdown, title string, known []struct {
 		}
 		if strings.HasPrefix(line, "# ") {
 			heading := strings.TrimSpace(strings.TrimPrefix(line, "# "))
-			if title != "" && heading != title {
+			if title != "" && heading != title && !isAllowedMarkdownTitleAlias(title, heading) {
 				errs = append(errs, MarkdownValidationError{Line: i + 1, Message: fmt.Sprintf("expected top-level heading '# %s'", title)})
 			}
 			seenTitle = true
@@ -605,6 +611,10 @@ func parseMarkdownSectionsStrict(markdown, title string, known []struct {
 		return out, errs
 	}
 	return out, nil
+}
+
+func isAllowedMarkdownTitleAlias(expected, got string) bool {
+	return expected == "Task Handoff" && got == "TaskPilot Handoff"
 }
 
 func sectionsText(sections map[string]string, key string) string {
@@ -635,9 +645,13 @@ func sectionsList(sections map[string]string, key string) []string {
 		if line == "" || line == "None recorded." || line == "- None recorded." {
 			continue
 		}
-		if strings.HasPrefix(line, "- ") {
+		if strings.HasPrefix(raw, "- ") {
 			flush()
 			current = strings.TrimSpace(strings.TrimPrefix(line, "- "))
+			continue
+		}
+		if strings.HasPrefix(line, "- ") && current != "" {
+			current = strings.TrimSpace(current + "; " + strings.TrimSpace(strings.TrimPrefix(line, "- ")))
 			continue
 		}
 		if current == "" {
@@ -919,6 +933,63 @@ func appendUseful(out []string, values ...string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func appendUsefulImplementationNotes(out []string, values ...string) []string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if !isUsefulImplementationNote(value) {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func isUsefulImplementationNote(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || isNoisyContext(value) || len(value) < 12 || strings.HasPrefix(value, ",") {
+		return false
+	}
+	return strings.Contains(value, ":")
+}
+
+func compactHandoffWorkItems(values []string) []string {
+	out := []string{}
+	current := ""
+	flush := func() {
+		current = strings.TrimSpace(current)
+		if current != "" {
+			out = append(out, current)
+		}
+		current = ""
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if current != "" && isNestedWorkFragment(value) {
+			current += "; " + value
+			continue
+		}
+		flush()
+		current = value
+	}
+	flush()
+	return uniqueStrings(out)
+}
+
+func isNestedWorkFragment(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, ":") || strings.HasSuffix(value, ".") {
+		return false
+	}
+	r := []rune(value)
+	if len(r) == 0 {
+		return false
+	}
+	return r[0] >= 'a' && r[0] <= 'z'
 }
 
 func latestHandoffForTimeline(handoffs []Handoff) *Handoff {

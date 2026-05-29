@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -193,7 +194,7 @@ func runAgentCommand(args []string) error {
 		return err
 	}
 	defer cleanup()
-	var contextOffset int64
+	importedContextLines := map[string]bool{}
 	if detail.Task.OwnerID == "" || detail.Task.OwnerID != cfg.ActorID {
 		var claimed Task
 		if err := request("POST", "/api/tasks/"+taskID+"/claim", map[string]any{"reason": "taskpilot run"}, &claimed); err != nil {
@@ -226,6 +227,7 @@ func runAgentCommand(args []string) error {
 		return err
 	}
 	defer handoffCleanup()
+	lastHandoffHash := fileHash(handoffPath)
 	startupPrompt := agentStartupPrompt(taskID, taskContextPath, relatedContextPath, contextPath, handoffPath)
 	promptPath, promptCleanup, err := createTextTemp("taskpilot-"+taskID+"-prompt-*.txt", startupPrompt)
 	if err != nil {
@@ -240,7 +242,7 @@ func runAgentCommand(args []string) error {
 	done := make(chan struct{})
 	var contextMu sync.Mutex
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, contextPath, &contextOffset, *progressEvery, done, &contextMu)
+	go progressLoop(ctx, taskID, contextPath, importedContextLines, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, *progressEvery, done, &contextMu)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -264,8 +266,8 @@ func runAgentCommand(args []string) error {
 	err = cmd.Run()
 	close(done)
 	contextMu.Lock()
-	imported := importRunContextSince(taskID, contextPath, &contextOffset)
-	_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
+	imported := importRunContext(taskID, contextPath, importedContextLines)
+	_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
 	contextMu.Unlock()
 	changed, preExisting, changedFiles := touchedFilesSummary(beforeFiles, gitChangedFileSnapshot())
 	if changed != "" {
@@ -276,13 +278,13 @@ func runAgentCommand(args []string) error {
 		_ = appendRunContext(taskID, "risk", preExisting)
 	}
 	if changed != "" || preExisting != "" {
-		_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
+		_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "agent command exited with error: %v\n", err)
 		_ = appendRunContext(taskID, "blocker", "taskpilot run command failed: "+err.Error())
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "failed", "finish_reason": err.Error()}, &Task{})
-		_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
+		_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
 		if *handoffOnFailure && *handoffTo != "" {
 			_, _ = prepareRunHandoff(taskID, *handoffTo, err.Error(), changed, imported)
 		}
@@ -296,7 +298,7 @@ func runAgentCommand(args []string) error {
 	if summary == "" {
 		summary = "Agent command completed successfully through taskpilot run."
 	}
-	_ = checkpointRunHandoff(taskID, handoffPacket.ID, session.ID, handoffPath)
+	_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
 	if *completeOnSuccess && !*noComplete {
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "success", "finish_reason": "agent command exited before explicit completion"}, &Task{})
 		var completed Task
@@ -348,10 +350,11 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset *int64, interval time.Duration, done <-chan struct{}, mu *sync.Mutex) {
+func progressLoop(ctx context.Context, taskID, contextPath string, importedContextLines map[string]bool, handoffPacketID, sessionID, handoffPath string, lastHandoffHash *string, interval time.Duration, done <-chan struct{}, mu *sync.Mutex) {
 	if interval <= 0 {
 		return
 	}
+	interval = runSyncInterval(interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -362,10 +365,22 @@ func progressLoop(ctx context.Context, taskID, contextPath string, contextOffset
 			return
 		case <-ticker.C:
 			mu.Lock()
-			_ = importRunContextSince(taskID, contextPath, contextOffset)
+			_ = importRunContext(taskID, contextPath, importedContextLines)
+			_ = checkpointRunHandoffIfChanged(taskID, handoffPacketID, sessionID, handoffPath, lastHandoffHash, false)
 			mu.Unlock()
 		}
 	}
+}
+
+func runSyncInterval(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return configured
+	}
+	const maxLiveSyncDelay = 2 * time.Second
+	if configured > maxLiveSyncDelay {
+		return maxLiveSyncDelay
+	}
+	return configured
 }
 
 func generateRunSnapshot(taskID, snapshotType string) error {
@@ -391,6 +406,32 @@ func checkpointRunHandoff(taskID, packetID, sessionID, handoffPath string) error
 	}
 	var out HandoffCheckpoint
 	return request("POST", "/api/tasks/"+taskID+"/handoff-checkpoints", map[string]any{"packet_id": packetID, "session_id": sessionID, "markdown": string(data)}, &out)
+}
+
+func checkpointRunHandoffIfChanged(taskID, packetID, sessionID, handoffPath string, lastHash *string, force bool) error {
+	currentHash := fileHash(handoffPath)
+	if currentHash == "" {
+		return nil
+	}
+	if lastHash != nil && *lastHash == currentHash {
+		return nil
+	}
+	if err := checkpointRunHandoff(taskID, packetID, sessionID, handoffPath); err != nil {
+		return err
+	}
+	if lastHash != nil {
+		*lastHash = currentHash
+	}
+	return nil
+}
+
+func fileHash(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func createRunContextFile(taskID string) (string, func(), error) {
@@ -933,9 +974,8 @@ func limitGitRefs(values []GitRef, max int) []GitRef {
 	return values[len(values)-max:]
 }
 
-func importRunContextSince(taskID, path string, offset *int64) int {
-	entries, next := readRunContextFileSince(path, *offset)
-	*offset = next
+func importRunContext(taskID, path string, seen map[string]bool) int {
+	entries := readNewRunContextEntries(path, seen)
 	imported := 0
 	for _, entry := range entries {
 		if appendRunContext(taskID, entry.Kind, entry.Content) == nil {
@@ -950,29 +990,29 @@ type runContextEntry struct {
 	Content string `json:"content"`
 }
 
-func readRunContextFileSince(path string, offset int64) ([]runContextEntry, int64) {
+func readNewRunContextEntries(path string, seen map[string]bool) []runContextEntry {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, offset
+		return nil
 	}
 	defer f.Close()
-	if offset > 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, offset
-		}
-	}
 	out := []runContextEntry{}
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		if entry, ok := parseRunContextLine(scanner.Text()); ok {
+			key := runContextEntryKey(entry)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			out = append(out, entry)
 		}
 	}
-	next, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		next = offset
-	}
-	return out, next
+	return out
+}
+
+func runContextEntryKey(entry runContextEntry) string {
+	return entry.Kind + "\x00" + strings.TrimSpace(entry.Content)
 }
 
 func parseRunContextLine(line string) (runContextEntry, bool) {
@@ -2497,6 +2537,9 @@ func print(v any, jsonOut bool) error {
 			for _, c := range x.Context {
 				fmt.Printf("- %s: %s\n", c.Kind, c.Content)
 			}
+		}
+		if x.HandoffPacket != nil && strings.TrimSpace(x.HandoffPacket.Markdown) != "" {
+			fmt.Printf("\nLatest Handoff Memory (%s v%d, %s):\n%s\n", x.HandoffPacket.Status, x.HandoffPacket.Version, x.HandoffPacket.Source, strings.TrimSpace(x.HandoffPacket.Markdown))
 		}
 		if len(x.Handoffs) > 0 {
 			fmt.Println("\nHandoffs:")

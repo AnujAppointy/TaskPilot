@@ -606,12 +606,16 @@ function lockItem(l) {
 }
 
 function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
-  const packetMarkdown = handoffPacket && handoffPacket.markdown ? handoffPacket.markdown : "";
+  const packetTimeline = handoffPacket && handoffPacket.packet && Array.isArray(handoffPacket.packet.handoff_timeline) ? handoffPacket.packet.handoff_timeline : [];
+  const packetIsWeak = handoffPacket && Array.isArray(handoffPacket.validation_errors) && handoffPacket.validation_errors.length && !packetTimeline.length;
+  const snapshotIsNewer = handoffPacket && latestSnapshot && new Date(latestSnapshot.updated_at || latestSnapshot.created_at) > new Date(handoffPacket.updated_at || handoffPacket.created_at);
+  const preferSnapshot = packetIsWeak && snapshotIsNewer;
+  const packetMarkdown = !preferSnapshot && handoffPacket && handoffPacket.markdown ? handoffPacket.markdown : "";
   const snapshotMarkdown = latestSnapshot && latestSnapshot.markdown ? latestSnapshot.markdown : "";
   const markdown = packetMarkdown || snapshotMarkdown || "# Task Memory\n\nNo handoff packet or context snapshot has been generated yet.\n";
   const editor = h("textarea", { class: "memory-editor", value: markdown });
   const sourceLabel = handoffPacket && handoffPacket.source ? handoffPacket.source.replaceAll("_", " ") : "";
-  const source = packetMarkdown ? `Handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1}${sourceLabel ? ` · ${sourceLabel}` : ""} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}` : "No memory document yet";
+  const source = packetMarkdown ? `Handoff packet ${handoffPacket.status || "draft"} v${handoffPacket.version || 1}${sourceLabel ? ` · ${sourceLabel}` : ""} · ${new Date(handoffPacket.updated_at).toLocaleString()}` : snapshotMarkdown ? `Latest snapshot · ${new Date(latestSnapshot.updated_at).toLocaleString()}${preferSnapshot ? " · newer than weak draft" : ""}` : "No memory document yet";
   const saveMarkdown = async () => {
     apiState.memoryError = "";
     try {

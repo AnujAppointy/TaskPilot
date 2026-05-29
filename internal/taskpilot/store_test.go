@@ -1056,6 +1056,118 @@ Planning is ready for review.
 	}
 }
 
+func TestCheckpointFallbackDoesNotPolluteAgentHandoffWithContextFragments(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Snake planning", Goal: "Plan a snake game"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "note", "0`."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "note", "d a game implementation task separately; this task is complete as a documentation-only deliverable."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "note", "Verification: Confirmed the workspace was empty before creating the document."); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := `# TaskPilot Handoff
+
+## Current State
+Planning doc is complete.
+
+## Completed Work
+- Created planning.md with:
+  - technology section
+  - validation checklist
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Remaining Work
+- None for this task.
+
+## Suggested Next Steps
+- Start implementation separately if needed.
+
+## Handoff Message
+Planning is ready for the next agent.
+`
+	if _, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", markdown); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.LatestHandoffPacket(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := strings.Join(latest.Packet.ImplementationNotes, "\n")
+	if contains(notes, "0`.") || contains(notes, "d a game") {
+		t.Fatalf("fragmented context notes should not pollute checkpoint handoff: %+v", latest.Packet.ImplementationNotes)
+	}
+	completed := strings.Join(latest.Packet.CompletedWork, "\n")
+	if !contains(completed, "technology section") || len(latest.Packet.CompletedWork) != 1 {
+		t.Fatalf("nested completed-work bullets should be preserved under the parent item, got %+v", latest.Packet.CompletedWork)
+	}
+}
+
+func TestDuplicateHandoffCheckpointReturnsExistingCheckpoint(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Snake planning", Goal: "Plan a snake game"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := `# Task Handoff
+
+## Current State
+Planning doc is complete.
+
+## Completed Work
+- Created planning.md.
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Remaining Work
+- None for this task.
+
+## Suggested Next Steps
+- Start implementation separately if needed.
+
+## Handoff Message
+Planning is ready.
+`
+	first, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", markdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", markdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID || second.Sequence != first.Sequence {
+		t.Fatalf("duplicate checkpoint should return existing row, first=%+v second=%+v", first, second)
+	}
+	checkpoints, err := s.ListHandoffCheckpoints(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 1 {
+		t.Fatalf("expected one checkpoint after duplicate submit, got %+v", checkpoints)
+	}
+}
+
 func TestTaskSessionLifecycleReturnsToClaimed(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

@@ -1320,6 +1320,8 @@ func (s *Store) UpdateHandoffPacketMarkdownWithSource(ctx context.Context, actor
 			packet.SupportingEvidence = handoffSupportingEvidence(buildHandoffFallbackContent(detail))
 		}
 	}
+	packet.Packet = cleanHandoffPacketContent(packet.Packet)
+	content = packet.Packet
 	packet.ValidationErrors = validateHandoffQuality(content)
 	if len(packet.SupportingEvidence) == 0 {
 		packet.SupportingEvidence = handoffSupportingEvidence(content)
@@ -1359,7 +1361,12 @@ func (s *Store) CreateHandoffCheckpoint(ctx context.Context, actorID, taskID, pa
 		return HandoffCheckpoint{}, err
 	}
 	content = mergeAgentAuthoredHandoffWithFallback(content, detail)
+	content = cleanHandoffPacketContent(content)
 	validationErrors := validateHandoffQuality(content)
+	checkpointMarkdown := renderHandoffMarkdown(content)
+	if existing, err := s.latestHandoffCheckpoint(ctx, taskID); err == nil && existing != nil && existing.SessionID == sessionID && strings.TrimSpace(existing.Markdown) == strings.TrimSpace(checkpointMarkdown) {
+		return *existing, nil
+	}
 	now := time.Now().UTC()
 	sequence := 1
 	_ = s.queryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM handoff_checkpoints WHERE task_id=?`, taskID).Scan(&sequence)
@@ -1371,7 +1378,7 @@ func (s *Store) CreateHandoffCheckpoint(ctx context.Context, actorID, taskID, pa
 		ActorID:          actorID,
 		Sequence:         sequence,
 		Packet:           content,
-		Markdown:         renderHandoffMarkdown(content),
+		Markdown:         checkpointMarkdown,
 		ValidationErrors: validationErrors,
 		CreatedAt:        now,
 	}
@@ -1413,6 +1420,18 @@ func (s *Store) ListHandoffCheckpoints(ctx context.Context, taskID string) ([]Ha
 		out = append(out, checkpoint)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) latestHandoffCheckpoint(ctx context.Context, taskID string) (*HandoffCheckpoint, error) {
+	row := s.queryRow(ctx, `SELECT id,task_id,packet_id,session_id,actor_id,sequence,packet_json,markdown_cache,validation_errors_json,created_at FROM handoff_checkpoints WHERE task_id=? ORDER BY sequence DESC, created_at DESC LIMIT 1`, taskID)
+	checkpoint, err := scanHandoffCheckpoint(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &checkpoint, nil
 }
 
 func (s *Store) PublishHandoffPacket(ctx context.Context, actorID, packetID string) (HandoffPacket, error) {
