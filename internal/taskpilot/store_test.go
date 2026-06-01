@@ -605,6 +605,78 @@ func TestContextSnapshotsAndHandoffPacket(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskMemoryKeepsTaskAndClearsMemory(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Memory Delete", Goal: "Clear task memory only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Sensitive planning note"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateContextSnapshot(ctx, a.ID, task.ID, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteTaskMemory(ctx, a.ID, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := s.TaskDetail(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Context) != 0 || len(detail.Snapshots) != 0 || detail.HandoffPacket != nil {
+		t.Fatalf("expected task memory cleared, got context=%d snapshots=%d packet=%v", len(detail.Context), len(detail.Snapshots), detail.HandoffPacket)
+	}
+	events, err := s.ListEvents(ctx, 0, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 || events[len(events)-1].EventType != "task.memory_deleted" {
+		t.Fatalf("expected memory deletion audit event, got %+v", events)
+	}
+}
+
+func TestDeleteTaskRemovesTaskAndRelatedRows(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Delete Me", Goal: "Hard delete task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Context to remove"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AcquireLock(ctx, a.ID, task.ID, "README.md", "file_glob"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteTask(ctx, a.ID, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetTask(ctx, task.ID); err == nil || errorCode(err) != "not_found" {
+		t.Fatalf("expected task not found after delete, got %v", err)
+	}
+	contextRows, err := s.ListContext(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks, err := s.ListLocks(ctx, task.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contextRows) != 0 || len(locks) != 0 {
+		t.Fatalf("expected related rows removed, context=%d locks=%d", len(contextRows), len(locks))
+	}
+}
+
 func TestMarkdownValidationAndPublishHandoff(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
@@ -1085,12 +1157,112 @@ Planning is ready for review.
 	if !contains(timeline, "Checkpoint 1") || !contains(timeline, "Checkpoint 2") || !contains(timeline, "Add gameplay rules section") {
 		t.Fatalf("expected chronological checkpoint timeline with old next step, got %s", timeline)
 	}
+	if strings.Count(timeline, "Created PLANNING.md outline") != 1 {
+		t.Fatalf("timeline should not repeat prior completed work across checkpoints, got %s", timeline)
+	}
 	checkpoints, err := s.ListHandoffCheckpoints(ctx, task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(checkpoints) != 2 || checkpoints[0].Sequence != 1 || checkpoints[1].Sequence != 2 {
 		t.Fatalf("expected two sequenced checkpoints, got %+v", checkpoints)
+	}
+}
+
+func TestCumulativeHandoffCheckpointsRenderTimelineDeltas(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Snake test", Goal: "Test snake game"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := `# Task Handoff
+
+## Objective
+Test snake game
+
+## Current Status
+in_progress
+
+## Current State
+Input bug fixed.
+
+## Completed Work
+- Verified syntax with node --check game.js.
+- Fixed pre-start input handling.
+
+## Important Decisions
+- Keep Space as the only explicit start action.
+
+## Known Issues
+- Browser-level gameplay verification has not been completed in this session.
+
+## Remaining Work
+- Run browser playtest.
+
+## Suggested Next Steps
+- Open the game in a browser and test movement.
+
+## Handoff Message
+Input bug fixed; browser testing remains.
+`
+	if _, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", first); err != nil {
+		t.Fatal(err)
+	}
+	second := `# Task Handoff
+
+## Objective
+Test snake game
+
+## Current Status
+in_progress
+
+## Current State
+Input bug fixed and canvas compatibility patched.
+
+## Completed Work
+- Verified syntax with node --check game.js.
+- Fixed pre-start input handling.
+- Added roundRect fallback.
+- Added full-board food guard.
+
+## Important Decisions
+- Keep Space as the only explicit start action.
+
+## Known Issues
+- Browser-level gameplay verification has not been completed in this session.
+- Browser-level gameplay verification has not been completed in this session because the sandbox blocked local server startup.
+
+## Remaining Work
+- Run browser playtest.
+
+## Suggested Next Steps
+- Open the game in a browser and test movement.
+
+## Handoff Message
+Runtime risks patched; browser testing remains.
+`
+	if _, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", second); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.LatestHandoffPacket(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeline := strings.Join(latest.Packet.HandoffTimeline, "\n")
+	if strings.Count(timeline, "Verified syntax with node --check game.js") != 1 {
+		t.Fatalf("timeline should show repeated cumulative work only once, got %s", timeline)
+	}
+	if !contains(timeline, "Added roundRect fallback") || !contains(timeline, "Added full-board food guard") {
+		t.Fatalf("timeline should show new work in second checkpoint, got %s", timeline)
+	}
+	if strings.Count(strings.Join(latest.Packet.KnownIssues, "\n"), "Browser-level gameplay verification") != 1 {
+		t.Fatalf("known issues should keep the more specific browser verification issue once, got %+v", latest.Packet.KnownIssues)
 	}
 }
 

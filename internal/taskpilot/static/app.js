@@ -47,6 +47,12 @@ const apiState = {
 const statuses = ["ready", "claimed", "in_progress", "blocked", "handoff_ready", "in_review", "completed"];
 const writeRoles = ["admin", "maintainer", "developer", "agent"];
 
+try {
+  localStorage.removeItem("taskpilot.theme");
+} catch {
+  // Ignore storage failures; TaskPilot now uses the light theme only.
+}
+
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -457,9 +463,23 @@ function stat(label, value) {
   return h("div", { class: "stat" }, h("strong", {}, value), h("span", {}, label));
 }
 
+function navIcon(tab) {
+  const icons = {
+    board: "▦",
+    detail: "◷",
+    projects: "□",
+    conflicts: "!",
+    actors: "○",
+    handoffs: "↗",
+    admin: "⌘",
+    settings: "⚙",
+  };
+  return icons[tab] || "•";
+}
+
 function board() {
   const tasks = filteredTasks();
-  return h("div", {},
+  return h("div", { class: "board-page" },
     projectFilter(),
     taskFilters(),
     stats(),
@@ -473,7 +493,7 @@ function board() {
 }
 
 function taskCard(t) {
-  return h("div", { class: "card", onclick: () => selectTask(t.id) },
+  return h("div", { class: `card task-card ${t.status === "completed" ? "completed" : ""}`, onclick: () => selectTask(t.id) },
     h("div", { class: "card-title" }, t.title),
     h("div", { class: "meta" },
       h("span", {}, `Owner: ${actorName(t.owner_id)}`),
@@ -581,7 +601,7 @@ function detailView() {
       section("Git", gitRefs.map(gitItem)),
       section("Locks", locks.map(lockItem)),
       section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`)))),
-      section("Timeline", h("div", { class: "timeline" }, events.map(e => h("div", { class: "event" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
+      section("Timeline", h("div", { class: "timeline log-panel" }, events.map(e => h("div", { class: "event log-line" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
     )
   );
 }
@@ -664,7 +684,13 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
         h("button", { onclick: async () => { apiState.memoryMode = "snapshot"; await api(`/api/tasks/${task.id}/snapshots`, { method: "POST", body: JSON.stringify({ snapshot_type: "manual" }) }); await refresh(); } }, "Generate Snapshot"),
         h("button", { onclick: showRecentHandoff }, "Show Recent Handoff"),
         apiState.memoryMode !== "auto" ? h("button", { onclick: () => { apiState.memoryMode = "auto"; apiState.memoryError = ""; render(); } }, "Show Best Memory") : null,
-        h("button", { onclick: () => openHandoffModal(task, latestSnapshot, handoffPacket) }, "Prepare handoff for other agent")
+        h("button", { onclick: () => openHandoffModal(task, latestSnapshot, handoffPacket) }, "Prepare handoff for other agent"),
+        h("button", { class: "danger", onclick: async () => {
+          if (!confirm("Delete task memory? This removes context entries, snapshots, and handoff memory, but keeps the task.")) return;
+          await api(`/api/tasks/${task.id}/memory`, { method: "DELETE" });
+          apiState.memoryMode = "auto";
+          await refresh();
+        } }, "Delete Memory")
       ) : null
     ),
     h("pre", { class: "markdown-doc" }, markdown),
@@ -723,6 +749,54 @@ function usefulText(value) {
   value = `${value || ""}`.trim();
   if (!value || value === "Not specified." || value === "None recorded.") return false;
   return !/^(task is .*continue from the latest task memory|continue from the latest task context|not specified)$/i.test(value);
+}
+
+function linesFromTextarea(value) {
+  return String(value || "").split("\n").map(s => s.trim()).filter(Boolean);
+}
+
+function csvFromInput(value) {
+  return String(value || "").split(",").map(s => s.trim()).filter(Boolean);
+}
+
+function editTaskForm(task) {
+  const title = h("input", { value: task.title || "", placeholder: "Task title" });
+  const goal = h("textarea", { value: task.goal || "", placeholder: "Task goal" });
+  const type = h("select", {}, ["planning","research","implementation","review","debugging","documentation","other"].map(v => h("option", { value: v, selected: v === task.type }, v)));
+  const priority = h("select", {}, ["low","normal","high","urgent"].map(v => h("option", { value: v, selected: v === task.priority }, v)));
+  const scope = h("textarea", { value: (task.scope || []).join("\n"), placeholder: "Scope, one item per line" });
+  const requirements = h("textarea", { value: (task.requirements || []).join("\n"), placeholder: "Requirements, one per line" });
+  const criteria = h("textarea", { value: (task.completion_criteria || []).join("\n"), placeholder: "Completion criteria, one per line" });
+  const risks = h("textarea", { value: (task.risks || []).join("\n"), placeholder: "Risks, one per line" });
+  const blockers = h("textarea", { value: (task.blockers || []).join("\n"), placeholder: "Blockers, one per line" });
+  return h("details", { class: "edit-task" },
+    h("summary", {}, "Edit Task"),
+    h("div", { class: "form" },
+      title,
+      goal,
+      h("div", { class: "row" }, type, priority),
+      scope,
+      requirements,
+      criteria,
+      risks,
+      blockers,
+      h("button", { class: "primary", onclick: async () => {
+        await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({
+          title: title.value,
+          goal: goal.value,
+          type: type.value,
+          priority: priority.value,
+          scope: linesFromTextarea(scope.value),
+          requirements: linesFromTextarea(requirements.value),
+          completion_criteria: linesFromTextarea(criteria.value),
+          risks: linesFromTextarea(risks.value),
+          blockers: linesFromTextarea(blockers.value),
+          reason: "Edited from dashboard.",
+        }) });
+        await refresh();
+      } }, "Save Task")
+    )
+  );
 }
 
 function openHandoffModal(task, latestSnapshot, handoffPacket) {
@@ -897,6 +971,7 @@ function actionsPanel(task) {
   return h("div", { class: "panel" },
     h("h2", {}, "Actions"),
     h("div", { class: "form" },
+      editTaskForm(task),
       h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, "Claim"),
       h("div", { class: "row" }, status, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: status.value }) }); await refresh(); } }, "Apply Manual Status")),
       h("div", { class: "button-row" },
@@ -947,7 +1022,16 @@ function actionsPanel(task) {
         gitBranch.value = ""; gitCommit.value = ""; gitPR.value = ""; gitFiles.value = ""; gitNote.value = "";
         await refresh();
       } }, "Attach Git Metadata"),
-      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock"))
+      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock")),
+      h("h3", {}, "Danger Zone"),
+      h("button", { class: "danger", onclick: async () => {
+        if (!confirm(`Delete task "${task.title}" permanently? This removes the task and its related database records.`)) return;
+        await api(`/api/tasks/${task.id}`, { method: "DELETE" });
+        apiState.selected = null;
+        apiState.detail = null;
+        apiState.tab = "board";
+        await refresh();
+      } }, "Delete Task")
     )
   );
 }
@@ -1393,7 +1477,10 @@ function render() {
     root.append(h("div", { class: "shell" },
       h("div", { class: "topbar" },
         h("div", { class: "brand" }, "TaskPilot"),
-        h("div", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } }, t))),
+        h("div", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } },
+          h("span", { class: "nav-icon" }, navIcon(t)),
+          h("span", {}, t)
+        ))),
         h("div", { class: "identity" },
           h("span", {}, `${apiState.principal.kind} · ${apiState.principal.role}`),
           h("button", { onclick: () => logout(true) }, "Log Out")

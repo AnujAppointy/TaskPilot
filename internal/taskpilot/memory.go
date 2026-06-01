@@ -335,10 +335,17 @@ func mergeAgentAuthoredHandoffWithFallback(agent HandoffPacketContent, detail Ta
 func cleanHandoffPacketContent(out HandoffPacketContent) HandoffPacketContent {
 	out.CompletedWork = compactHandoffWorkItems(uniqueStrings(out.CompletedWork))
 	out.ImportantDecisions = uniqueStrings(out.ImportantDecisions)
+	out.RejectedApproaches = compactContainedStrings(uniqueStrings(out.RejectedApproaches))
+	out.ArchitectureNotes = compactContainedStrings(uniqueStrings(out.ArchitectureNotes))
 	out.ImplementationNotes = appendUsefulImplementationNotes(nil, uniqueStrings(out.ImplementationNotes)...)
 	out.FilesComponentsAffected = uniqueStrings(out.FilesComponentsAffected)
+	out.KnownIssues = compactContainedStrings(uniqueStrings(out.KnownIssues))
+	out.FailedSessions = compactContainedStrings(uniqueStrings(out.FailedSessions))
 	out.RemainingWork = latestActionableNextSteps(uniqueStrings(out.RemainingWork))
 	out.SuggestedNextSteps = latestActionableNextSteps(uniqueStrings(out.SuggestedNextSteps))
+	out.Assumptions = compactContainedStrings(uniqueStrings(out.Assumptions))
+	out.Risks = compactContainedStrings(uniqueStrings(out.Risks))
+	out.Dependencies = compactContainedStrings(uniqueStrings(out.Dependencies))
 	return out
 }
 
@@ -359,10 +366,13 @@ func buildHandoffPacketFromCheckpoints(detail TaskDetail, checkpoints []HandoffC
 	out.Risks = nil
 	out.Dependencies = nil
 	out.HandoffMessage = ""
+	seenForTimeline := HandoffPacketContent{}
 	for _, checkpoint := range checkpoints {
 		content := cleanHandoffPacketContent(checkpoint.Packet)
-		checkpoint.Packet = content
-		out.HandoffTimeline = append(out.HandoffTimeline, checkpointTimelineBlock(checkpoint))
+		checkpoint.Packet = checkpointDeltaContent(content, seenForTimeline)
+		if block := checkpointTimelineBlock(checkpoint); block != "" {
+			out.HandoffTimeline = append(out.HandoffTimeline, block)
+		}
 		out.CompletedWork = appendUseful(out.CompletedWork, content.CompletedWork...)
 		out.ImportantDecisions = appendUseful(out.ImportantDecisions, content.ImportantDecisions...)
 		out.RejectedApproaches = appendUseful(out.RejectedApproaches, content.RejectedApproaches...)
@@ -386,6 +396,7 @@ func buildHandoffPacketFromCheckpoints(detail TaskDetail, checkpoints []HandoffC
 		if strings.TrimSpace(content.HandoffMessage) != "" && !isHandoffPlaceholder(content.HandoffMessage) {
 			out.HandoffMessage = content.HandoffMessage
 		}
+		seenForTimeline = mergeCheckpointSeenContent(seenForTimeline, content)
 	}
 	fallback := buildHandoffPacketContentFromDetail(detail)
 	if len(out.CompletedWork) == 0 {
@@ -409,18 +420,73 @@ func buildHandoffPacketFromCheckpoints(detail TaskDetail, checkpoints []HandoffC
 	out.CompletedWork = limitStrings(uniqueStrings(out.CompletedWork), 30)
 	out.ImportantDecisions = limitStrings(uniqueStrings(out.ImportantDecisions), 30)
 	out.HandoffTimeline = limitStrings(uniqueStrings(out.HandoffTimeline), 30)
-	out.RejectedApproaches = limitStrings(uniqueStrings(out.RejectedApproaches), 16)
-	out.ArchitectureNotes = limitStrings(uniqueStrings(out.ArchitectureNotes), 20)
+	out.RejectedApproaches = limitStrings(compactContainedStrings(uniqueStrings(out.RejectedApproaches)), 16)
+	out.ArchitectureNotes = limitStrings(compactContainedStrings(uniqueStrings(out.ArchitectureNotes)), 20)
 	out.ImplementationNotes = limitStrings(uniqueStrings(out.ImplementationNotes), 20)
 	out.FilesComponentsAffected = limitStrings(uniqueStrings(out.FilesComponentsAffected), 30)
-	out.KnownIssues = limitStrings(uniqueStrings(out.KnownIssues), 16)
-	out.FailedSessions = limitStrings(uniqueStrings(out.FailedSessions), 8)
+	out.KnownIssues = limitStrings(compactContainedStrings(uniqueStrings(out.KnownIssues)), 16)
+	out.FailedSessions = limitStrings(compactContainedStrings(uniqueStrings(out.FailedSessions)), 8)
 	out.RemainingWork = limitStrings(latestActionableNextSteps(uniqueStrings(out.RemainingWork)), 10)
 	out.SuggestedNextSteps = limitStrings(latestActionableNextSteps(uniqueStrings(out.SuggestedNextSteps)), 10)
-	out.Assumptions = limitStrings(uniqueStrings(out.Assumptions), 12)
-	out.Risks = limitStrings(uniqueStrings(out.Risks), 16)
-	out.Dependencies = limitStrings(uniqueStrings(out.Dependencies), 12)
+	out.Assumptions = limitStrings(compactContainedStrings(uniqueStrings(out.Assumptions)), 12)
+	out.Risks = limitStrings(compactContainedStrings(uniqueStrings(out.Risks)), 16)
+	out.Dependencies = limitStrings(compactContainedStrings(uniqueStrings(out.Dependencies)), 12)
 	return out
+}
+
+func checkpointDeltaContent(content, seen HandoffPacketContent) HandoffPacketContent {
+	delta := content
+	delta.CompletedWork = stringListDelta(content.CompletedWork, seen.CompletedWork)
+	delta.ImportantDecisions = stringListDelta(content.ImportantDecisions, seen.ImportantDecisions)
+	delta.RejectedApproaches = stringListDelta(content.RejectedApproaches, seen.RejectedApproaches)
+	delta.ArchitectureNotes = stringListDelta(content.ArchitectureNotes, seen.ArchitectureNotes)
+	delta.ImplementationNotes = stringListDelta(content.ImplementationNotes, seen.ImplementationNotes)
+	delta.FilesComponentsAffected = stringListDelta(content.FilesComponentsAffected, seen.FilesComponentsAffected)
+	delta.KnownIssues = stringListDelta(content.KnownIssues, seen.KnownIssues)
+	delta.FailedSessions = stringListDelta(content.FailedSessions, seen.FailedSessions)
+	delta.Assumptions = stringListDelta(content.Assumptions, seen.Assumptions)
+	delta.Risks = stringListDelta(content.Risks, seen.Risks)
+	delta.Dependencies = stringListDelta(content.Dependencies, seen.Dependencies)
+	if normalizedHandoffKey(content.CurrentState) == normalizedHandoffKey(seen.CurrentState) {
+		delta.CurrentState = ""
+	}
+	if sameStringSet(content.RemainingWork, seen.RemainingWork) {
+		delta.RemainingWork = nil
+	}
+	if sameStringSet(content.SuggestedNextSteps, seen.SuggestedNextSteps) {
+		delta.SuggestedNextSteps = nil
+	}
+	if normalizedHandoffKey(content.HandoffMessage) == normalizedHandoffKey(seen.HandoffMessage) {
+		delta.HandoffMessage = ""
+	}
+	return cleanHandoffPacketContent(delta)
+}
+
+func mergeCheckpointSeenContent(seen, content HandoffPacketContent) HandoffPacketContent {
+	seen.CompletedWork = appendUseful(seen.CompletedWork, content.CompletedWork...)
+	seen.ImportantDecisions = appendUseful(seen.ImportantDecisions, content.ImportantDecisions...)
+	seen.RejectedApproaches = appendUseful(seen.RejectedApproaches, content.RejectedApproaches...)
+	seen.ArchitectureNotes = appendUseful(seen.ArchitectureNotes, content.ArchitectureNotes...)
+	seen.ImplementationNotes = appendUsefulImplementationNotes(seen.ImplementationNotes, content.ImplementationNotes...)
+	seen.FilesComponentsAffected = appendUseful(seen.FilesComponentsAffected, content.FilesComponentsAffected...)
+	seen.KnownIssues = appendUseful(seen.KnownIssues, content.KnownIssues...)
+	seen.FailedSessions = appendUseful(seen.FailedSessions, content.FailedSessions...)
+	seen.Assumptions = appendUseful(seen.Assumptions, content.Assumptions...)
+	seen.Risks = appendUseful(seen.Risks, content.Risks...)
+	seen.Dependencies = appendUseful(seen.Dependencies, content.Dependencies...)
+	if strings.TrimSpace(content.CurrentState) != "" && !isHandoffPlaceholder(content.CurrentState) {
+		seen.CurrentState = content.CurrentState
+	}
+	if !listMissingOrPlaceholder(content.RemainingWork) {
+		seen.RemainingWork = content.RemainingWork
+	}
+	if !listMissingOrPlaceholder(content.SuggestedNextSteps) {
+		seen.SuggestedNextSteps = content.SuggestedNextSteps
+	}
+	if strings.TrimSpace(content.HandoffMessage) != "" && !isHandoffPlaceholder(content.HandoffMessage) {
+		seen.HandoffMessage = content.HandoffMessage
+	}
+	return cleanHandoffPacketContent(seen)
 }
 
 func checkpointTimelineBlock(checkpoint HandoffCheckpoint) string {
@@ -950,6 +1016,105 @@ func appendUseful(out []string, values ...string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func stringListDelta(values, seen []string) []string {
+	out := []string{}
+	seenKeys := map[string]bool{}
+	for _, value := range seen {
+		key := normalizedHandoffKey(value)
+		if key != "" {
+			seenKeys[key] = true
+		}
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		key := normalizedHandoffKey(value)
+		if value == "" || key == "" || seenKeys[key] {
+			continue
+		}
+		seenKeys[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func sameStringSet(a, b []string) bool {
+	a = cleanStrings(a)
+	b = cleanStrings(b)
+	if len(a) != len(b) {
+		return false
+	}
+	aKeys := map[string]int{}
+	for _, value := range a {
+		aKeys[normalizedHandoffKey(value)]++
+	}
+	for _, value := range b {
+		key := normalizedHandoffKey(value)
+		if aKeys[key] == 0 {
+			return false
+		}
+		aKeys[key]--
+	}
+	return true
+}
+
+func compactContainedStrings(values []string) []string {
+	values = cleanStrings(values)
+	if len(values) < 2 {
+		return values
+	}
+	keep := make([]bool, len(values))
+	for i := range keep {
+		keep[i] = true
+	}
+	keys := make([]string, len(values))
+	for i, value := range values {
+		keys[i] = normalizedHandoffKey(value)
+	}
+	for i, key := range keys {
+		if key == "" {
+			keep[i] = false
+			continue
+		}
+		for j, other := range keys {
+			if i == j || other == "" {
+				continue
+			}
+			if len(other) > len(key) && strings.Contains(other, key) {
+				keep[i] = false
+				break
+			}
+		}
+	}
+	out := []string{}
+	for i, value := range values {
+		if keep[i] {
+			out = append(out, value)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func normalizedHandoffKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastSpace := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func appendUsefulImplementationNotes(out []string, values ...string) []string {

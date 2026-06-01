@@ -83,6 +83,8 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/tasks", s.requireScope("task:read", s.handleTasks))
 	s.mux.Handle("GET /api/tasks/{id}", s.requireScope("task:read", s.handleTaskDetail))
 	s.mux.Handle("PATCH /api/tasks/{id}", s.requireScope("task:write", s.handleUpdateTask))
+	s.mux.Handle("DELETE /api/tasks/{id}", s.requireScope("task:write", s.handleDeleteTask))
+	s.mux.Handle("DELETE /api/tasks/{id}/memory", s.requireScope("context:write", s.handleDeleteTaskMemory))
 	s.mux.Handle("POST /api/tasks/{id}/subtasks", s.requireScope("task:write", s.handleCreateSubtask))
 	s.mux.Handle("POST /api/tasks/{id}/dependencies", s.requireScope("task:write", s.handleAddDependency))
 	s.mux.Handle("POST /api/tasks/{id}/claim", s.requireScope("task:write", s.handleClaimTask))
@@ -466,6 +468,16 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.store.UpdateTask(r.Context(), actorID(r), r.PathValue("id"), in.TaskInput, in.Reason)
 	writeResult(w, out, err)
+}
+
+func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteTask(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, map[string]string{"status": "ok"}, err)
+}
+
+func (s *Server) handleDeleteTaskMemory(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteTaskMemory(r.Context(), actorID(r), r.PathValue("id"))
+	writeResult(w, map[string]string{"status": "ok"}, err)
 }
 
 func (s *Server) handleCreateSubtask(w http.ResponseWriter, r *http.Request) {

@@ -730,7 +730,16 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 	if len(snapshots) > 0 {
 		latestSnapshot = &snapshots[len(snapshots)-1]
 	}
-	return TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, HandoffCheckpoints: checkpoints, Events: e}, nil
+	detail := TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, HandoffCheckpoints: checkpoints, Events: e}
+	if packet != nil && len(checkpoints) > 0 && packet.Source == "agent_authored" {
+		rebuilt := buildHandoffPacketFromCheckpoints(detail, checkpoints)
+		rebuiltPacket := *packet
+		rebuiltPacket.Packet = rebuilt
+		rebuiltPacket.Markdown = renderHandoffMarkdown(rebuilt)
+		rebuiltPacket.ValidationErrors = validateHandoffQuality(rebuilt)
+		detail.HandoffPacket = &rebuiltPacket
+	}
+	return detail, nil
 }
 
 func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput, reason string) (Task, error) {
@@ -820,6 +829,99 @@ func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput
 		_ = s.addEvent(ctx, t.ID, actorID, "task.status_changed", map[string]any{"from": oldStatus, "to": t.Status, "reason": reason})
 	}
 	return t, s.addEvent(ctx, t.ID, actorID, "task.updated", map[string]any{"task": t, "reason": reason})
+}
+
+func (s *Store) DeleteTask(ctx context.Context, actorID, id string) error {
+	t, err := s.GetTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_ = tx.Rollback()
+		}
+	}()
+	exec := func(query string, args ...any) error {
+		_, err := tx.ExecContext(ctx, s.sql(query), args...)
+		return err
+	}
+	deletes := []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE tasks SET parent_task_id=NULL WHERE parent_task_id=?`, []any{id}},
+		{`DELETE FROM task_dependencies WHERE task_id=? OR depends_on_id=?`, []any{id, id}},
+		{`DELETE FROM locks WHERE task_id=?`, []any{id}},
+		{`DELETE FROM conflicts WHERE task_id=? OR other_task_id=?`, []any{id, id}},
+		{`DELETE FROM context_entries WHERE task_id=?`, []any{id}},
+		{`DELETE FROM decision_records WHERE task_id=?`, []any{id}},
+		{`DELETE FROM comments WHERE task_id=?`, []any{id}},
+		{`DELETE FROM artifacts WHERE task_id=?`, []any{id}},
+		{`DELETE FROM git_refs WHERE task_id=?`, []any{id}},
+		{`DELETE FROM context_snapshots WHERE task_id=?`, []any{id}},
+		{`DELETE FROM handoff_checkpoints WHERE task_id=?`, []any{id}},
+		{`DELETE FROM handoff_packets WHERE task_id=?`, []any{id}},
+		{`DELETE FROM task_sessions WHERE task_id=?`, []any{id}},
+		{`DELETE FROM handoffs WHERE task_id=?`, []any{id}},
+		{`DELETE FROM events WHERE task_id=?`, []any{id}},
+		{`DELETE FROM tasks WHERE id=?`, []any{id}},
+	}
+	for _, d := range deletes {
+		if err := exec(d.query, d.args...); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	rollback = false
+	_ = s.addEvent(ctx, "", actorID, "task.deleted", map[string]any{"id": t.ID, "title": t.Title})
+	return nil
+}
+
+func (s *Store) DeleteTaskMemory(ctx context.Context, actorID, id string) error {
+	if _, err := s.GetTask(ctx, id); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_ = tx.Rollback()
+		}
+	}()
+	exec := func(query string, args ...any) error {
+		_, err := tx.ExecContext(ctx, s.sql(query), args...)
+		return err
+	}
+	deletes := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM context_entries WHERE task_id=?`, []any{id}},
+		{`DELETE FROM context_snapshots WHERE task_id=?`, []any{id}},
+		{`DELETE FROM handoff_checkpoints WHERE task_id=?`, []any{id}},
+		{`DELETE FROM handoff_packets WHERE task_id=?`, []any{id}},
+		{`DELETE FROM events WHERE task_id=? AND event_type IN ('context.appended','context.snapshot_created','context.snapshot_edited','handoff.packet_generated','handoff.packet_edited','handoff.checkpoint_created','handoff.packet_published')`, []any{id}},
+	}
+	for _, d := range deletes {
+		if err := exec(d.query, d.args...); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	rollback = false
+	return s.addEvent(ctx, id, actorID, "task.memory_deleted", nil)
 }
 
 func (s *Store) ClaimTask(ctx context.Context, actorID, id, reason string, force bool) (Task, error) {
