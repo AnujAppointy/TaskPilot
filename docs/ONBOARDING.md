@@ -1,100 +1,108 @@
 # TaskPilot Onboarding Guide
 
-TaskPilot is a coordination system for teams that use AI agents across different machines. It helps humans and agents work from the same task context instead of passing status, decisions, and handoffs manually through chat.
+This guide is for a new internal team that wants to use TaskPilot with humans, Codex, Gemini, or other CLI agents.
 
-The simplest way to understand TaskPilot is:
+TaskPilot helps the team answer five questions:
 
-```text
-TaskPilot is the shared work memory for humans, Codex, Gemini, and other agents.
-```
+- Who owns this task right now?
+- What is the agent working on?
+- Which files or areas are locked?
+- What decisions were already made?
+- Can another agent continue without losing context?
 
-Agents can work from the CLI. Managers and tech leads can use the dashboard. Both interfaces read and write the same task state.
-
-## Why TaskPilot Exists
-
-Without TaskPilot, distributed agent work usually breaks in predictable ways:
-
-- Two agents start the same work without knowing about each other.
-- A developer stops an agent session and the next person does not know what was decided.
-- Context stays inside one terminal session and never reaches the rest of the team.
-- Managers need to ask people for status because the CLI is invisible.
-- Handoffs depend on humans summarizing everything correctly.
-- Parallel work creates file or scope conflicts late, usually at git merge time.
-
-TaskPilot solves this by making the task the shared coordination unit. Every task has a goal, owner, status, scope, context, decisions, locks, handoffs, artifacts, and timeline.
-
-## What TaskPilot Can Do
-
-TaskPilot currently supports:
-
-- Shared task board for humans and agents.
-- CLI for agent workflows.
-- Dashboard for managers, tech leads, and reviewers.
-- Actor registration for humans and agents.
-- Task ownership and claim protection.
-- Heartbeats for active agent sessions.
-- Locks for files, semantic areas, and artifacts.
-- Conflict detection for overlapping work.
-- Context entries for summaries, notes, decisions, risks, blockers, and output references.
-- First-class decision records.
-- Human comments separate from agent context.
-- Handoffs between agents or humans.
-- Subtasks and task dependencies.
-- Artifact references for PRs, logs, docs, outputs, and screenshots.
-- Git metadata for branches, commits, PR URLs, and changed files.
-- Postgres-backed shared server for team use.
-- `taskpilot run` wrapper so agents can coordinate automatically while they work.
-
-## Mental Model
-
-TaskPilot has three main parts:
+The short version:
 
 ```text
-Shared TaskPilot Server
-  Stores task state, context, events, locks, conflicts, handoffs, and actors.
-
-CLI
-  Used by agents and power users.
-  Example: taskpilot run <task-id> -- codex
-
-Dashboard
-  Used by managers, tech leads, reviewers, and humans.
-  Shows the same task state as the CLI.
+TaskPilot is shared memory, ownership, locks, and handoff workflow for agent-driven software work.
 ```
 
-The CLI and dashboard are not separate systems. They are two views over the same shared coordination layer.
+## The Mental Model
 
-If an agent updates a task from CLI, the dashboard changes. If a lead resolves a conflict in the dashboard, CLI users see the updated state.
+```mermaid
+flowchart TD
+  Task["Task<br/>goal + scope + status"] --> Owner["Owner<br/>human or agent"]
+  Task --> Locks["Locks<br/>files or areas being touched"]
+  Task --> Memory["Memory<br/>context + decisions + comments"]
+  Task --> Handoff["Handoff<br/>what the next agent needs"]
+  Task --> Timeline["Timeline<br/>audit events"]
 
-## Core Concepts
+  Codex["Codex on Mac"] --> TP["TaskPilot Server"]
+  Gemini["Gemini on Windows"] --> TP
+  Human["Lead in Dashboard"] --> TP
+  TP --> Task
+```
 
-### Task
+Everything revolves around the task. The task is not just a todo item. It contains the goal, owner, scope, current state, decisions, handoff memory, locks, artifacts, git metadata, and timeline.
 
-A task is the canonical unit of work.
+## What TaskPilot Gives The Team
 
-It carries:
+### Humans get visibility
 
-- Title and goal.
-- Type such as planning, research, implementation, review, debugging, documentation, or other.
-- Status such as ready, claimed, in progress, blocked, handoff ready, in review, completed, or cancelled.
-- Priority.
-- Owner.
-- Scope.
-- Context.
-- Decisions.
-- Locks.
+The dashboard shows:
+
+- Task board by status.
+- Task detail.
+- Current owner.
+- Context and decisions.
+- Locks and conflicts.
 - Handoffs.
-- Artifacts.
-- Git metadata.
-- Event timeline.
+- Artifacts and git links.
+- Subtasks and dependencies.
+- Audit timeline.
 
 Value:
 
-The task lets another human or agent understand what is happening without asking for a manual explanation.
+Humans do not need to open every terminal to understand what agents are doing.
+
+### Agents get context
+
+Agents launched with `taskpilot run` receive:
+
+- Current task JSON.
+- Related prior task context.
+- Handoff memory.
+- Environment variables.
+- A startup prompt with TaskPilot rules.
+- A file for incremental notes.
+- A file for transfer-ready handoff memory.
+
+Value:
+
+The agent does not need a human to paste task history manually.
+
+### Teams get safer parallel work
+
+TaskPilot tracks ownership and locks.
+
+Value:
+
+Two agents should not silently work on the same task or same scope without a warning.
+
+### Handoffs become reliable
+
+TaskPilot has an agent-authored handoff file. The agent updates it after each meaningful work unit and checkpoints it to the server.
+
+Value:
+
+The next agent sees completed work, decisions, current state, remaining work, and next steps instead of a vague chat summary.
+
+## Important Words
+
+### Task
+
+The unit of work.
+
+Example:
+
+```text
+Title: Fix invited-user signup
+Goal: Find and fix why invited users cannot complete signup.
+Scope: src/auth/*
+```
 
 ### Actor
 
-An actor is a human or agent identity.
+A human or agent identity.
 
 Examples:
 
@@ -104,297 +112,115 @@ Gemini CLI - Windows
 Anuj - Tech Lead
 ```
 
-Value:
+### Claim
 
-TaskPilot knows who owns work, who added context, who accepted a handoff, and which machine or agent is active.
-
-### Ownership
-
-Only one active owner should work on a task at a time.
-
-When an agent runs:
-
-```bash
-taskpilot run <task-id> -- codex
-```
-
-TaskPilot claims the task for that agent.
-
-Value:
-
-This prevents two agents from unknowingly doing the same task.
-
-### Heartbeat
-
-While an agent is running through `taskpilot run`, TaskPilot sends heartbeats.
-
-Value:
-
-The dashboard can show that the agent is still active. If heartbeats stop, the task can be treated as stale.
+The actor says, "I own this task right now."
 
 ### Lock
 
-A lock describes the scope an agent plans to touch.
+The actor says, "I am touching this file or area."
 
 Examples:
 
 ```text
+README.md
 src/auth/*
 billing/refunds
-release-notes.md
+task:<task-id>
 ```
-
-Value:
-
-TaskPilot can warn when two agents are working on overlapping areas before the conflict becomes a git merge problem.
 
 ### Context
 
-Context is structured information attached to a task.
+Small structured notes attached to the task.
 
 Examples:
 
 ```text
-summary: Signup failure happens after expiry validation.
+summary: Found expiry bug after invite lookup.
 decision: Keep token format unchanged.
-risk: Do not change DB schema during this fix.
-blocker: Need production invite token sample.
-output_ref: PR https://github.com/org/repo/pull/42
+risk: Timezone edge cases may need coverage.
+output_ref: PR https://github.com/acme/app/pull/42
 ```
-
-Value:
-
-The next agent can continue from the previous agent's reasoning without needing a human to translate.
 
 ### Decision
 
-Decisions are durable rationale.
+A durable record of why something was chosen.
 
 Example:
 
 ```text
 Decision: Keep token format unchanged.
-Reason: Existing invite links must continue working.
+Reason: Existing invite links must keep working.
 Impact: Patch only expiry validation.
-Alternatives: Rotate tokens, add DB schema column.
 ```
-
-Value:
-
-Future agents know not only what was chosen, but why.
-
-### Comment
-
-Comments are human discussion and review notes.
-
-Value:
-
-Human discussion stays separate from agent-generated task context.
 
 ### Handoff
 
-A handoff is a prepared continuation packet.
+A prepared continuation packet for the next agent or developer.
 
-It includes:
+Good handoff sections:
 
-- Previous owner.
-- Next owner if known.
-- Resume summary.
-- Next steps.
+- Completed Work
+- Important Decisions
+- Current State
+- Remaining Work
+- Suggested Next Steps
+- Files / Components Affected
+- Risks and blockers
+- Handoff Message
 
-Value:
+## First-Time Setup
 
-One agent can stop and another agent can continue without a human rewriting the story.
+### 1. Start the server
 
-### Conflict
+Local development:
 
-A conflict means TaskPilot detected competing work.
-
-Common cases:
-
-- Two agents tried to own the same task.
-- Two tasks have overlapping locks.
-- One task should wait for another task.
-
-Value:
-
-Tech leads can resolve collisions early from the dashboard.
-
-### Artifact
-
-Artifacts are references to work outputs.
-
-Examples:
-
-- PR URL.
-- Log link.
-- Branch name.
-- Design doc.
-- Test output.
-- Screenshot reference.
-
-TaskPilot stores references by default, not raw local files.
-
-Value:
-
-Handoffs become richer without uploading private local data.
-
-### Git Metadata
-
-Git metadata links implementation work to the task.
-
-Examples:
-
-- Branch.
-- Commit SHA.
-- PR URL.
-- Changed files.
-
-Value:
-
-Managers can see where code work lives without asking the agent or developer.
-
-## Dashboard: What Humans Use
-
-Open the dashboard:
-
-```text
-http://<taskpilot-server>:8080
+```bash
+taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
 ```
 
-For a local Docker setup on the same Mac:
+Docker with Postgres:
+
+```bash
+docker compose up --build
+```
+
+Check:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/readyz
+```
+
+### 2. Open the dashboard
+
+Local:
 
 ```text
 http://127.0.0.1:8080
 ```
 
-For another laptop on the same network:
+Another laptop:
 
 ```text
-http://<mac-lan-ip>:8080
+http://<server-lan-ip>:8080
 ```
 
-### Dashboard Login
-
-For the current Docker setup, use the development token:
+Current Docker token:
 
 ```text
 change-this-team-token-before-use
 ```
 
-For local SQLite development, the default token is:
+Local SQLite default token:
 
 ```text
 dev-token
 ```
 
-### Task Board
+### 3. Install the CLI on PATH
 
-The task board groups tasks by status:
-
-- Ready
-- Claimed
-- In progress
-- Blocked
-- Handoff ready
-- In review
-- Completed
-
-Use it to answer:
-
-- What is active?
-- Who owns what?
-- What is blocked?
-- Which tasks have conflicts?
-- Which tasks are stale?
-
-### Task Detail
-
-Task detail shows:
-
-- Goal.
-- Status.
-- Owner.
-- Project.
-- Repository.
-- Workspace.
-- Scope.
-- Subtasks.
-- Dependencies.
-- Decisions.
-- Comments.
-- Artifacts.
-- Git metadata.
-- Context.
-- Locks.
-- Handoffs.
-- Timeline.
-
-Use it to understand the full state of one task.
-
-### Conflicts
-
-The Conflicts page shows:
-
-- Why a conflict happened.
-- Which tasks are involved.
-- Which actors are involved.
-- The overlapping scope.
-- Resolution options.
-
-Resolution options include:
-
-- Continue current owner.
-- Transfer ownership.
-- Split scope.
-- Pause secondary work.
-- Mark duplicate.
-- Escalate to human.
-
-### People / Agents
-
-Shows registered humans and agents.
-
-Use it to check:
-
-- Which agents exist.
-- Which machine they belong to.
-- Which actor id to use for handoffs.
-
-### Handoffs
-
-Shows prepared handoffs and lets the receiving actor accept them.
-
-Use it when one agent stops and another agent needs to continue.
-
-### Projects
-
-Projects group work by product, team, or codebase.
-
-Repositories and workspaces can also be attached so agents know where work belongs.
-
-### Settings
-
-Settings handles connection identity.
-
-For normal internal testing:
-
-- Use the team token.
-- Let the dashboard manage its own actor identity.
-
-Do not manually edit actor credentials unless you are debugging.
-
-## CLI: What Agents Use
-
-The CLI should be available as:
-
-```bash
-taskpilot
-```
-
-from any repo.
-
-Recommended install pattern:
+Agents should be able to run `taskpilot` from any repo.
 
 Mac/Linux:
 
@@ -407,220 +233,21 @@ export PATH="$HOME/.local/bin:$PATH"
 Windows:
 
 ```text
-C:\Tools\taskpilot\taskpilot.exe
+Put taskpilot.exe in C:\Tools\taskpilot
+Add C:\Tools\taskpilot to Windows Path
 ```
 
-Add this folder to Windows Path:
-
-```text
-C:\Tools\taskpilot
-```
-
-After setup:
-
-```bash
-taskpilot
-taskpilot task list
-```
-
-should work from any repo.
-
-### CLI Login
-
-Mac server itself:
-
-```bash
-taskpilot login --server http://127.0.0.1:8080 --token change-this-team-token-before-use
-```
-
-Another laptop on the same network:
-
-```bash
-taskpilot login --server http://<mac-lan-ip>:8080 --token change-this-team-token-before-use
-```
-
-### Register Agent
-
-Codex on Mac:
-
-```bash
-taskpilot actor register --name "Codex CLI - Mac" --kind agent --machine macbook
-```
-
-Gemini on Windows:
-
-```powershell
-taskpilot actor register --name "Gemini CLI - Windows" --kind agent --machine windows-laptop
-```
-
-### Create Task
-
-```bash
-taskpilot task create \
-  --title "Fix invited-user signup expiry" \
-  --goal "Find and fix expiry validation failure for invited users" \
-  --type debugging \
-  --priority high \
-  --scope "src/auth/*"
-```
-
-### List Tasks
+Check:
 
 ```bash
 taskpilot task list
 ```
 
-### Show Task
-
-```bash
-taskpilot task show <task-id>
-```
-
-### Claim Task
-
-```bash
-taskpilot task claim <task-id>
-```
-
-### Acquire Lock
-
-```bash
-taskpilot lock acquire <task-id> --scope "src/auth/*"
-```
-
-### Add Context
-
-```bash
-taskpilot context append <task-id> \
-  --kind decision \
-  --content "Keep token format unchanged"
-```
-
-### Record Decision
-
-```bash
-taskpilot decision add <task-id> \
-  --decision "Keep token format unchanged" \
-  --reason "Existing invite links depend on it" \
-  --impact "Only patch expiry validation"
-```
-
-### Add Comment
-
-```bash
-taskpilot comment add <task-id> --body "Please review edge cases before merge."
-```
-
-### Prepare Handoff
-
-```bash
-taskpilot handoff prepare <task-id> \
-  --to <actor-id> \
-  --summary "Root cause traced to expiry comparison. Token format should stay unchanged." \
-  --next "Add failing regression test" \
-  --next "Patch expiry comparison"
-```
-
-### Accept Handoff
-
-```bash
-taskpilot handoff accept <handoff-id>
-```
-
-### Add Artifact
-
-```bash
-taskpilot artifact add <task-id> \
-  --kind pr \
-  --title "Signup fix PR" \
-  --uri "https://github.com/org/repo/pull/42"
-```
-
-### Attach Git Metadata
-
-```bash
-taskpilot git link-branch <task-id>
-taskpilot git attach-pr <task-id> "https://github.com/org/repo/pull/42"
-```
-
-## Agent Automation With `taskpilot run`
-
-The most important command is:
-
-```bash
-taskpilot run <task-id> -- <agent-command>
-```
-
-Examples:
-
-```bash
-taskpilot run <task-id> -- codex
-taskpilot run <task-id> -- gemini
-```
-
-With this wrapper, TaskPilot automatically:
-
-- Reads the task.
-- Claims the task if available.
-- Acquires locks based on task scope.
-- Starts heartbeat.
-- Passes task environment variables to the child agent.
-- Provides a context file for the agent to write summaries and decisions.
-- Imports context while the agent is running.
-- Captures touched files after the command exits.
-- Completes, blocks, or leaves the task in progress depending on the run outcome.
-
-The child agent receives:
-
-```text
-TASKPILOT_TASK_ID
-TASKPILOT_SERVER
-TASKPILOT_ACTOR_ID
-TASKPILOT_PROJECT_ID
-TASKPILOT_REPO_ID
-TASKPILOT_WORKSPACE_ID
-TASKPILOT_RUN_CONTEXT_FILE
-TASKPILOT_AGENT_INSTRUCTIONS
-```
-
-Agents should write useful context to:
-
-```text
-TASKPILOT_RUN_CONTEXT_FILE
-```
-
-Example lines:
-
-```text
-summary: Signup failure happens after expiry validation.
-decision: Keep token format unchanged.
-risk: Do not change DB schema.
-blocker: Need production invite sample.
-next: Add failing regression test.
-```
-
-TaskPilot imports these entries into the task context.
-
-## Two-Agent Scenario: Codex On Mac, Gemini On Windows
-
-This scenario tests the real reason TaskPilot exists.
-
-Goal:
-
-```text
-Codex investigates the bug on Mac.
-Gemini continues from Codex's decisions on Windows.
-Both work in the same git repo without losing context.
-```
-
-### Setup
-
-Both laptops clone the same repo.
+### 4. Login and register actors
 
 Mac:
 
 ```bash
-cd /path/to/repo
 taskpilot login --server http://127.0.0.1:8080 --token change-this-team-token-before-use
 taskpilot actor register --name "Codex CLI - Mac" --kind agent --machine macbook
 ```
@@ -628,167 +255,215 @@ taskpilot actor register --name "Codex CLI - Mac" --kind agent --machine macbook
 Windows:
 
 ```powershell
-cd C:\path\to\repo
-taskpilot login --server http://<mac-lan-ip>:8080 --token change-this-team-token-before-use
+taskpilot login --server http://<server-lan-ip>:8080 --token change-this-team-token-before-use
 taskpilot actor register --name "Gemini CLI - Windows" --kind agent --machine windows-laptop
 ```
 
-### Create Investigation Task
+## Everyday Workflow
 
-On Mac:
-
-```bash
-taskpilot task create \
-  --title "Investigate invited-user signup expiry bug" \
-  --goal "Find why invited users fail signup after expiry validation." \
-  --type debugging \
-  --priority high \
-  --scope "src/auth/*" \
-  --json
-```
-
-Save the returned id:
-
-```text
-TASK_A=<task-id>
-```
-
-### Codex Starts Work
-
-On Mac:
-
-```bash
-taskpilot run TASK_A --no-complete --progress-interval 30s -- codex
-```
-
-Prompt Codex:
-
-```text
-You are working under TaskPilot task TASK_A.
-
-Focus only on src/auth/*.
-Find the root cause of invited-user signup expiry failure.
-Do not change token format unless the task context explicitly says to.
-Write findings, decisions, risks, blockers, and next steps to TASKPILOT_RUN_CONTEXT_FILE.
-```
-
-Codex should write context like:
-
-```text
-summary: Failure happens after invite token lookup during expiry comparison.
-decision: Keep token format unchanged.
-risk: Changing DB schema would break existing invite links.
-next: Add regression test for expired invited-user signup.
-```
-
-Dashboard now shows:
-
-- Task is owned by Codex CLI - Mac.
-- Status is claimed or in progress.
-- Lock on `src/auth/*`.
-- Context from Codex.
-- Timeline of activity.
-
-### Gemini Continues From Codex Context
-
-Find Gemini actor id:
-
-```bash
-taskpilot actor list
-```
-
-Prepare handoff:
-
-```bash
-taskpilot handoff prepare TASK_A \
-  --to <gemini-actor-id> \
-  --summary "Codex traced the failure to expiry comparison after invite token lookup. Token format must stay unchanged." \
-  --next "Add failing regression test for expired invited-user signup" \
-  --next "Patch expiry comparison only if the test confirms the issue"
-```
-
-On Windows:
-
-```powershell
-taskpilot handoff accept <handoff-id>
-taskpilot run TASK_A --progress-interval 30s -- gemini
-```
-
-Prompt Gemini:
-
-```text
-Continue TaskPilot task TASK_A from the accepted handoff.
-
-Use Codex's recorded decision:
-- Keep token format unchanged.
-- Do not change DB schema.
-- Add regression coverage first.
-- Patch only expiry comparison.
-
-Write final findings and implementation summary to TASKPILOT_RUN_CONTEXT_FILE.
-```
-
-Gemini can now continue without asking a human:
-
-```text
-What did Codex find?
-What did we decide?
-What should I avoid changing?
-What should I do next?
-```
-
-That information is already in TaskPilot.
-
-### Expected Dashboard Result
-
-The task detail should show:
-
-- Codex's summary.
-- Codex's decision.
-- Handoff from Codex to Gemini.
-- Gemini accepting the handoff.
-- Gemini's final summary.
-- Git metadata or artifacts if attached.
-- Completed status when done.
-
-## Conflict Scenario
-
-Create two tasks with the same scope:
+### Create a task
 
 ```bash
 taskpilot task create \
-  --title "Patch auth expiry logic" \
-  --goal "Patch expiry comparison" \
-  --scope "src/auth/*"
-
-taskpilot task create \
-  --title "Refactor auth invite flow" \
-  --goal "Clean up invite signup path" \
-  --scope "src/auth/*"
+  --title "Improve README architecture docs" \
+  --goal "Make README architecture explanation clear and brief." \
+  --type documentation \
+  --priority normal \
+  --scope "README.md"
 ```
 
-Start Codex on one task:
+### Run an agent through TaskPilot
 
 ```bash
-taskpilot run <task-1> --no-complete -- codex
+taskpilot run <task-id> -- codex "Improve the README architecture section. Keep it brief and easy to understand."
 ```
 
-Start Gemini on the other task:
+or:
 
 ```bash
-taskpilot run <task-2> --no-complete -- gemini
+taskpilot run <task-id> -- gemini "Continue from the TaskPilot handoff and complete the next steps."
 ```
 
-TaskPilot should detect overlapping scope.
+Do not manually paste all task context. `taskpilot run` injects it.
 
-The dashboard Conflicts page should explain:
+The terminal will show:
 
-- Which tasks overlap.
+```text
+TaskPilot: injected task context into codex prompt. Full injected prompt: /tmp/taskpilot-...-prompt-....txt
+TaskPilot: handoff draft file: /tmp/taskpilot-...-handoff-....md
+TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint ...
+```
+
+### What the agent should do
+
+The agent should:
+
+1. Read the injected task context file.
+2. Read the injected related-context file.
+3. Work only inside the task scope.
+4. Write incremental notes to `TASKPILOT_RUN_CONTEXT_FILE`.
+5. Update `TASKPILOT_HANDOFF_FILE` after each meaningful work unit.
+6. Run `taskpilot handoff checkpoint`.
+7. Leave the task `claimed` unless a human or explicit command marks it completed.
+
+### What happens when the agent exits
+
+TaskPilot does not automatically mark the task completed.
+
+Instead:
+
+```text
+ready -> claimed -> in_progress -> claimed
+```
+
+Completion is deliberate:
+
+```bash
+taskpilot task complete <task-id> --summary "README architecture section updated and reviewed."
+```
+
+Value:
+
+Stopping an agent session does not falsely mean the work is done.
+
+## Handoff Checkpoints
+
+A checkpoint is one completed work unit.
+
+Example:
+
+```text
+Prompt 1: create PLANNING.md
+Checkpoint 1: planning doc created, decisions recorded
+
+Prompt 2: add technology section
+Checkpoint 2: technology section added, current state updated
+
+Prompt 3: tighten risks
+Checkpoint 3: risks updated, remaining work now empty
+```
+
+After each unit, the agent should update:
+
+```text
+TASKPILOT_HANDOFF_FILE
+```
+
+Then run:
+
+```bash
+taskpilot handoff checkpoint "$TASKPILOT_TASK_ID" --file "$TASKPILOT_HANDOFF_FILE"
+```
+
+The latest handoff keeps:
+
+- Completed work accumulated across checkpoints.
+- Decisions accumulated across checkpoints.
+- Current state from the latest checkpoint.
+- Suggested next steps from the latest checkpoint only.
+- Older next steps in the historical timeline.
+
+If the handoff is weak, TaskPilot warns:
+
+```text
+TaskPilot handoff needs attention before another agent can continue reliably:
+  - Completed Work: completed work is required
+  - Important Decisions: important decisions are required
+```
+
+This is intentional. It stops weak handoff memory from silently becoming the source of truth.
+
+## Dashboard Guide
+
+### Task Board
+
+Use it to see:
+
+- Ready tasks.
+- Claimed tasks.
+- Active in-progress work.
+- Blocked work.
+- Handoff-ready work.
+- Review and completed work.
+
+Search and filters help by project, owner, status, repo, priority, blocked state, stale state, title, goal, context, and decisions.
+
+### Task Detail
+
+Use it to inspect one task:
+
+- Goal and status.
+- Owner.
+- Project, repo, workspace.
+- Parent, subtasks, dependencies.
+- Task memory.
+- Recent handoff.
+- Decisions.
+- Comments.
+- Artifacts.
+- Git metadata.
+- Locks.
+- Handoffs.
+- Timeline.
+
+### Task Memory
+
+Use this area to understand the current state.
+
+Actions:
+
+- Generate snapshot.
+- Show best memory.
+- Show recent handoff.
+- Prepare handoff for other agent.
+
+The recent handoff preview lets a developer check what the next agent will receive before publishing.
+
+### Prepare Handoff
+
+In task detail, click:
+
+```text
+Prepare handoff for other agent
+```
+
+A modal opens with:
+
+- Summary.
+- Next steps.
+- Editable preview.
+- Publish button.
+
+Publishing moves the task to `handoff_ready` and shows it on the Handoffs page.
+
+### Handoffs Page
+
+Use this page when another actor should continue.
+
+The receiving actor can:
+
+1. Read the handoff.
+2. Accept it.
+3. Run:
+
+```bash
+taskpilot run <task-id> -- codex "Continue from the accepted handoff."
+```
+
+### Conflicts Page
+
+Use this when TaskPilot detects overlapping work.
+
+It shows:
+
+- Which tasks conflict.
 - Which actors are involved.
 - Which scope overlaps.
-- What resolution options exist.
+- Why the conflict happened.
+- Whether a claim is stale.
+- Suggested actions.
 
-The lead can choose:
+Resolution options:
 
 - Continue current owner.
 - Transfer ownership.
@@ -797,74 +472,115 @@ The lead can choose:
 - Mark duplicate.
 - Escalate to human.
 
-## Recommended Team Workflow
+## Two-Agent Scenario
 
-For every agent task:
+This checks the real value of TaskPilot.
 
-1. Create or select a TaskPilot task.
-2. Make sure the task has a clear goal and scope.
-3. Run the agent through `taskpilot run`.
-4. Let the dashboard show ownership and status.
-5. Ask the agent to write decisions and summaries to `TASKPILOT_RUN_CONTEXT_FILE`.
-6. Use handoff when another agent or teammate should continue.
-7. Attach PR/artifact/git metadata when work is reviewable.
-8. Complete the task only when the completion criteria are satisfied.
+Goal:
+
+```text
+Codex on Mac starts the work.
+Gemini on Windows continues from the handoff.
+Both use the same TaskPilot server and same git repo.
+```
+
+### 1. Create task on Mac
+
+```bash
+taskpilot task create \
+  --title "Create Snake planning doc" \
+  --goal "Create PLANNING.md for a simple 2D Snake game. Do not implement the game." \
+  --type planning \
+  --priority normal \
+  --scope "PLANNING.md" \
+  --json
+```
+
+Save the task id.
+
+### 2. Codex works on Mac
+
+```bash
+taskpilot run <task-id> -- codex "Create the planning doc only. Record completed work, decisions, and next steps in the handoff."
+```
+
+Expected:
+
+- Task becomes `in_progress`.
+- Codex creates or edits `PLANNING.md`.
+- Codex updates `TASKPILOT_HANDOFF_FILE`.
+- Codex runs a handoff checkpoint.
+- Dashboard shows context and handoff memory.
+- When Codex exits, task returns to `claimed`.
+
+### 3. Publish handoff
+
+From dashboard:
+
+1. Open task detail.
+2. Click "Show Recent Handoff".
+3. Review the handoff.
+4. Click "Prepare handoff for other agent".
+5. Edit summary and next steps if needed.
+6. Publish.
+
+Task becomes `handoff_ready`.
+
+### 4. Gemini accepts on Windows
+
+```powershell
+taskpilot handoff accept <handoff-id>
+taskpilot run <task-id> -- gemini "Continue from the accepted handoff. Add the technology section and update the handoff checkpoint."
+```
+
+Expected:
+
+- Gemini receives prior Codex handoff context.
+- Gemini does not repeat completed work.
+- Gemini adds only the missing section.
+- Gemini records its own checkpoint.
+- The handoff timeline shows what Codex did and what Gemini did.
 
 ## What To Tell Agents
 
-Use this prompt when launching Codex, Gemini, or another CLI agent:
+Use a short human prompt. Do not paste all context manually.
+
+Good:
 
 ```text
-You are working inside TaskPilot.
-
-Read TASKPILOT_AGENT_INSTRUCTIONS.
-Use TASKPILOT_TASK_ID as the current task.
-Focus only on the task scope.
-Write useful summaries, decisions, risks, blockers, and next steps to TASKPILOT_RUN_CONTEXT_FILE.
-Do not upload raw files or secrets.
-If you stop before completing the task, leave a handoff summary.
+Work on the current TaskPilot task. Follow the injected TaskPilot instructions. Focus on the task scope. Update the handoff file and checkpoint after this work unit.
 ```
 
-## What TaskPilot Does Not Try To Do
+Better with a concrete goal:
 
-TaskPilot does not replace git, GitHub, Jira, Linear, Slack, or human review.
+```text
+Continue from the accepted TaskPilot handoff. Add the technology section to PLANNING.md. Do not implement the game. Update TASKPILOT_HANDOFF_FILE and run the checkpoint command before stopping.
+```
 
-It coordinates agent work around shared task context.
-
-It does not store raw local files by default.
-
-It does not automatically understand every private thought inside an agent unless the agent writes useful context to the run context file or uses the TaskPilot CLI/API.
+TaskPilot injects the rest.
 
 ## Troubleshooting
 
 ### `taskpilot` command not found
 
-TaskPilot is not on PATH.
-
-Install it globally:
+The CLI is not on PATH. Install it into a global folder and retry:
 
 ```bash
-mkdir -p ~/.local/bin
-ln -sf "/path/to/taskpilot" ~/.local/bin/taskpilot
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Windows:
-
-```text
-Put taskpilot.exe in C:\Tools\taskpilot
-Add C:\Tools\taskpilot to Path
+which taskpilot
+taskpilot task list
 ```
 
 ### Dashboard token rejected
 
-Docker default token:
+Use the token that matches the running server.
+
+Docker compose currently uses:
 
 ```text
 change-this-team-token-before-use
 ```
 
-Local SQLite default token:
+Local `serve` default uses:
 
 ```text
 dev-token
@@ -879,7 +595,7 @@ location.reload()
 
 ### Windows cannot reach Mac server
 
-Check from Windows:
+From Windows:
 
 ```powershell
 curl http://<mac-lan-ip>:8080/healthz
@@ -887,38 +603,50 @@ curl http://<mac-lan-ip>:8080/healthz
 
 If it fails:
 
-- Confirm both laptops are on the same network.
-- Confirm Docker is running on Mac.
-- Confirm TaskPilot exposes port `8080`.
+- Check both laptops are on the same network.
+- Check Docker or the server process is running.
+- Check port `8080` is exposed.
 - Check macOS firewall.
 
-### Context does not appear while agent is running
+### Handoff is empty or weak
 
-Make sure the agent writes to:
+Check whether the agent updated:
+
+```text
+TASKPILOT_HANDOFF_FILE
+```
+
+Then run:
+
+```bash
+taskpilot handoff checkpoint <task-id> --file "<handoff-file-path>"
+```
+
+If TaskPilot printed a warning, it also kept the temp handoff file on disk for repair.
+
+### Context does not show in the dashboard while running
+
+The agent must write useful lines to:
 
 ```text
 TASKPILOT_RUN_CONTEXT_FILE
 ```
 
-Example:
+and checkpoint handoff memory through:
 
-```text
-decision: Keep token format unchanged.
-summary: Added failing regression test.
+```bash
+taskpilot handoff checkpoint "$TASKPILOT_TASK_ID" --file "$TASKPILOT_HANDOFF_FILE"
 ```
 
-TaskPilot imports these lines while the run is active and again when the run exits.
-
-## Success Criteria For A Team
+## Success Criteria
 
 TaskPilot is working well when:
 
-- A lead can see active agent work without opening terminals.
-- Two agents do not unknowingly own the same task.
-- Overlapping file or scope work is visible early.
-- Handoffs carry enough context for another agent to continue.
-- Decisions survive beyond one local terminal session.
-- PRs, branches, and outputs are linked back to the task.
-- Humans can resolve conflicts from the dashboard.
-- Agents can use `taskpilot` from any repo without absolute paths.
-
+- Agents can run `taskpilot` from any repo.
+- A task has a clear owner and scope.
+- The dashboard shows active agent work.
+- Locks explain who is touching what.
+- Conflicts are visible early.
+- Handoffs contain completed work and decisions, not placeholders.
+- The next agent can continue without asking what happened.
+- Completion only happens deliberately.

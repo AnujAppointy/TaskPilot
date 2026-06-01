@@ -167,6 +167,57 @@ func TestAgentHandoffTemplateRequiresRealAgentEdits(t *testing.T) {
 	}
 }
 
+func TestRunHandoffAttentionWarnsForPlaceholderDraft(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "handoff.md")
+	markdown := agentHandoffTemplate("task_1", TaskDetail{Task: Task{ID: "task_1", Goal: "Create PLANNING.md", Status: "in_progress"}}, HandoffPacket{})
+	if err := os.WriteFile(path, []byte(markdown), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tracker := &runHandoffTracker{}
+	tracker.record(true, nil)
+	if !warnIfRunHandoffNeedsAttention("task_1", path, tracker) {
+		t.Fatal("expected placeholder handoff draft to need attention")
+	}
+}
+
+func TestRunHandoffAttentionAcceptsValidCheckpointedDraft(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "handoff.md")
+	markdown := `# Task Handoff
+
+## Objective
+Create PLANNING.md
+
+## Current Status
+in_progress
+
+## Current State
+Planning document has been written and reviewed.
+
+## Completed Work
+- Created PLANNING.md with gameplay phases and validation checklist.
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Remaining Work
+- No known work remains for this documentation task.
+
+## Suggested Next Steps
+- Review PLANNING.md and create a separate implementation task if approved.
+
+## Handoff Message
+Planning document is ready for review.
+`
+	if err := os.WriteFile(path, []byte(markdown), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tracker := &runHandoffTracker{}
+	tracker.record(true, nil)
+	if warnIfRunHandoffNeedsAttention("task_1", path, tracker) {
+		t.Fatal("valid checkpointed handoff draft should not need attention")
+	}
+}
+
 func TestParseHandoffAcceptsTaskPilotHandoffHeading(t *testing.T) {
 	markdown := `# TaskPilot Handoff
 

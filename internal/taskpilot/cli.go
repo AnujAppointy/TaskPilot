@@ -226,23 +226,32 @@ func runAgentCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer handoffCleanup()
+	preserveHandoffFile := false
+	defer func() {
+		if !preserveHandoffFile {
+			handoffCleanup()
+		}
+	}()
 	lastHandoffHash := fileHash(handoffPath)
+	handoffTracker := &runHandoffTracker{}
 	startupPrompt := agentStartupPrompt(taskID, taskContextPath, relatedContextPath, contextPath, handoffPath)
 	promptPath, promptCleanup, err := createTextTemp("taskpilot-"+taskID+"-prompt-*.txt", startupPrompt)
 	if err != nil {
 		return err
 	}
 	defer promptCleanup()
+	injectedPrompt := false
 	if !*noPromptInject {
+		before := strings.Join(commandArgs, "\x00")
 		commandArgs = injectAgentStartupPrompt(commandArgs, startupPrompt)
+		injectedPrompt = strings.Join(commandArgs, "\x00") != before
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	done := make(chan struct{})
 	var contextMu sync.Mutex
 	go heartbeatLoop(ctx, taskID, done)
-	go progressLoop(ctx, taskID, contextPath, importedContextLines, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, *progressEvery, done, &contextMu)
+	go progressLoop(ctx, taskID, contextPath, importedContextLines, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, *progressEvery, done, &contextMu, handoffTracker)
 	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -263,11 +272,16 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_AGENT_PROMPT_FILE="+promptPath,
 		"TASKPILOT_AGENT_INSTRUCTIONS="+agentInstructions(taskID),
 	)
+	if injectedPrompt {
+		_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: injected task context into %s prompt. Full injected prompt: %s\n", filepath.Base(commandArgs[0]), promptPath)
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: handoff draft file: %s\n", handoffPath)
+	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint %s --file %q\n", taskID, handoffPath)
 	err = cmd.Run()
 	close(done)
 	contextMu.Lock()
 	imported := importRunContext(taskID, contextPath, importedContextLines)
-	_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
+	handoffTracker.record(checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true))
 	contextMu.Unlock()
 	changed, preExisting, changedFiles := touchedFilesSummary(beforeFiles, gitChangedFileSnapshot())
 	if changed != "" {
@@ -278,13 +292,15 @@ func runAgentCommand(args []string) error {
 		_ = appendRunContext(taskID, "risk", preExisting)
 	}
 	if changed != "" || preExisting != "" {
-		_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
+		handoffTracker.record(checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true))
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "agent command exited with error: %v\n", err)
 		_ = appendRunContext(taskID, "blocker", "taskpilot run command failed: "+err.Error())
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "failed", "finish_reason": err.Error()}, &Task{})
-		_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
+		if warnIfRunHandoffNeedsAttention(taskID, handoffPath, handoffTracker) {
+			preserveHandoffFile = true
+		}
 		if *handoffOnFailure && *handoffTo != "" {
 			_, _ = prepareRunHandoff(taskID, *handoffTo, err.Error(), changed, imported)
 		}
@@ -298,7 +314,10 @@ func runAgentCommand(args []string) error {
 	if summary == "" {
 		summary = "Agent command completed successfully through taskpilot run."
 	}
-	_ = checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true)
+	handoffTracker.record(checkpointRunHandoffIfChanged(taskID, handoffPacket.ID, session.ID, handoffPath, &lastHandoffHash, true))
+	if warnIfRunHandoffNeedsAttention(taskID, handoffPath, handoffTracker) {
+		preserveHandoffFile = true
+	}
 	if *completeOnSuccess && !*noComplete {
 		_ = request("POST", "/api/tasks/"+taskID+"/sessions/finish", map[string]any{"session_id": session.ID, "exit_status": "success", "finish_reason": "agent command exited before explicit completion"}, &Task{})
 		var completed Task
@@ -350,7 +369,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 	}
 }
 
-func progressLoop(ctx context.Context, taskID, contextPath string, importedContextLines map[string]bool, handoffPacketID, sessionID, handoffPath string, lastHandoffHash *string, interval time.Duration, done <-chan struct{}, mu *sync.Mutex) {
+func progressLoop(ctx context.Context, taskID, contextPath string, importedContextLines map[string]bool, handoffPacketID, sessionID, handoffPath string, lastHandoffHash *string, interval time.Duration, done <-chan struct{}, mu *sync.Mutex, tracker *runHandoffTracker) {
 	if interval <= 0 {
 		return
 	}
@@ -366,7 +385,7 @@ func progressLoop(ctx context.Context, taskID, contextPath string, importedConte
 		case <-ticker.C:
 			mu.Lock()
 			_ = importRunContext(taskID, contextPath, importedContextLines)
-			_ = checkpointRunHandoffIfChanged(taskID, handoffPacketID, sessionID, handoffPath, lastHandoffHash, false)
+			tracker.record(checkpointRunHandoffIfChanged(taskID, handoffPacketID, sessionID, handoffPath, lastHandoffHash, false))
 			mu.Unlock()
 		}
 	}
@@ -408,21 +427,96 @@ func checkpointRunHandoff(taskID, packetID, sessionID, handoffPath string) error
 	return request("POST", "/api/tasks/"+taskID+"/handoff-checkpoints", map[string]any{"packet_id": packetID, "session_id": sessionID, "markdown": string(data)}, &out)
 }
 
-func checkpointRunHandoffIfChanged(taskID, packetID, sessionID, handoffPath string, lastHash *string, force bool) error {
+func checkpointRunHandoffIfChanged(taskID, packetID, sessionID, handoffPath string, lastHash *string, force bool) (bool, error) {
 	currentHash := fileHash(handoffPath)
 	if currentHash == "" {
-		return nil
+		return false, nil
 	}
-	if lastHash != nil && *lastHash == currentHash {
-		return nil
+	if !force && lastHash != nil && *lastHash == currentHash {
+		return false, nil
 	}
 	if err := checkpointRunHandoff(taskID, packetID, sessionID, handoffPath); err != nil {
-		return err
+		return true, err
 	}
 	if lastHash != nil {
 		*lastHash = currentHash
 	}
-	return nil
+	return true, nil
+}
+
+type runHandoffTracker struct {
+	mu         sync.Mutex
+	attempts   int
+	successes  int
+	lastErrMsg string
+}
+
+func (t *runHandoffTracker) record(sent bool, err error) {
+	if t == nil || !sent {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.attempts++
+	if err != nil {
+		t.lastErrMsg = err.Error()
+		return
+	}
+	t.successes++
+	t.lastErrMsg = ""
+}
+
+func (t *runHandoffTracker) snapshot() (attempts, successes int, lastErr string) {
+	if t == nil {
+		return 0, 0, ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.attempts, t.successes, t.lastErrMsg
+}
+
+func warnIfRunHandoffNeedsAttention(taskID, handoffPath string, tracker *runHandoffTracker) bool {
+	reasons := []string{}
+	data, err := os.ReadFile(handoffPath)
+	if err != nil {
+		reasons = append(reasons, "Could not read TASKPILOT_HANDOFF_FILE: "+err.Error())
+	} else {
+		content, err := parseHandoffMarkdownStrict(string(data), false)
+		if err != nil {
+			reasons = append(reasons, "Handoff Markdown could not be parsed: "+err.Error())
+		} else {
+			for _, validationErr := range validateHandoffQuality(content) {
+				section := strings.TrimSpace(validationErr.Section)
+				if section == "" {
+					section = "Document"
+				}
+				reasons = append(reasons, section+": "+validationErr.Message)
+			}
+		}
+	}
+	attempts, successes, lastErr := tracker.snapshot()
+	if successes == 0 {
+		if attempts == 0 {
+			reasons = append(reasons, "No handoff checkpoint was sent to the TaskPilot server.")
+		} else {
+			reasons = append(reasons, "No handoff checkpoint was saved by the TaskPilot server.")
+		}
+	}
+	if lastErr != "" {
+		reasons = append(reasons, "Last checkpoint error: "+lastErr)
+	}
+	reasons = uniqueStrings(cleanStrings(reasons))
+	if len(reasons) == 0 {
+		return false
+	}
+	_, _ = fmt.Fprintln(os.Stderr)
+	_, _ = fmt.Fprintln(os.Stderr, "TaskPilot handoff needs attention before another agent can continue reliably:")
+	for _, reason := range reasons {
+		_, _ = fmt.Fprintf(os.Stderr, "  - %s\n", reason)
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "Update the handoff draft and save a checkpoint with:\n  taskpilot handoff checkpoint %s --file %q\n", taskID, handoffPath)
+	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot kept the handoff file on disk for repair: %s\n\n", handoffPath)
+	return true
 }
 
 func fileHash(path string) string {

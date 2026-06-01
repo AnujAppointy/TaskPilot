@@ -1,296 +1,349 @@
 # TaskPilot
 
-TaskPilot is a local-first coordination MVP for distributed AI agents and humans. It gives agents a CLI/API and gives managers or tech leads a dashboard over the same task state.
+TaskPilot is a shared coordination system for humans and AI agents working across machines. It gives agents a CLI wrapper and gives humans a dashboard over the same task state.
 
-New to TaskPilot? Start with the team-friendly onboarding guide:
-
-```text
-docs/ONBOARDING.md
-```
-
-Want to understand the technology choices? Read:
+The main idea is simple:
 
 ```text
-docs/TECHNICAL_DECISIONS.md
+TaskPilot is shared work memory plus coordination rules for Codex, Gemini, and humans.
 ```
 
-## Run
+Use it when two or more people or agents need to work on the same codebase without losing task context, decisions, locks, handoffs, or ownership.
+
+## Start Here
+
+- Team onboarding guide: [docs/ONBOARDING.md](docs/ONBOARDING.md)
+- Technical decisions: [docs/TECHNICAL_DECISIONS.md](docs/TECHNICAL_DECISIONS.md)
+- Agent rules for this repo: [AGENTS.md](AGENTS.md)
+
+## How It Fits Together
+
+```mermaid
+flowchart LR
+  Human["Human / Lead<br/>Dashboard"] --> API["TaskPilot API"]
+  Codex["Codex CLI<br/>Mac"] --> CLI["taskpilot run"]
+  Gemini["Gemini CLI<br/>Windows"] --> CLI
+  CLI --> API
+  API --> Server["Go Coordination Server"]
+  Server --> DB[("SQLite or Postgres")]
+  Server --> Events["Events / Audit Timeline"]
+  Server --> Locks["Ownership + Locks"]
+  Server --> Memory["Context + Decisions + Handoffs"]
+  API --> Human
+```
+
+The dashboard and CLI are two interfaces over the same server. If Codex updates a task from the CLI, the dashboard sees it. If a lead publishes a handoff from the dashboard, the next agent sees it from the CLI.
+
+## What TaskPilot Can Do Now
+
+- Create and manage tasks with goal, type, priority, scope, owner, project, repo, and workspace.
+- Track task lifecycle: `ready`, `claimed`, `in_progress`, `blocked`, `handoff_ready`, `in_review`, `completed`, `cancelled`.
+- Claim tasks and prevent overlapping ownership.
+- Acquire file, semantic-area, artifact, and task-level locks.
+- Detect and explain conflicts and stale claims.
+- Record structured context, decisions, comments, artifacts, and git metadata.
+- Split work into subtasks and dependencies.
+- Run Codex, Gemini, or another agent through `taskpilot run`.
+- Inject current task context and selected related task context into the agent prompt.
+- Maintain an agent-authored handoff file during the run.
+- Save handoff checkpoints after meaningful work units.
+- Warn loudly when a handoff is weak, placeholder, or not checkpointed.
+- Show task board, detail, memory, conflicts, handoffs, projects, actors, repos, workspaces, and settings in the dashboard.
+- Use SQLite locally or Postgres for shared team deployments.
+
+## Install The CLI
+
+The CLI should be available as `taskpilot` from any repo. This is important because agents naturally call `taskpilot`, not an absolute path inside the TaskPilot source folder.
+
+Mac/Linux:
 
 ```bash
-go build -o taskpilot ./cmd/taskpilot
-./taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+go build -o bin/taskpilot ./cmd/taskpilot
+mkdir -p ~/.local/bin
+ln -sf "$PWD/bin/taskpilot" ~/.local/bin/taskpilot
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Optional env-file setup:
+Windows:
+
+```text
+Put taskpilot.exe in C:\Tools\taskpilot
+Add C:\Tools\taskpilot to Windows Path
+```
+
+Check:
 
 ```bash
-cp .env.example .env
-set -a
-source .env
-set +a
-./taskpilot serve
+taskpilot task list
 ```
 
-Open the dashboard at:
+## Run The Server
+
+Local SQLite development:
+
+```bash
+go build -o bin/taskpilot ./cmd/taskpilot
+./bin/taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+```
+
+Open:
 
 ```text
 http://127.0.0.1:8080
 ```
 
-The dashboard uses the same API as the CLI. Set the token in the dashboard settings to `dev-token`, then register a human or agent actor.
-
-Production-like self-hosted run:
-
-```bash
-TASKPILOT_TOKEN="$(openssl rand -hex 24)" \
-TASKPILOT_SECRET_KEY="$(openssl rand -hex 32)" \
-TASKPILOT_DB_URL="postgres://taskpilot:password@localhost:5432/taskpilot?sslmode=disable" \
-./taskpilot serve --addr 0.0.0.0:8080 --production
-```
-
-SQLite remains the default for local development. Production can use Postgres by setting `TASKPILOT_DB_URL` to a `postgres://` or `postgresql://` connection string.
-
-Docker:
+Docker with Postgres:
 
 ```bash
 docker compose up --build
 ```
 
-## CLI Setup
+The current Docker compose development token is:
 
-Legacy development setup:
-
-```bash
-./taskpilot login --server http://127.0.0.1:8080 --token dev-token
-./taskpilot actor register --name "Codex on Anuj Mac" --kind agent --machine anuj-mac
+```text
+change-this-team-token-before-use
 ```
 
-The actor registration command saves the returned actor ID and actor secret into the local CLI config.
+The local SQLite default token is:
 
-## Projects, Repositories, And Workspaces
-
-Use projects to keep team work separated, repositories to tell agents where code lives, and workspaces to identify the machine or runtime doing the work.
-
-```bash
-./taskpilot project create --name "Appointy Backend" --description "Backend agent coordination"
-./taskpilot repo create --project <project-id> --name appointy-api --path /path/to/repo --branch main
-./taskpilot workspace create --project <project-id> --name "Anuj Mac" --actor <actor-id> --machine anuj-mac
-./taskpilot task create --project <project-id> --repo <repo-id> --workspace <workspace-id> --title "Fix signup bug" --goal "Resolve invited-user signup failure"
-./taskpilot task list --project <project-id>
+```text
+dev-token
 ```
 
-Existing databases automatically get a `Default` project so older tasks keep working.
-
-Production-style local bootstrap:
+Health checks:
 
 ```bash
-./taskpilot admin create-user \
-  --email admin@example.com \
-  --name "Admin" \
-  --password "change-this-password" \
-  --role admin
-
-./taskpilot admin create-actor \
-  --name "Codex on Anuj Mac" \
-  --kind agent \
-  --machine anuj-mac
-
-./taskpilot admin create-api-key \
-  --name "Codex agent key" \
-  --actor <actor-id> \
-  --scope task:read \
-  --scope task:write \
-  --scope lock:write \
-  --scope context:write \
-  --scope handoff:write
-
-./taskpilot login --server http://127.0.0.1:8080 --api-key <tpk_...>
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/readyz
 ```
 
-The raw API key is shown only once when it is created. Store it in the local TaskPilot config with `login --api-key` or `api-key set`.
+## CLI Login
 
-## Demo Flow
+For the machine running the server:
 
 ```bash
-./taskpilot task create \
+taskpilot login --server http://127.0.0.1:8080 --token change-this-team-token-before-use
+```
+
+For another laptop on the same network:
+
+```bash
+taskpilot login --server http://<server-lan-ip>:8080 --token change-this-team-token-before-use
+```
+
+Register an agent:
+
+```bash
+taskpilot actor register --name "Codex CLI - Mac" --kind agent --machine macbook
+taskpilot actor register --name "Gemini CLI - Windows" --kind agent --machine windows-laptop
+```
+
+## Basic Task Flow
+
+```bash
+taskpilot task create \
   --title "Fix invited-user signup" \
-  --goal "Resolve signup failure for invited users" \
+  --goal "Find and fix invited-user signup failure" \
+  --type debugging \
+  --priority high \
   --scope "src/auth/*"
 
-./taskpilot task list
-./taskpilot task claim <task-id>
-./taskpilot lock acquire <task-id> --scope "src/auth/*"
-
-./taskpilot task subtask <task-id> \
-  --title "Write invited-user regression test" \
-  --goal "Capture the failing expiry case before patching"
-
-./taskpilot task depend <task-id> --on <blocking-task-id>
-
-./taskpilot context append <task-id> \
-  --kind decision \
-  --content "Keep token format unchanged. Fix expiry comparison only."
-
-./taskpilot handoff prepare <task-id> \
-  --summary "Signup failure traced to expiry comparison. No schema change needed." \
-  --next "Write regression test" \
-  --next "Patch expiry logic"
+taskpilot task list
+taskpilot task show <task-id>
+taskpilot task claim <task-id>
+taskpilot lock acquire <task-id> --scope "src/auth/*"
 ```
 
-Another machine or agent can configure the same server/token, register its own actor, inspect the task, accept the handoff, and continue.
-
-## Subtasks and Dependencies
-
-Use subtasks to split a larger task into owned child work. A parent task cannot be completed while any child task is still open.
-
-Use dependencies when one task must wait for another task to finish first. A dependent task cannot be completed until every blocking task is completed or cancelled.
-
-The dashboard exposes the same model:
-
-- Task cards show subtask and blocker counts.
-- Task detail shows parent, subtasks, "Blocked By", and "Blocking" sections.
-- Humans can create subtasks, add blockers, and remove dependencies from the dashboard.
-
-Every subtask and dependency change writes an audit event, so handoffs and status reviews keep their timeline.
-
-## Decisions and Comments
-
-Use decision records for durable rationale that future agents should preserve:
+Add durable context:
 
 ```bash
-./taskpilot decision add <task-id> \
+taskpilot context append <task-id> \
+  --kind decision \
+  --content "Keep token format unchanged. Patch expiry comparison only."
+```
+
+Add a first-class decision:
+
+```bash
+taskpilot decision add <task-id> \
   --decision "Keep token format unchanged" \
-  --alternative "Rotate all tokens" \
   --reason "Existing invite links must keep working" \
   --impact "Patch only expiry validation"
 ```
 
-Use comments for human discussion, review notes, and questions:
+Attach outputs:
 
 ```bash
-./taskpilot comment add <task-id> --body "Please review expiry edge cases before merge."
-```
-
-Task detail and the dashboard show decisions and comments separately from generic agent context.
-
-## Conflict Resolution
-
-TaskPilot records ownership and lock collisions as open conflicts. The dashboard Conflicts view lets a lead choose a resolution with a required note:
-
-- continue current owner
-- transfer ownership
-- split scope
-- pause secondary work
-- mark duplicate
-- escalate to human
-
-Resolution actions write audit events. Outcomes that change workflow also update task state, for example pausing secondary work marks the task blocked and adds blocker context.
-
-## Artifacts and Git Metadata
-
-TaskPilot stores artifact references by default, not raw local files. Use artifacts for PRs, logs, branches, docs, screenshots, and output links:
-
-```bash
-./taskpilot artifact add <task-id> \
+taskpilot artifact add <task-id> \
   --kind pr \
   --title "Signup fix PR" \
-  --uri "https://github.com/acme/app/pull/42" \
-  --description "Reviewable implementation for invited-user signup"
+  --uri "https://github.com/acme/app/pull/42"
+
+taskpilot git link-branch <task-id>
+taskpilot git attach-pr <task-id> "https://github.com/acme/app/pull/42"
 ```
 
-Attach git metadata so managers can see where implementation work lives:
+## Agent Automation
+
+The most important workflow is:
 
 ```bash
-./taskpilot git link-branch <task-id>
-./taskpilot git attach-pr <task-id> "https://github.com/acme/app/pull/42"
-./taskpilot git attach <task-id> --branch feature/signup-fix --commit abc1234 --file src/auth/login.go
+taskpilot run <task-id> -- codex "your prompt"
+taskpilot run <task-id> -- gemini "your prompt"
 ```
 
-Task detail and the dashboard show artifact references and git metadata separately from context and comments.
+`taskpilot run` does the coordination work around the child agent:
 
-## Agent Wrapper
+1. Reads the task from the server.
+2. Claims the task if available.
+3. Starts a session and moves the task to `in_progress`.
+4. Acquires task/scope locks.
+5. Sends heartbeats while the agent runs.
+6. Creates task context and related-context files.
+7. Injects a startup prompt into known agents like Codex and Gemini.
+8. Creates `TASKPILOT_RUN_CONTEXT_FILE` for incremental notes.
+9. Creates `TASKPILOT_HANDOFF_FILE` for transfer-ready memory.
+10. Imports useful context and handoff checkpoints.
+11. On normal exit, returns the task to `claimed`, not `completed`.
+12. Completion happens only through an explicit complete action.
 
-Use `taskpilot run` when you want TaskPilot to claim the task, heartbeat while the child agent runs, pass task context through environment variables, import sanitized progress, and complete or block the task based on the child process exit status.
+When prompt injection is active, the terminal shows:
 
-```bash
-./taskpilot run <task-id> -- codex
-./taskpilot run <task-id> --progress-interval 2m --no-complete -- codex
+```text
+TaskPilot: injected task context into codex prompt. Full injected prompt: /tmp/taskpilot-...-prompt-....txt
+TaskPilot: handoff draft file: /tmp/taskpilot-...-handoff-....md
+TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint ...
 ```
 
-The child process receives:
+The injected prompt includes the human prompt:
+
+```text
+Human prompt for this work unit:
+your prompt
+```
+
+## Agent Context And Handoff Files
+
+The child agent receives these environment variables:
 
 ```text
 TASKPILOT_TASK_ID
 TASKPILOT_SERVER
 TASKPILOT_ACTOR_ID
+TASKPILOT_SESSION_ID
+TASKPILOT_HANDOFF_PACKET_ID
 TASKPILOT_PROJECT_ID
 TASKPILOT_REPO_ID
 TASKPILOT_WORKSPACE_ID
+TASKPILOT_TASK_CONTEXT_FILE
+TASKPILOT_RELATED_CONTEXT_FILE
 TASKPILOT_RUN_CONTEXT_FILE
+TASKPILOT_HANDOFF_FILE
+TASKPILOT_AGENT_PROMPT_FILE
 TASKPILOT_AGENT_INSTRUCTIONS
 ```
 
-`taskpilot run` appends sanitized run context automatically when the agent starts, periodically while it runs, succeeds, or fails. The child agent can add richer context by writing lines to `TASKPILOT_RUN_CONTEXT_FILE`:
+Write incremental notes to `TASKPILOT_RUN_CONTEXT_FILE`:
 
 ```text
-decision: Keep token format unchanged
-blocker: Invite reproduction data is missing
-{"kind":"summary","content":"Added invited-user regression coverage"}
+summary: Added invited-user regression coverage.
+finding: Failure happens after token lookup during expiry comparison.
+decision: Keep token format unchanged because existing invite links depend on it.
+risk: Timezone handling may still need edge-case coverage.
+files: src/auth/invite.go, src/auth/invite_test.go
+verification: go test ./src/auth passed.
+next: Patch already-used invite token handling.
 ```
 
-After the command exits, TaskPilot imports those entries, records touched files from `git status`, and prepares a handoff automatically if the command fails.
-
-Initialize project instructions:
+Keep `TASKPILOT_HANDOFF_FILE` updated after each meaningful prompt response or work unit, then checkpoint it:
 
 ```bash
-./taskpilot agent init
+taskpilot handoff checkpoint "$TASKPILOT_TASK_ID" --file "$TASKPILOT_HANDOFF_FILE"
 ```
 
-Expose TaskPilot to MCP-capable agents:
+If the handoff is still weak or placeholder text when the agent exits, TaskPilot prints a warning and keeps the handoff file on disk so it can be fixed manually.
+
+## Handoff Workflow
+
+Use handoffs when another agent or developer should continue.
+
+CLI:
 
 ```bash
-./taskpilot mcp serve
+taskpilot handoff prepare <task-id> \
+  --summary "Root cause traced to expiry comparison. Token format should stay unchanged." \
+  --next "Add failing regression test" \
+  --next "Patch expiry comparison"
 ```
 
-The MCP server provides tools for `read_task`, `claim_task`, `heartbeat_task`, `append_context`, and `complete_task` using the same CLI config as other TaskPilot commands.
+Dashboard:
 
-The dashboard task board also supports search and filters for project, owner, status, repo, priority, blocked state, and stale claims. Search covers task title, goal, context entries, and decision records.
+1. Open task detail.
+2. Go to Task Memory.
+3. Click "Prepare handoff for other agent".
+4. Edit summary and next steps in the modal.
+5. Publish handoff.
+6. Another actor accepts it from the Handoffs page.
 
-## Operations
+The best handoffs include:
 
-```bash
-./taskpilot migrate status
-./taskpilot migrate up
-./taskpilot backup create --out taskpilot-backup.db
-./taskpilot backup restore --in taskpilot-backup.db
+- Completed work.
+- Important decisions and reasons.
+- Current state.
+- Remaining work.
+- Suggested next steps.
+- Files/components affected.
+- Risks, blockers, assumptions, and references.
+
+## Dashboard
+
+The dashboard supports:
+
+- Task board with search and filters.
+- Task detail with memory, decisions, comments, artifacts, git, locks, handoffs, and timeline.
+- Task creation even from empty states.
+- Project, repository, and workspace management.
+- Actors and identity settings.
+- Conflict and stale-claim views.
+- Handoff page for published handoffs.
+- Task memory preview, latest handoff preview, editable Markdown, and publish flow.
+
+Dashboard actions call the same API as the CLI, so humans and agents stay consistent.
+
+## Architecture In One Picture
+
+```mermaid
+sequenceDiagram
+  participant Human as Human Dashboard
+  participant CLI as taskpilot run
+  participant Agent as Codex/Gemini
+  participant API as TaskPilot API
+  participant DB as SQLite/Postgres
+
+  Human->>API: create task
+  CLI->>API: read + claim task
+  API->>DB: save owner, session, locks
+  CLI->>Agent: launch with injected context prompt
+  Agent->>Agent: edit code/docs
+  Agent->>CLI: write run context + handoff file
+  Agent->>API: handoff checkpoint
+  API->>DB: save context, checkpoint, audit events
+  Human->>API: inspect dashboard
+  CLI->>API: finish session
+  API->>DB: task returns to claimed unless explicitly completed
 ```
 
-Health and observability:
+## Auth
 
-```text
-GET /healthz
-GET /readyz
-GET /metrics
+Development token auth:
+
+```http
+Authorization: Bearer <team-token>
+X-Actor-ID: <actor-id>
+X-Actor-Secret: <actor-secret>
 ```
 
-## Agent Operating Instructions
-
-When working on a TaskPilot task:
-
-1. Read the task before starting.
-2. Claim the task before editing.
-3. Acquire locks for files, artifacts, or semantic areas you will touch.
-4. Send heartbeat while actively working.
-5. Append sanitized findings, decisions, risks, and next steps.
-6. Never upload raw local files unless explicitly approved outside the MVP.
-7. Prepare a handoff if stopping before completion.
-8. Mark task complete only when completion criteria are satisfied.
-
-## API Auth
-
-TaskPilot now supports production-style auth while keeping the legacy team token flow for local development.
-
-Agent/API-key auth:
+API key auth:
 
 ```http
 Authorization: ApiKey <tpk_...>
@@ -303,20 +356,29 @@ POST /api/auth/login
 Cookie: taskpilot_session=<session>
 ```
 
-Legacy development auth:
+For current internal testing, token auth is the simplest path. API keys and user login are available for more accountable setups.
 
-```http
-Authorization: Bearer <team-token>
-X-Actor-ID: <actor-id>
-X-Actor-Secret: <actor-secret>
+## Operations
+
+Migration and backup:
+
+```bash
+taskpilot migrate status
+taskpilot migrate up
+taskpilot backup create --out taskpilot-backup.db
+taskpilot backup restore --in taskpilot-backup.db
 ```
 
-`POST /api/actors/register` only requires the bearer token.
+Observability:
 
-Do not expose the server on `0.0.0.0` with the default `dev-token`. TaskPilot refuses that startup mode; use a strong token through `--token` or `TASKPILOT_TOKEN`.
-
-Production mode also requires `TASKPILOT_SECRET_KEY` with at least 32 characters.
+```text
+GET /healthz
+GET /readyz
+GET /metrics
+```
 
 ## Privacy Boundary
 
-TaskPilot stores structured task context, ownership, locks, handoffs, and audit events. It does not store raw local files, secrets, full prompts, private logs, screenshots, or workspace data by default.
+TaskPilot stores structured task context, decisions, comments, ownership, locks, handoff memory, artifact references, git metadata, and audit events.
+
+TaskPilot does not store raw local files, secrets, full private prompts, private logs, screenshots, or customer data by default.

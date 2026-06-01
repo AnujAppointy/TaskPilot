@@ -1,383 +1,583 @@
-# TaskPilot Technical Decision Document
+# TaskPilot Technical Decisions
 
-## Purpose
+This document explains what TaskPilot is built with and why. The goal is to keep the system easy to run inside a company while still being useful for real multi-agent software work.
 
-This document explains the main technology choices behind TaskPilot and why they fit the product goal: coordinating humans and AI agents working across different machines without making every agent depend on one vendor, IDE, or runtime.
+## Product Goal
 
-TaskPilot is designed as a task-centric coordination layer. The system stores shared task state, ownership, locks, handoffs, decisions, context, artifacts, and audit events so agents such as Codex and Gemini can continue each other's work with less human translation.
+TaskPilot coordinates humans and AI agents around structured tasks.
 
-## High-Level Architecture
+It is not only "shared memory." It is a work hook around agent sessions:
 
 ```text
-Codex / Gemini / Other Agent
-        |
-        v
-TaskPilot CLI / taskpilot run
-        |
-        v
-TaskPilot REST API
-        |
-        v
-Go Coordination Server
-        |
-        v
-SQLite or Postgres Database
-        ^
-        |
-React Dashboard
+taskpilot run <task-id> -- codex "prompt"
 ```
 
-The CLI and dashboard are two interfaces over the same backend. Agents mostly use the CLI and `taskpilot run`; humans mostly use the dashboard.
+That wrapper lets TaskPilot claim work, inject task context, send heartbeats, create locks, collect progress, validate handoff memory, and keep the dashboard updated.
 
-## Technology Decisions
+## Current Architecture
 
-### 1. Go For Backend And CLI
+```mermaid
+flowchart TD
+  Browser["Dashboard<br/>human workflow"] --> API["REST API"]
+  CLI["TaskPilot CLI"] --> API
+  Run["taskpilot run"] --> API
+  Run --> Agent["Child agent<br/>Codex / Gemini"]
+  Agent --> Files["Run context file<br/>Handoff file"]
+  Files --> Run
+  API --> Server["Go coordination server"]
+  Server --> Store[("SQLite dev<br/>Postgres shared server")]
+  Server --> Audit["Events / audit log"]
+  Server --> Locks["Locks + conflicts"]
+  Server --> Memory["Task memory + decisions + handoffs"]
+```
 
-**Decision:** Use Go for the TaskPilot server and CLI.
+## Main Technical Choices
 
-**Why:**
+### Go for backend and CLI
 
-- Go produces a single portable binary, which is useful for internal tools.
-- The same language can power both the server and CLI.
-- Go is strong for long-running daemons, HTTP APIs, background workers, and filesystem/process integration.
-- The standard library is enough for much of the MVP: HTTP server, JSON, process execution, signals, file handling, and concurrency.
-- It is easier to distribute to Mac, Windows, and Linux developer machines than a large runtime-heavy tool.
-
-**Value to TaskPilot:**
-
-- Developers can install one `taskpilot` binary.
-- Agents can call a simple CLI from any repo.
-- `taskpilot run` can wrap child agent processes, inject context, send heartbeats, and collect structured output.
-
-**Trade-off:**
-
-- Go is not the fastest language for building complex UI-heavy logic, so the dashboard is handled separately in frontend code.
-
-### 2. React Dashboard
-
-**Decision:** Use a React-based dashboard served by the Go server.
+**Decision:** Build the server and CLI in Go.
 
 **Why:**
 
-- Managers and tech leads need visibility without terminal commands.
-- React is familiar and good for interactive task boards, filters, detail panels, forms, and real-time updates.
-- Serving the dashboard from the Go server keeps deployment simple for the MVP.
+- One portable binary works well for internal tools.
+- Go is good for HTTP servers, CLI tools, subprocess management, signals, filesystem access, and concurrency.
+- The same binary can serve the API, dashboard, migrations, backup, admin commands, and agent wrapper.
+- Distribution is simpler across Mac, Windows, and Linux.
 
-**Value to TaskPilot:**
+**Value:**
 
-- Humans can see task status, context, owners, locks, handoffs, conflicts, decisions, and artifacts.
-- Leads can resolve coordination issues without using CLI commands.
-- Dashboard actions call the same API as the CLI, so UI and CLI stay consistent.
+Agents can run one command from any repo:
+
+```bash
+taskpilot run <task-id> -- codex "prompt"
+```
 
 **Trade-off:**
 
-- A richer frontend introduces UI state management concerns. For example, polling must not reset form inputs while a user is typing.
+Go is not ideal for complex frontend UI, so the dashboard uses browser JavaScript served by the Go server.
 
-### 3. REST API As The Shared Interface
+### REST JSON API
 
-**Decision:** Use REST JSON APIs as the main interface between CLI, dashboard, and server.
+**Decision:** Use REST JSON as the shared interface for CLI and dashboard.
 
 **Why:**
 
-- REST is simple, debuggable, and language-agnostic.
-- Any agent provider or tool can call HTTP without needing a vendor-specific SDK.
-- The dashboard and CLI can share the same backend behavior.
-- JSON fits structured task context well.
+- Easy to debug with `curl`.
+- Works with any language or agent runtime.
+- Keeps Codex, Gemini, dashboard, and scripts on the same behavior path.
 
-**Value to TaskPilot:**
+**Value:**
 
-- Codex, Gemini, scripts, dashboard, and future integrations can all use the same task system.
-- It keeps TaskPilot interoperable across agent providers.
+Dashboard actions and CLI actions mutate the same task model and write the same audit events.
 
 **Trade-off:**
 
-- REST alone does not provide live updates. The MVP uses polling, with a path toward Server-Sent Events for better real-time behavior.
+REST needs polling or SSE for live UI updates. The current dashboard is polling-oriented, with the backend event model ready for SSE later.
 
-### 4. SQLite For Local Development
+### SQLite for local development
 
-**Decision:** Use SQLite as the default local database.
+**Decision:** Keep SQLite as the default local database.
 
 **Why:**
 
-- SQLite requires no separate database server.
-- It is easy to run on a developer laptop.
-- It works well for local demos, MVP validation, and small internal deployments.
-- It keeps setup lightweight while the product shape is still evolving.
+- Zero database setup.
+- Easy demos and local testing.
+- Simple backup as a file.
 
-**Value to TaskPilot:**
+**Value:**
 
-- New users can start quickly.
-- The system can be tested without Docker or cloud infrastructure.
-- Local-first development remains simple.
+A developer can run TaskPilot quickly on one laptop.
 
 **Trade-off:**
 
-- SQLite is not ideal for larger multi-user production workloads with heavy concurrency.
+SQLite is not the best shared-team database under heavier concurrency.
 
-### 5. Postgres For Production
+### Postgres for shared server use
 
-**Decision:** Support Postgres for production-style deployments.
+**Decision:** Support Postgres through `TASKPILOT_DB_URL`.
 
 **Why:**
 
-- Postgres is better for concurrent team usage.
-- It has mature backup, restore, monitoring, and operations support.
-- It is the safer long-term choice for shared team infrastructure.
+- Better concurrency for multiple laptops and agents.
+- Better operational support for backup, restore, monitoring, and Docker deployment.
+- Fits the shared-server model.
 
-**Value to TaskPilot:**
+**Value:**
 
-- Teams can move from a local MVP to a shared internal server without changing the task model.
-- The same APIs and dashboard work over a more production-ready database.
+The team can use one TaskPilot server from Mac and Windows machines.
 
 **Trade-off:**
 
-- Postgres adds operational complexity compared with SQLite, so SQLite remains the default local mode.
+Postgres adds deployment complexity, so SQLite remains useful for local development.
 
-### 6. `taskpilot run` As The Agent Wrapper
+### Dashboard served by the Go server
 
-**Decision:** Make `taskpilot run <task-id> -- <agent-command>` the primary agent workflow.
+**Decision:** Serve the dashboard from the TaskPilot server.
 
 **Why:**
 
-- Relying on every agent to remember manual CLI commands is brittle.
-- Some agent runtimes may not be able to reach localhost or read the same shell config as the parent terminal.
-- The wrapper can fetch task context from the server before launching the agent.
-- The wrapper can inject context files, collect agent updates, send heartbeats, and mark final status.
+- One server is easier for teams to run.
+- The dashboard naturally shares the same auth and API.
+- No separate frontend hosting is needed for the MVP/internal tool.
 
-**Value to TaskPilot:**
+**Value:**
 
-- Agents no longer need humans to paste task context manually.
-- Codex on Mac can continue from Gemini on Windows using related task context.
-- The parent wrapper handles server communication, so the child agent can work even if direct CLI/server access is limited.
+Open:
+
+```text
+http://<taskpilot-server>:8080
+```
+
+and the team sees the same state as the CLI.
 
 **Trade-off:**
 
-- The wrapper must understand common agent command behavior. For known commands such as `codex` and `gemini`, TaskPilot injects a startup prompt directly.
+The UI must carefully avoid polling bugs that reset input fields while the user types.
 
-### 7. Context Files For Agent Injection
+## Agent Wrapper Design
 
-**Decision:** Inject task context through temporary local files:
+### `taskpilot run`
+
+**Decision:** Make `taskpilot run` the normal way to start agents.
+
+```bash
+taskpilot run <task-id> -- codex "your prompt"
+taskpilot run <task-id> -- gemini "your prompt"
+```
+
+**Why:**
+
+Manual coordination is brittle. Agents may forget to claim tasks, acquire locks, write context, or prepare handoffs.
+
+`taskpilot run` handles the outer workflow:
+
+1. Read current task from server.
+2. Claim if available.
+3. Start a task session.
+4. Move status to `in_progress`.
+5. Acquire locks.
+6. Start heartbeat.
+7. Create injected context files.
+8. Inject startup prompt into known agents.
+9. Collect run context.
+10. Validate handoff file.
+11. Return task to `claimed` on exit unless explicitly completed.
+
+**Important lifecycle decision:**
+
+Successful agent exit does not mean task completion.
+
+```text
+ready -> claimed -> in_progress -> claimed
+```
+
+Completion is deliberate:
+
+```bash
+taskpilot task complete <task-id> --summary "Done and verified."
+```
+
+**Value:**
+
+An interrupted session does not accidentally mark work complete.
+
+### Prompt injection
+
+**Decision:** For known agents like Codex and Gemini, TaskPilot combines the TaskPilot startup prompt with the human work-unit prompt.
+
+Example command:
+
+```bash
+taskpilot run task_123 -- codex "Add a technology section to PLANNING.md"
+```
+
+The injected prompt includes:
+
+```text
+Work on the current TaskPilot task.
+...
+Human prompt for this work unit:
+Add a technology section to PLANNING.md
+```
+
+TaskPilot also prints the injected prompt file path:
+
+```text
+TaskPilot: injected task context into codex prompt. Full injected prompt: /tmp/taskpilot-...-prompt-....txt
+```
+
+**Why:**
+
+Agents should not guess from repo-local databases or stale chat memory. The server task is authoritative.
+
+**Trade-off:**
+
+The child agent still needs to follow instructions. TaskPilot now validates the handoff file at exit and warns if the agent did not produce useful memory.
+
+### Context files
+
+**Decision:** Use temp files for injected context and agent output.
+
+TaskPilot creates:
 
 ```text
 TASKPILOT_TASK_CONTEXT_FILE
 TASKPILOT_RELATED_CONTEXT_FILE
 TASKPILOT_RUN_CONTEXT_FILE
+TASKPILOT_HANDOFF_FILE
+TASKPILOT_AGENT_PROMPT_FILE
 ```
 
-**Why:**
+**Why files instead of only env vars:**
 
-- Environment variables are too small and easy for agents to ignore.
-- Large JSON context is easier to inspect as a file.
-- Some child agents cannot reliably call the TaskPilot server directly.
-- Files make the workflow provider-neutral.
+- JSON context can be larger than comfortable environment variables.
+- Files are provider-neutral.
+- Agents can inspect them easily.
+- The parent wrapper can still communicate with the server even if the child agent cannot.
 
-**Value to TaskPilot:**
+**Value:**
 
-- Current task context is available before the agent starts work.
-- Relevant parent or prior task context is available without fetching the whole database.
-- Agents can write structured progress back while they work.
+Codex on Mac and Gemini on Windows can receive the same task truth from the server.
 
 **Trade-off:**
 
-- Temporary files are cleaned up after the run, so debugging generated context requires either logs or a future `--keep-context` option.
+Temp files are normally cleaned up. If the handoff is weak or invalid, TaskPilot keeps the handoff file on disk for repair.
 
-### 8. Selective Related Context Instead Of Full Memory
+## Handoff Memory Design
 
-**Decision:** Fetch only relevant related task context, not every task.
+### Agent-authored handoff file
+
+**Decision:** Prefer an agent-authored `TASKPILOT_HANDOFF_FILE` over rule-based handoff inference.
 
 **Why:**
 
-- Pulling all task history would create noise.
-- It could expose unrelated context.
-- It would overload the agent with unnecessary information.
-- Most continuation work only needs the current task, linked tasks, and prior work with overlapping scope.
+Rule-based generation can miss important reasoning. The working agent knows what it did, why it did it, and what remains.
 
-**Current selection signals:**
+The required handoff sections are:
 
-- Direct parent/subtask/dependency relation.
-- Same project.
-- Same repository.
-- Overlapping scope, such as `README.md`.
-- Recent updates.
-- Completed prior work.
+- Completed Work
+- Important Decisions
+- Current State
+- Remaining Work
+- Suggested Next Steps
+- Handoff Message
 
-**Value to TaskPilot:**
-
-- Agents receive useful continuity without drowning in irrelevant task history.
-- Human trust boundaries are preserved because unrelated work is not injected by default.
-
-**Trade-off:**
-
-- Relevance scoring is heuristic. Over time it may need stronger semantic matching, explicit task links, or user-controlled context policies.
-
-### 9. Structured Task Context
-
-**Decision:** Store structured context entries rather than unstructured transcripts.
-
-Supported context kinds include:
+If no meaningful decision was made, the agent must explicitly write:
 
 ```text
-summary
-decision
-note
-risk
-blocker
-output_ref
+No material decision made; work followed existing requirements.
+```
+
+**Value:**
+
+The next agent gets useful continuation memory instead of generic `None recorded` sections.
+
+### Work-unit checkpoints
+
+**Decision:** Replace time-based handoff syncing with explicit checkpoints.
+
+Command:
+
+```bash
+taskpilot handoff checkpoint <task-id> --file "$TASKPILOT_HANDOFF_FILE"
 ```
 
 **Why:**
 
-- Agents need compact continuation context, not full chat logs.
-- Humans need quick status understanding.
-- Different context kinds support different dashboard sections and future automation.
+Time-based sync can capture half-written or noisy handoff content. A checkpoint represents a completed prompt response or meaningful unit of work.
 
-**Value to TaskPilot:**
+**How checkpoints are merged:**
 
-- Handoffs become clearer.
-- Future agents can quickly understand what was found, decided, blocked, or produced.
-- Dashboard stays readable.
+- Completed work accumulates.
+- Important decisions accumulate.
+- Current state comes from the latest checkpoint.
+- Suggested next steps come from the latest checkpoint only.
+- Older next steps stay in the checkpoint timeline.
+
+```mermaid
+sequenceDiagram
+  participant Agent as Agent
+  participant File as TASKPILOT_HANDOFF_FILE
+  participant CLI as taskpilot checkpoint
+  participant API as TaskPilot API
+  participant DB as Database
+
+  Agent->>File: update after work unit 1
+  Agent->>CLI: handoff checkpoint
+  CLI->>API: POST /handoff-checkpoints
+  API->>DB: save checkpoint 1
+  Agent->>File: update after work unit 2
+  Agent->>CLI: handoff checkpoint
+  CLI->>API: POST /handoff-checkpoints
+  API->>DB: save checkpoint 2
+  API->>DB: rebuild latest handoff draft
+```
+
+**Value:**
+
+The handoff timeline is chronological and action-oriented.
+
+### Handoff validation
+
+**Decision:** Validate handoff quality before trusting it.
+
+TaskPilot warns if:
+
+- Completed work is empty or placeholder text.
+- Important decisions are missing.
+- Remaining work is missing.
+- Handoff message is missing.
+- No checkpoint reached the server.
+
+Example:
+
+```text
+TaskPilot handoff needs attention before another agent can continue reliably:
+  - Completed Work: completed work is required
+  - Important Decisions: important decisions are required
+```
+
+**Value:**
+
+Weak handoffs do not silently become the source of truth.
 
 **Trade-off:**
 
-- Agents must write useful structured updates. `taskpilot run` helps by giving explicit accepted formats.
+This cannot force a model to write perfect content, but it makes failure visible and repairable.
 
-### 10. Locks And Conflict Detection
+## Task Lifecycle
 
-**Decision:** Add task ownership, locks, and conflict detection as first-class coordination concepts.
+```mermaid
+stateDiagram-v2
+  [*] --> ready
+  ready --> claimed: claim
+  claimed --> in_progress: taskpilot run starts
+  in_progress --> claimed: run exits
+  claimed --> blocked: manual
+  in_progress --> blocked: manual
+  claimed --> handoff_ready: publish handoff
+  in_progress --> handoff_ready: manual
+  handoff_ready --> claimed: accept handoff
+  claimed --> in_review: manual
+  in_review --> completed: manual complete
+  claimed --> completed: explicit complete
+  ready --> cancelled: manual
+  claimed --> cancelled: manual
+```
+
+**Decision:** Completion is manual-only.
 
 **Why:**
 
-- Shared memory alone does not prevent duplicate work.
-- Agents need to know when someone else owns a task or file scope.
-- Leads need to see collisions before they become git conflicts.
+An agent session may stop because of interruption, failure, or partial work. That should not mark the task completed.
 
-**Value to TaskPilot:**
+## Locking And Conflict Design
 
-- One active owner per task.
-- File or semantic scopes can be locked.
-- The dashboard can explain why conflicts exist and who is involved.
+**Decision:** Track ownership and locks separately.
 
-**Trade-off:**
+Ownership says who owns the task.
 
-- MVP lock overlap detection is intentionally simple. More advanced file-level and git-aware conflict detection can be added later.
+Locks say what the owner is touching.
 
-### 11. Dashboard Polling Now, SSE Later
+Lock fields include:
 
-**Decision:** Use polling for MVP dashboard updates, while keeping the system ready for Server-Sent Events.
-
-**Why:**
-
-- Polling is simpler and reliable enough for MVP validation.
-- The event model already gives a natural path to SSE.
-- Real-time behavior can be improved incrementally.
-
-**Value to TaskPilot:**
-
-- Dashboard can reflect CLI and agent updates without manual refresh.
-- The implementation remains simple while product behavior is validated.
-
-**Trade-off:**
-
-- Polling is less efficient than SSE and requires careful UI handling so forms do not reset while users type.
-
-### 12. Team Token, Users, And API Keys
-
-**Decision:** Keep legacy team-token login for development, and add user/API-key authentication for more realistic internal usage.
+- Task ID.
+- Scope.
+- Scope type.
+- Owner ID and name.
+- Created time.
+- Last heartbeat.
+- Expiry.
+- Status: active, stale, released, overridden.
+- Release or override reason.
 
 **Why:**
 
-- Team token keeps local demos simple.
-- Human users and agent API keys are needed for accountability.
-- Different actors need different permissions and audit trails.
+A task owner may touch one or more areas. Another task may overlap that scope.
 
-**Value to TaskPilot:**
+**Conflict behavior:**
 
-- Dashboard users can log in.
-- Agents can authenticate with API keys.
-- Events and context entries can be tied to a human or agent identity.
+- Active tasks are checked for ownership and lock conflicts.
+- Completed and cancelled tasks are hidden from open conflicts.
+- Stale claims include reason, threshold, owner, last activity, and suggested actions.
+
+**Value:**
+
+Leads can resolve collisions before they become code conflicts.
+
+## Markdown And JSON Sync
+
+**Decision:** Store structured JSON as source of truth, but let the UI display and edit Markdown.
+
+**Why:**
+
+Developers read Markdown more easily than raw JSON. The backend still needs structured fields for validation, filtering, and handoff generation.
+
+**Flow:**
+
+```text
+JSON -> render Markdown -> user edits Markdown -> strict parser -> JSON -> normalized Markdown
+```
+
+**Validation rules:**
+
+- Required top-level heading.
+- Known sections.
+- Duplicate section errors.
+- Required sections for publish.
+- List sections use `- item`.
+- Unknown sections must be under `Extra Sections`.
+
+**Value:**
+
+The UI is readable, while the backend remains structured.
+
+## Related Context Selection
+
+**Decision:** Inject selected related context, not every task.
+
+TaskPilot selects related context from:
+
+- Parent task.
+- Subtasks.
+- Dependencies.
+- Same project.
+- Same repo.
+- Overlapping scope.
+- Recent relevant work.
+
+**Why:**
+
+Injecting all task history would add noise and may expose unrelated work.
+
+**Value:**
+
+The agent receives useful continuity without drowning in irrelevant context.
 
 **Trade-off:**
 
-- This is not yet a full enterprise identity system. SSO/OIDC can come later if needed.
+Selection is heuristic. Explicit links and better relevance scoring can improve it later.
 
-## Why This Stack Fits The Main Problem
+## Authentication Choices
 
-The main problem is not only storing memory. It is coordinating distributed human-agent work across machines.
+**Decision:** Support both simple internal token auth and stronger user/API-key auth.
 
-TaskPilot needs to support:
+Current options:
 
-- Shared task state.
-- Agent-to-agent handoff.
-- Human dashboard visibility.
-- Ownership and locks.
-- Conflict detection.
-- Structured context transfer.
-- Local-first operation.
-- A future path to shared infrastructure.
+- Team token for internal development.
+- Actor ID and actor secret for legacy CLI identity.
+- API keys for agents.
+- Email/password sessions for humans.
 
-The chosen stack supports that path:
+**Why:**
+
+The project is currently an internal tool, so the primary focus is coordination behavior. But actor identity and auditability still matter.
+
+**Value:**
+
+Teams can start simple and move toward stronger identity when needed.
+
+## Deployment Choices
+
+### Local development
+
+```bash
+taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+```
+
+### Docker shared server
+
+```bash
+docker compose up --build
+```
+
+### Production-like environment
+
+Important env vars:
+
+```text
+TASKPILOT_ENV
+TASKPILOT_HTTP_ADDR
+TASKPILOT_DB_URL
+TASKPILOT_TOKEN
+TASKPILOT_SECRET_KEY
+TASKPILOT_BASE_URL
+TASKPILOT_ARTIFACT_DIR
+TASKPILOT_HEARTBEAT_INTERVAL
+```
+
+Postgres example:
+
+```text
+TASKPILOT_DB_URL=postgres://taskpilot:password@localhost:5432/taskpilot?sslmode=disable
+```
+
+## Why These Choices Fit The Main Problem
+
+TaskPilot needs to coordinate agents across machines, not just store notes.
+
+The stack supports that:
 
 ```text
 Go binary
-  -> easy local installation and agent wrapping
+  easy install and subprocess wrapping
 
-REST JSON API
-  -> interoperable with any agent/tool
+REST API
+  shared path for CLI, dashboard, agents, scripts
 
-React dashboard
-  -> human visibility and governance
+Dashboard
+  human visibility and governance
 
 SQLite
-  -> easy local-first start
+  simple local development
 
 Postgres
-  -> production shared-server scale
+  shared team server
 
 taskpilot run
-  -> automatic agent coordination
+  automatic ownership, prompt injection, heartbeat, handoff validation
 
-context files
-  -> reliable provider-neutral context injection
+Handoff checkpoints
+  transfer-ready memory across long-running sessions
 ```
 
 ## Alternatives Considered
 
-### Browser-only app
+### Chat-only coordination
 
-Rejected because agents need a CLI/API wrapper and filesystem/process integration.
-
-### SaaS-first cloud service
-
-Deferred because the initial requirement is local-first and internal-team friendly.
-
-### Agent-provider-specific SDK
-
-Rejected because TaskPilot must work across Codex, Gemini, and future agents.
+Rejected as the main source of truth because chat is unstructured and easy to lose.
 
 ### Git-only coordination
 
-Rejected because git can show code changes, but not ownership, handoff rationale, decisions, blockers, or live task status.
+Rejected because git tracks code changes, not ownership, decisions, handoffs, blockers, or task state.
 
-### Slack/Chat-based coordination
+### SaaS-first architecture
 
-Rejected as the canonical system because chat is not structured enough for reliable agent continuation.
+Deferred because the current goal is internal self-hosted coordination.
 
-## Current Known Trade-Offs
+### Agent-provider-specific SDK
 
+Rejected because TaskPilot should work with Codex, Gemini, and future agents.
+
+### Rule-only handoff generation
+
+Rejected as the primary handoff source because it produced weak handoffs. It remains useful as fallback evidence.
+
+## Known Trade-Offs
+
+- Agents can still ignore instructions; TaskPilot now warns when handoff quality is weak.
+- Checkpoints are agent-declared, not automatically detected from hidden model internals.
 - Related context selection is useful but heuristic.
-- Dashboard polling works, but SSE would provide cleaner real-time updates.
-- Temporary context files are removed after the run.
-- Some advanced security features are intentionally not prioritized yet because this is currently an internal tool.
-- Artifact sharing is reference-first; raw artifact upload needs stricter approval and audit before broad use.
+- Polling works for the dashboard, but SSE would be cleaner.
+- The current internal-security posture is practical, not enterprise-grade.
+- Raw artifact uploads are intentionally not the default.
 
-## Future Technical Direction
+## Recommended Next Technical Improvements
 
-Recommended next technical improvements:
-
-1. Add `taskpilot run --keep-context` for debugging injected context files.
+1. Add `taskpilot run --keep-context` for easier debugging of injected files.
 2. Add Server-Sent Events for live dashboard updates.
-3. Improve related-context relevance with explicit task links and semantic tags.
-4. Add stronger git integration for branch, PR, and changed-file tracking.
-5. Add production deployment hardening around backups, metrics, and operational docs.
-6. Add richer MCP support so agents can coordinate through tools instead of shell commands.
-
+3. Add an MCP checkpoint tool so agents can save handoffs without shell commands.
+4. Improve related-context scoring with explicit task links and semantic tags.
+5. Add clearer installer scripts for Mac, Windows, and Linux.
+6. Add more dashboard tests around handoff edit and publish flows.
+7. Add backup/restore docs for Postgres deployment.
