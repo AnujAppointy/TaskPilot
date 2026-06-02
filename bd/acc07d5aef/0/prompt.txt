@@ -1,0 +1,15 @@
+# Files mentioned by the user:
+
+## stitch_taskpilot_dashboard_ui_update.zip: /Users/appointy/Downloads/stitch_taskpilot_dashboard_ui_update.zip
+
+## My request for Codex:
+go through this file ui example for the taskpilot  . implement this type of ui design for the taskpilot. dont break the taskpilot working functionality while updating the ui
+
+---
+
+# Files mentioned by the user:
+
+## Screenshot 2026-06-02 at 11.06.38 AM.png: /Users/appointy/Desktop/Screenshot 2026-06-02 at 11.06.38 AM.png
+
+## My request for Codex:
+as you see the task blocks are getting behind the heading of states like here behind claimed , fix this issue , pull down the tasks from heading.

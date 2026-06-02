@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "bdacc07d5aef",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "bin/taskpilot",
+    "internal/taskpilot/static/app.js",
+    "internal/taskpilot/static/index.html",
+    "internal/taskpilot/static/styles.css"
+  ],
+  "sessions": [
+    {
+      "metadata": "/bd/acc07d5aef/0/metadata.json",
+      "transcript": "/bd/acc07d5aef/0/full.jsonl",
+      "content_hash": "/bd/acc07d5aef/0/content_hash.txt",
+      "prompt": "/bd/acc07d5aef/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 526268,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 12427392,
+    "output_tokens": 18768,
+    "api_call_count": 71
+  }
+}
