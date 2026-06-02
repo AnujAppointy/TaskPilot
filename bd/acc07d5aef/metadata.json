@@ -3,7 +3,7 @@
   "checkpoint_id": "bdacc07d5aef",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "bin/taskpilot",
     "internal/taskpilot/static/app.js",
@@ -16,13 +16,19 @@
       "transcript": "/bd/acc07d5aef/0/full.jsonl",
       "content_hash": "/bd/acc07d5aef/0/content_hash.txt",
       "prompt": "/bd/acc07d5aef/0/prompt.txt"
+    },
+    {
+      "metadata": "/bd/acc07d5aef/1/metadata.json",
+      "transcript": "/bd/acc07d5aef/1/full.jsonl",
+      "content_hash": "/bd/acc07d5aef/1/content_hash.txt",
+      "prompt": "/bd/acc07d5aef/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 526268,
+    "input_tokens": 3860959,
     "cache_creation_tokens": 0,
-    "cache_read_tokens": 12427392,
-    "output_tokens": 18768,
-    "api_call_count": 71
+    "cache_read_tokens": 27193856,
+    "output_tokens": 59611,
+    "api_call_count": 260
   }
 }
