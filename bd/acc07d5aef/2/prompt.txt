@@ -1,0 +1,40 @@
+make a doc explaining that how the current taskpilot is working from server level , Postgres and local sql lite , when which of the one is triggered , how they connected and working
+
+---
+
+i want to see the data in the postgress how to see it
+
+---
+
+if i want to deploy the server and frontend of the taskpilot what should i use for free tiers
+
+---
+
+what is better prisma postgres or supabase
+
+---
+
+before going for deploy , let me clear a one important aspect , as we know currently taskpilot has 2 entry point on eis dashboard and one is on machine taskpilot clli on which agent is working . so if we deploy the server and dashboard , then the changes done in the cli will reflect on the deployed server or not ?
+
+---
+
+# Selected text:
+
+## Selection 1
+taskpilot login --server https://your-app-url --token YOUR_TOKEN
+taskpilot config set-actor <actor-id> <actor-secret>
+
+## My request for Codex:
+but when someone coming for the first time they will not have token , actor id and actor secret
+
+---
+
+how to change the team token
+
+---
+
+but every team should have diferent team token , team token main purpose is that the particular team will only saw there particular task and project
+
+---
+
+ok now give me step by step guidance for deploying taskpilot into the render and supabase

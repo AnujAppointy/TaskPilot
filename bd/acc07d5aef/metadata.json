@@ -3,9 +3,10 @@
   "checkpoint_id": "bdacc07d5aef",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 3,
+  "checkpoints_count": 12,
   "files_touched": [
     "bin/taskpilot",
+    "docs/STORAGE_AND_SERVER_FLOW.md",
     "internal/taskpilot/static/app.js",
     "internal/taskpilot/static/index.html",
     "internal/taskpilot/static/styles.css"
@@ -22,13 +23,19 @@
       "transcript": "/bd/acc07d5aef/1/full.jsonl",
       "content_hash": "/bd/acc07d5aef/1/content_hash.txt",
       "prompt": "/bd/acc07d5aef/1/prompt.txt"
+    },
+    {
+      "metadata": "/bd/acc07d5aef/2/metadata.json",
+      "transcript": "/bd/acc07d5aef/2/full.jsonl",
+      "content_hash": "/bd/acc07d5aef/2/content_hash.txt",
+      "prompt": "/bd/acc07d5aef/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 3860959,
+    "input_tokens": 4276255,
     "cache_creation_tokens": 0,
-    "cache_read_tokens": 27193856,
-    "output_tokens": 59611,
-    "api_call_count": 260
+    "cache_read_tokens": 28219520,
+    "output_tokens": 73183,
+    "api_call_count": 279
   }
 }
