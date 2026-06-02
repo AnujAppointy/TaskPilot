@@ -465,14 +465,14 @@ function stat(label, value) {
 
 function navIcon(tab) {
   const icons = {
-    board: "▦",
-    detail: "◷",
-    projects: "□",
-    conflicts: "!",
-    actors: "○",
-    handoffs: "↗",
-    admin: "⌘",
-    settings: "⚙",
+    board: "dashboard",
+    detail: "schedule",
+    projects: "inventory_2",
+    conflicts: "report",
+    actors: "groups",
+    handoffs: "call_split",
+    admin: "admin_panel_settings",
+    settings: "settings",
   };
   return icons[tab] || "•";
 }
@@ -480,6 +480,14 @@ function navIcon(tab) {
 function board() {
   const tasks = filteredTasks();
   return h("div", { class: "board-page" },
+    h("div", { class: "page-heading" },
+      h("div", {},
+        h("p", { class: "eyebrow" }, "Workspace"),
+        h("h1", {}, "Main Kanban Board"),
+        h("p", { class: "meta" }, "Coordinate humans and agents across claims, locks, handoffs, and task memory.")
+      ),
+      canWrite() ? h("button", { class: "primary", onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, "+ New Task") : null
+    ),
     projectFilter(),
     taskFilters(),
     stats(),
