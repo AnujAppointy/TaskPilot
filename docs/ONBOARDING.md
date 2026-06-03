@@ -176,7 +176,7 @@ Good handoff sections:
 Local development:
 
 ```bash
-taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db
 ```
 
 Docker with Postgres:
@@ -206,18 +206,6 @@ Another laptop:
 http://<server-lan-ip>:8080
 ```
 
-Current Docker token:
-
-```text
-change-this-team-token-before-use
-```
-
-Local SQLite default token:
-
-```text
-dev-token
-```
-
 ### 3. Install the CLI on PATH
 
 Agents should be able to run `taskpilot` from any repo.
@@ -225,38 +213,59 @@ Agents should be able to run `taskpilot` from any repo.
 Mac/Linux:
 
 ```bash
-mkdir -p ~/.local/bin
-ln -sf "/path/to/taskpilot" ~/.local/bin/taskpilot
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Windows:
-
-```text
-Put taskpilot.exe in C:\Tools\taskpilot
-Add C:\Tools\taskpilot to Windows Path
-```
-
-Check:
-
-```bash
-taskpilot task list
-```
-
-### 4. Login and register actors
-
-Mac:
-
-```bash
-taskpilot login --server http://127.0.0.1:8080 --token change-this-team-token-before-use
-taskpilot actor register --name "Codex CLI - Mac" --kind agent --machine macbook
+git pull
+make install
 ```
 
 Windows:
 
 ```powershell
-taskpilot login --server http://<server-lan-ip>:8080 --token change-this-team-token-before-use
-taskpilot actor register --name "Gemini CLI - Windows" --kind agent --machine windows-laptop
+git pull
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+Check:
+
+```bash
+taskpilot config show
+```
+
+Mac/Linux should show `~/.local/bin/taskpilot`:
+
+```bash
+which taskpilot
+ls -l "$(which taskpilot)"
+```
+
+Windows should show `%USERPROFILE%\.local\bin\taskpilot.exe`:
+
+```powershell
+where.exe taskpilot
+Get-Item (where.exe taskpilot | Select-Object -First 1) | Format-List FullName,Length,LastWriteTime
+```
+
+### 4. Log in and connect an actor
+
+Dashboard login is email/password only. Actor management happens after login.
+
+1. Open the TaskPilot dashboard.
+2. Sign up or log in with email and password.
+3. Open **Actors**.
+4. Create an actor for the agent or developer mode, such as `anuj_codex`, `anuj_gemini`, or `rahul_claude`.
+5. Open **Settings** and copy the CLI setup command for that actor.
+
+Mac example:
+
+```bash
+taskpilot login --server http://127.0.0.1:8080 --email anuj@company.com
+taskpilot config set-actor <actor-id> <actor-secret>
+```
+
+Windows example:
+
+```powershell
+taskpilot login --server http://<server-lan-ip>:8080 --email teammate@company.com
+taskpilot config set-actor <actor-id> <actor-secret>
 ```
 
 ## Everyday Workflow
@@ -570,21 +579,9 @@ which taskpilot
 taskpilot task list
 ```
 
-### Dashboard token rejected
+### Dashboard login rejected
 
-Use the token that matches the running server.
-
-Docker compose currently uses:
-
-```text
-change-this-team-token-before-use
-```
-
-Local `serve` default uses:
-
-```text
-dev-token
-```
+Use the email and password created from the dashboard signup flow. TaskPilot no longer uses dashboard team tokens.
 
 If browser state is stale:
 

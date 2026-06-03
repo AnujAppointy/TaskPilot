@@ -103,7 +103,7 @@ In this mode:
 Local example from the repo:
 
 ```bash
-./bin/taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+./bin/taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db
 ```
 
 ## When Postgres Is Triggered
@@ -234,7 +234,7 @@ Those temporary files are not the main system of record. The server database is.
 Most user-facing coordination commands go through the server, including:
 
 - `login` only saves local CLI config
-- `actor register`
+- actor creation from the dashboard
 - `task create|list|show|claim|status|complete`
 - `context append`
 - `decision add|list`

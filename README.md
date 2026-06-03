@@ -58,23 +58,28 @@ The CLI should be available as `taskpilot` from any repo. This is important beca
 Mac/Linux:
 
 ```bash
-go build -o bin/taskpilot ./cmd/taskpilot
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/taskpilot" ~/.local/bin/taskpilot
-export PATH="$HOME/.local/bin:$PATH"
+git pull
+make install
 ```
 
 Windows:
 
-```text
-Put taskpilot.exe in C:\Tools\taskpilot
-Add C:\Tools\taskpilot to Windows Path
+```powershell
+git pull
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 ```
 
 Check:
 
 ```bash
-taskpilot task list
+which taskpilot      # Mac/Linux
+taskpilot config show
+```
+
+On Mac/Linux, keep this in `~/.zshrc` or your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## Run The Server
@@ -82,8 +87,8 @@ taskpilot task list
 Local SQLite development:
 
 ```bash
-go build -o bin/taskpilot ./cmd/taskpilot
-./bin/taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+make install
+taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db
 ```
 
 Open:
@@ -95,19 +100,7 @@ http://127.0.0.1:8080
 Docker with Postgres:
 
 ```bash
-docker compose up --build
-```
-
-The current Docker compose development token is:
-
-```text
-change-this-team-token-before-use
-```
-
-The local SQLite default token is:
-
-```text
-dev-token
+docker compose up -d --build
 ```
 
 Health checks:
@@ -117,25 +110,28 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/readyz
 ```
 
-## CLI Login
+## CLI Setup
+
+TaskPilot dashboard login uses only email and password. Actor setup happens after login:
+
+1. Open the dashboard.
+2. Sign up or log in with email and password.
+3. Open **Actors**.
+4. Create or select your actor, for example `anuj_codex` or `rahul_gemini`.
+5. Open **Settings** and copy the CLI setup command for that actor.
 
 For the machine running the server:
 
 ```bash
-taskpilot login --server http://127.0.0.1:8080 --token change-this-team-token-before-use
+taskpilot login --server http://127.0.0.1:8080 --email anuj@company.com
+taskpilot config set-actor <actor-id> <actor-secret>
 ```
 
 For another laptop on the same network:
 
 ```bash
-taskpilot login --server http://<server-lan-ip>:8080 --token change-this-team-token-before-use
-```
-
-Register an agent:
-
-```bash
-taskpilot actor register --name "Codex CLI - Mac" --kind agent --machine macbook
-taskpilot actor register --name "Gemini CLI - Windows" --kind agent --machine windows-laptop
+taskpilot login --server http://<server-lan-ip>:8080 --email teammate@company.com
+taskpilot config set-actor <actor-id> <actor-secret>
 ```
 
 ## Basic Task Flow

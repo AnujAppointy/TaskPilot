@@ -482,7 +482,7 @@ Teams can start simple and move toward stronger identity when needed.
 ### Local development
 
 ```bash
-taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db --token dev-token
+taskpilot serve --addr 127.0.0.1:8080 --db taskpilot.db
 ```
 
 ### Docker shared server
@@ -499,7 +499,6 @@ Important env vars:
 TASKPILOT_ENV
 TASKPILOT_HTTP_ADDR
 TASKPILOT_DB_URL
-TASKPILOT_TOKEN
 TASKPILOT_SECRET_KEY
 TASKPILOT_BASE_URL
 TASKPILOT_ARTIFACT_DIR
@@ -578,6 +577,6 @@ Rejected as the primary handoff source because it produced weak handoffs. It rem
 2. Add Server-Sent Events for live dashboard updates.
 3. Add an MCP checkpoint tool so agents can save handoffs without shell commands.
 4. Improve related-context scoring with explicit task links and semantic tags.
-5. Add clearer installer scripts for Mac, Windows, and Linux.
+5. Add a release/version command so teammates can compare installed binaries quickly.
 6. Add more dashboard tests around handoff edit and publish flows.
 7. Add backup/restore docs for Postgres deployment.
