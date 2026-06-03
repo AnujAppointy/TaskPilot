@@ -24,7 +24,6 @@ services:
       - 0.0.0.0:8080
       - --production
     environment:
-      TASKPILOT_TOKEN: change-this-team-token-before-use
       TASKPILOT_SECRET_KEY: change-this-secret-key-to-at-least-32-characters
       TASKPILOT_BASE_URL: http://localhost:8080
       TASKPILOT_ARTIFACT_DIR: /artifacts

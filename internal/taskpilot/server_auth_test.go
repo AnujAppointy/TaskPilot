@@ -12,51 +12,35 @@ import (
 	"time"
 )
 
-func TestAPIKeyScopeEnforcementOnRoutes(t *testing.T) {
-	ctx := context.Background()
+func TestActorSecretAuthOnRoutes(t *testing.T) {
 	store := testStore(t)
 	actor := testActor(t, store, "Scoped Agent")
-	viewer, err := store.CreateAPIKey(ctx, "viewer", actor.ID, "viewer", []string{"task:read"}, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	admin, err := store.CreateAPIKey(ctx, "admin", actor.ID, "admin", []string{"admin"}, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
 	server := NewServer(store, "dev-token")
 
-	getTasks := authReq(t, server, "GET", "/api/tasks", nil, viewer.Secret)
+	getTasks := actorReq(t, server, "GET", "/api/tasks", nil, actor.ID, actor.Secret)
 	if getTasks.Code != http.StatusOK {
-		t.Fatalf("viewer task read status=%d body=%s", getTasks.Code, getTasks.Body.String())
+		t.Fatalf("actor task read status=%d body=%s", getTasks.Code, getTasks.Body.String())
 	}
-	createTask := authReq(t, server, "POST", "/api/tasks", map[string]any{"title": "Task", "goal": "Goal"}, viewer.Secret)
-	if createTask.Code != http.StatusForbidden {
-		t.Fatalf("viewer task write should be forbidden, status=%d body=%s", createTask.Code, createTask.Body.String())
+	createTask := actorReq(t, server, "POST", "/api/tasks", map[string]any{"title": "Task", "goal": "Goal"}, actor.ID, actor.Secret)
+	if createTask.Code != http.StatusOK {
+		t.Fatalf("actor task write status=%d body=%s", createTask.Code, createTask.Body.String())
 	}
-	createUser := authReq(t, server, "POST", "/api/users", map[string]any{
-		"email": "new@example.com", "name": "New User", "password": "strong-password", "role": "developer",
-	}, admin.Secret)
-	if createUser.Code != http.StatusOK {
-		t.Fatalf("admin create user status=%d body=%s", createUser.Code, createUser.Body.String())
+	bad := actorReq(t, server, "GET", "/api/tasks", nil, actor.ID, "wrong-secret")
+	if bad.Code != http.StatusUnauthorized {
+		t.Fatalf("bad actor secret should be unauthorized, status=%d body=%s", bad.Code, bad.Body.String())
 	}
 }
 
-func TestSessionLoginPasswordAndAdminKeyRoutes(t *testing.T) {
+func TestSessionLoginPasswordAndUserRoutes(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
-	actor := testActor(t, store, "Agent")
-	adminUser, err := store.CreateUser(ctx, "admin@example.com", "Admin", "strong-password", "admin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.CreateUser(ctx, "viewer@example.com", "Viewer", "strong-password", "viewer")
+	user, err := store.CreateUser(ctx, "dev@example.com", "Developer", "strong-password", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := NewServer(store, "dev-token")
 
-	login := req(t, server, "POST", "/api/auth/login", map[string]any{"email": "admin@example.com", "password": "strong-password"})
+	login := req(t, server, "POST", "/api/auth/login", map[string]any{"email": "dev@example.com", "password": "strong-password"})
 	if login.Code != http.StatusOK {
 		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
 	}
@@ -65,65 +49,19 @@ func TestSessionLoginPasswordAndAdminKeyRoutes(t *testing.T) {
 	if me.Code != http.StatusOK {
 		t.Fatalf("me status=%d body=%s", me.Code, me.Body.String())
 	}
-	createKey := reqWithCookie(t, server, "POST", "/api/api-keys", map[string]any{
-		"name": "agent key", "actor_id": actor.ID, "role": "agent", "scopes": []string{"task:read"},
-	}, cookie)
-	if createKey.Code != http.StatusOK {
-		t.Fatalf("create key status=%d body=%s", createKey.Code, createKey.Body.String())
-	}
-	var key APIKey
-	if err := json.Unmarshal(createKey.Body.Bytes(), &key); err != nil {
-		t.Fatal(err)
-	}
-	if key.Secret == "" {
-		t.Fatal("expected one-time raw api key on create")
-	}
-	listKeys := reqWithCookie(t, server, "GET", "/api/api-keys", nil, cookie)
-	if listKeys.Code != http.StatusOK {
-		t.Fatalf("list keys status=%d body=%s", listKeys.Code, listKeys.Body.String())
-	}
-	if strings.Contains(listKeys.Body.String(), key.Secret) {
-		t.Fatal("list api keys leaked raw secret")
-	}
-	revoke := reqWithCookie(t, server, "DELETE", "/api/api-keys/"+key.ID, nil, cookie)
-	if revoke.Code != http.StatusOK {
-		t.Fatalf("revoke key status=%d body=%s", revoke.Code, revoke.Body.String())
-	}
-	if _, err := store.VerifyAPIKey(ctx, key.Secret); err == nil {
-		t.Fatal("expected revoked api key to stop authenticating")
+	createTask := reqWithCookie(t, server, "POST", "/api/tasks", map[string]any{"title": "Session Task", "goal": "Check session write"}, cookie)
+	if createTask.Code != http.StatusOK {
+		t.Fatalf("session user create task status=%d body=%s", createTask.Code, createTask.Body.String())
 	}
 	change := reqWithCookie(t, server, "POST", "/api/me/password", map[string]any{"current_password": "strong-password", "new_password": "new-strong-password"}, cookie)
 	if change.Code != http.StatusOK {
 		t.Fatalf("change password status=%d body=%s", change.Code, change.Body.String())
 	}
-	if _, err := store.AuthenticateUser(ctx, adminUser.Email, "strong-password"); err == nil {
+	if _, err := store.AuthenticateUser(ctx, user.Email, "strong-password"); err == nil {
 		t.Fatal("old password should no longer authenticate")
 	}
-	if _, err := store.AuthenticateUser(ctx, adminUser.Email, "new-strong-password"); err != nil {
+	if _, err := store.AuthenticateUser(ctx, user.Email, "new-strong-password"); err != nil {
 		t.Fatalf("new password should authenticate: %v", err)
-	}
-}
-
-func TestViewerSessionCannotMutateAdminRoutes(t *testing.T) {
-	ctx := context.Background()
-	store := testStore(t)
-	_, err := store.CreateUser(ctx, "viewer@example.com", "Viewer", "strong-password", "viewer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := NewServer(store, "dev-token")
-	login := req(t, server, "POST", "/api/auth/login", map[string]any{"email": "viewer@example.com", "password": "strong-password"})
-	if login.Code != http.StatusOK {
-		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
-	}
-	cookie := login.Result().Cookies()[0]
-	users := reqWithCookie(t, server, "GET", "/api/users", nil, cookie)
-	if users.Code != http.StatusForbidden {
-		t.Fatalf("viewer users route should be forbidden, status=%d body=%s", users.Code, users.Body.String())
-	}
-	taskCreate := reqWithCookie(t, server, "POST", "/api/tasks", map[string]any{"title": "Task", "goal": "Goal"}, cookie)
-	if taskCreate.Code != http.StatusForbidden {
-		t.Fatalf("viewer task create should be forbidden, status=%d body=%s", taskCreate.Code, taskCreate.Body.String())
 	}
 }
 
@@ -137,13 +75,6 @@ func TestProtectedRoutesRequireAuth(t *testing.T) {
 	}{
 		{"GET", "/api/me", nil},
 		{"POST", "/api/me/password", map[string]any{}},
-		{"GET", "/api/users", nil},
-		{"POST", "/api/users", map[string]any{}},
-		{"PATCH", "/api/users/user_missing", map[string]any{}},
-		{"POST", "/api/users/user_missing/password", map[string]any{}},
-		{"GET", "/api/api-keys", nil},
-		{"POST", "/api/api-keys", map[string]any{}},
-		{"DELETE", "/api/api-keys/key_missing", nil},
 		{"GET", "/api/projects", nil},
 		{"POST", "/api/projects", map[string]any{}},
 		{"GET", "/api/repositories", nil},
@@ -198,10 +129,6 @@ func TestEventsStreamSendsExistingEvents(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	actor := testActor(t, store, "Stream Agent")
-	key, err := store.CreateAPIKey(ctx, "stream", actor.ID, "viewer", []string{"task:read"}, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, err := store.CreateTask(ctx, actor.ID, TaskInput{Title: "Stream Task", Goal: "Check stream"}); err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +136,8 @@ func TestEventsStreamSendsExistingEvents(t *testing.T) {
 	reqCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	r := httptest.NewRequestWithContext(reqCtx, "GET", "/api/events/stream?since=0", nil)
-	r.Header.Set("Authorization", "ApiKey "+key.Secret)
+	r.Header.Set("X-Actor-ID", actor.ID)
+	r.Header.Set("X-Actor-Secret", actor.Secret)
 	rec := httptest.NewRecorder()
 	server.ServeHTTP(rec, r)
 	res := rec.Result()
@@ -226,7 +154,7 @@ func TestEventsStreamSendsExistingEvents(t *testing.T) {
 	}
 }
 
-func authReq(t *testing.T, h http.Handler, method, path string, body any, apiKey string) *httptest.ResponseRecorder {
+func actorReq(t *testing.T, h http.Handler, method, path string, body any, actorID, actorSecret string) *httptest.ResponseRecorder {
 	t.Helper()
 	var rbody *bytes.Reader
 	if body == nil {
@@ -240,7 +168,8 @@ func authReq(t *testing.T, h http.Handler, method, path string, body any, apiKey
 	}
 	r := httptest.NewRequest(method, path, rbody)
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "ApiKey "+apiKey)
+	r.Header.Set("X-Actor-ID", actorID)
+	r.Header.Set("X-Actor-Secret", actorSecret)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	return rec

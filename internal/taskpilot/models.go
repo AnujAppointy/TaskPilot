@@ -22,34 +22,19 @@ type User struct {
 	ID         string     `json:"id"`
 	Email      string     `json:"email"`
 	Name       string     `json:"name"`
-	Role       string     `json:"role"`
 	Active     bool       `json:"active"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 }
 
-type APIKey struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	ActorID   string     `json:"actor_id"`
-	Role      string     `json:"role"`
-	Scopes    []string   `json:"scopes"`
-	Prefix    string     `json:"prefix"`
-	Secret    string     `json:"api_key,omitempty"`
-	CreatedBy string     `json:"created_by"`
-	CreatedAt time.Time  `json:"created_at"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
-}
-
 type Principal struct {
 	ID      string   `json:"id"`
 	Kind    string   `json:"kind"`
-	Role    string   `json:"role"`
 	ActorID string   `json:"actor_id,omitempty"`
 	UserID  string   `json:"user_id,omitempty"`
 	Email   string   `json:"email,omitempty"`
 	Name    string   `json:"name,omitempty"`
-	Scopes  []string `json:"scopes,omitempty"`
+	Scopes  []string `json:"-"`
 }
 
 type Project struct {

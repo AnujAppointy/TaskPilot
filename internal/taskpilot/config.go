@@ -2,7 +2,6 @@ package taskpilot
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
@@ -11,21 +10,18 @@ import (
 type ServerConfig struct {
 	Addr        string
 	DBPath      string
-	Token       string
 	SecretKey   string
 	BaseURL     string
 	ArtifactDir string
 	Production  bool
 }
 
-func LoadServerConfig(addrFlag, dbFlag, tokenFlag string, production bool) ServerConfig {
+func LoadServerConfig(addrFlag, dbFlag, _ string, production bool) ServerConfig {
 	addr := firstNonEmpty(addrFlag, os.Getenv("TASKPILOT_HTTP_ADDR"), "127.0.0.1:8080")
 	db := firstNonEmpty(os.Getenv("TASKPILOT_DB_URL"), dbFlag, "taskpilot.db")
-	token := firstNonEmpty(tokenFlag, os.Getenv("TASKPILOT_TOKEN"), "dev-token")
 	return ServerConfig{
 		Addr:        addr,
 		DBPath:      db,
-		Token:       token,
 		SecretKey:   os.Getenv("TASKPILOT_SECRET_KEY"),
 		BaseURL:     os.Getenv("TASKPILOT_BASE_URL"),
 		ArtifactDir: firstNonEmpty(os.Getenv("TASKPILOT_ARTIFACT_DIR"), "artifacts"),
@@ -34,13 +30,6 @@ func LoadServerConfig(addrFlag, dbFlag, tokenFlag string, production bool) Serve
 }
 
 func (c ServerConfig) Validate() error {
-	host, _, _ := net.SplitHostPort(c.Addr)
-	exposed := host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1"
-	if c.Token == "" || c.Token == "dev-token" {
-		if exposed || c.Production {
-			return userErr("validation", "refusing to expose server with default token; set TASKPILOT_TOKEN or pass --token with a strong value")
-		}
-	}
 	if c.Production && len(c.SecretKey) < 32 {
 		return userErr("validation", "production mode requires TASKPILOT_SECRET_KEY with at least 32 characters")
 	}

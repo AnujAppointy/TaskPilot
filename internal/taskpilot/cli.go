@@ -25,8 +25,6 @@ import (
 
 type Config struct {
 	Server      string `json:"server"`
-	Token       string `json:"token"`
-	APIKey      string `json:"api_key,omitempty"`
 	Email       string `json:"email,omitempty"`
 	ActorID     string `json:"actor_id"`
 	ActorSecret string `json:"actor_secret"`
@@ -42,10 +40,9 @@ func Run(args []string) error {
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		addr := fs.String("addr", "127.0.0.1:8080", "listen address")
 		db := fs.String("db", "taskpilot.db", "SQLite database path")
-		token := fs.String("token", getenv("TASKPILOT_TOKEN", "dev-token"), "team token")
 		production := fs.Bool("production", false, "enforce production safety checks")
 		_ = fs.Parse(args[1:])
-		return ListenAndServeConfig(LoadServerConfig(*addr, *db, *token, *production))
+		return ListenAndServeConfig(LoadServerConfig(*addr, *db, "", *production))
 	case "login":
 		return runLogin(args[1:])
 	case "run":
@@ -60,16 +57,12 @@ func Run(args []string) error {
 		return runRepo(args[1:])
 	case "workspace":
 		return runWorkspace(args[1:])
-	case "api-key":
-		return runAPIKey(args[1:])
 	case "git":
 		return runGit(args[1:])
 	case "artifact":
 		return runArtifact(args[1:])
 	case "migrate":
 		return runMigrate(args[1:])
-	case "admin":
-		return runAdmin(args[1:])
 	case "backup":
 		return runBackup(args[1:])
 	case "config":
@@ -97,27 +90,21 @@ func usage() {
 	fmt.Print(`TaskPilot
 
 Server:
-  taskpilot serve --addr 0.0.0.0:8080 --db taskpilot.db --token dev-token
+  taskpilot serve --addr 0.0.0.0:8080 --db taskpilot.db
 
 Config:
   taskpilot login --server http://127.0.0.1:8080 --email anuj@company.com
-  taskpilot login --server http://127.0.0.1:8080 --api-key tpk_...
   taskpilot config show
   taskpilot config set-server http://127.0.0.1:8080
   taskpilot config set-email anuj@company.com
-  taskpilot config set-api-key tpk_...
   taskpilot config set-actor actor_... <actor-secret>
 
-Production auth bootstrap:
-  taskpilot admin create-user --email admin@example.com --name Admin --password "change-me-strong" --role admin
-  taskpilot admin create-actor --name "Codex Agent" --kind agent --machine anuj-mac
- taskpilot admin create-api-key --name "Lead key" --actor <actor-id> --role admin --scope admin
+Bootstrap:
   taskpilot project create --name "Appointy Backend"
   taskpilot repo create --project <project-id> --name appointy-api --path /path/to/repo
   taskpilot workspace create --project <project-id> --name "Anuj Mac" --actor <actor-id>
 
 Agent CLI:
- taskpilot actor register --name "Codex on Anuj Mac" --kind agent --machine anuj-mac
   taskpilot task create --title "Fix signup bug" --goal "Resolve invited-user signup failure" --scope "src/auth/*" --project <project-id>
   taskpilot task list
  taskpilot task show <task-id>
@@ -125,8 +112,8 @@ Agent CLI:
   taskpilot task depend <task-id> --on <dependency-task-id>
   taskpilot task claim <task-id>
   taskpilot lock acquire <task-id> --scope "src/auth/*"
-  taskpilot context append <task-id> --kind decision --content "Keep token format unchanged"
-  taskpilot decision add <task-id> --decision "Keep token format unchanged" --reason "Existing links depend on it"
+  taskpilot context append <task-id> --kind decision --content "Keep response shape stable"
+  taskpilot decision add <task-id> --decision "Keep response shape stable" --reason "Existing clients depend on it"
   taskpilot comment add <task-id> --body "Please review edge cases before merge"
   taskpilot artifact add <task-id> --kind pr --title "Signup fix PR" --uri https://github.com/org/repo/pull/42
   taskpilot git link-branch <task-id>
@@ -1671,139 +1658,6 @@ func runMigrate(args []string) error {
 	return nil
 }
 
-func runAdmin(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot admin create-user|create-actor|reset-password|create-api-key")
-	}
-	switch args[0] {
-	case "create-user":
-		fs := flag.NewFlagSet("admin create-user", flag.ExitOnError)
-		email := fs.String("email", "", "user email")
-		name := fs.String("name", "", "display name")
-		password := fs.String("password", "", "password")
-		role := fs.String("role", "developer", "admin, maintainer, developer, or viewer")
-		db := fs.String("db", firstNonEmpty(os.Getenv("TASKPILOT_DB_URL"), "taskpilot.db"), "SQLite database path")
-		jsonOut := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		store, err := OpenStore(*db)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-		out, err := store.CreateUser(context.Background(), *email, *name, *password, *role)
-		if err != nil {
-			return err
-		}
-		return print(out, *jsonOut)
-	case "create-actor":
-		fs := flag.NewFlagSet("admin create-actor", flag.ExitOnError)
-		name := fs.String("name", "", "actor name")
-		kind := fs.String("kind", "agent", "human or agent")
-		machine := fs.String("machine", "", "machine name")
-		db := fs.String("db", firstNonEmpty(os.Getenv("TASKPILOT_DB_URL"), "taskpilot.db"), "SQLite database path")
-		jsonOut := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		store, err := OpenStore(*db)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-		out, err := store.RegisterActor(context.Background(), *name, *kind, *machine)
-		if err != nil {
-			return err
-		}
-		return print(out, *jsonOut)
-	case "create-api-key":
-		fs := flag.NewFlagSet("admin create-api-key", flag.ExitOnError)
-		name := fs.String("name", "", "key name")
-		actor := fs.String("actor", "", "actor id")
-		role := fs.String("role", "agent", "admin, maintainer, developer, agent, or viewer")
-		scopes := multiFlag{}
-		fs.Var(&scopes, "scope", "scope; repeat for multiple")
-		db := fs.String("db", firstNonEmpty(os.Getenv("TASKPILOT_DB_URL"), "taskpilot.db"), "SQLite database path")
-		jsonOut := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		store, err := OpenStore(*db)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-		out, err := store.CreateAPIKey(context.Background(), *name, *actor, *role, []string(scopes), "local-admin")
-		if err != nil {
-			return err
-		}
-		return print(out, *jsonOut)
-	case "reset-password":
-		fs := flag.NewFlagSet("admin reset-password", flag.ExitOnError)
-		userID := fs.String("user", "", "user id")
-		password := fs.String("password", "", "new password")
-		db := fs.String("db", firstNonEmpty(os.Getenv("TASKPILOT_DB_URL"), "taskpilot.db"), "SQLite database path")
-		_ = fs.Parse(args[1:])
-		if *userID == "" {
-			return fmt.Errorf("--user is required")
-		}
-		store, err := OpenStore(*db)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-		if err := store.ChangeUserPassword(context.Background(), "local-admin", *userID, "", *password, false); err != nil {
-			return err
-		}
-		fmt.Println("password reset")
-		return nil
-	default:
-		return fmt.Errorf("unknown admin command %q", args[0])
-	}
-}
-
-func runAPIKey(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot api-key set|create|list|revoke")
-	}
-	switch args[0] {
-	case "set":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: taskpilot api-key set <api-key>")
-		}
-		cfg, _ := loadConfig()
-		cfg.APIKey = args[1]
-		return saveConfig(cfg)
-	case "create":
-		fs := flag.NewFlagSet("api-key create", flag.ExitOnError)
-		name := fs.String("name", "", "key name")
-		actor := fs.String("actor", "", "actor id")
-		role := fs.String("role", "agent", "admin, maintainer, developer, agent, or viewer")
-		scopes := multiFlag{}
-		fs.Var(&scopes, "scope", "scope; repeat for multiple")
-		jsonOut := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		var out APIKey
-		body := map[string]any{"name": *name, "actor_id": *actor, "role": *role, "scopes": []string(scopes)}
-		if err := request("POST", "/api/api-keys", body, &out); err != nil {
-			return err
-		}
-		return print(out, *jsonOut)
-	case "list":
-		var out []APIKey
-		if err := request("GET", "/api/api-keys", nil, &out); err != nil {
-			return err
-		}
-		return print(out, has(args, "--json"))
-	case "revoke":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: taskpilot api-key revoke <key-id>")
-		}
-		if err := request("DELETE", "/api/api-keys/"+args[1], nil, nil); err != nil {
-			return err
-		}
-		fmt.Println("api key revoked")
-		return nil
-	default:
-		return fmt.Errorf("unknown api-key command %q", args[0])
-	}
-}
-
 func runProject(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: taskpilot project create|list")
@@ -1935,20 +1789,16 @@ func runLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	server := fs.String("server", "http://127.0.0.1:8080", "server URL")
 	email := fs.String("email", "", "user email for local CLI identity notes")
-	token := fs.String("token", "", "deprecated team token")
-	apiKey := fs.String("api-key", "", "production API key")
 	_ = fs.Parse(args)
 	cfg, _ := loadConfig()
 	cfg.Server = strings.TrimRight(*server, "/")
 	cfg.Email = strings.TrimSpace(*email)
-	cfg.Token = *token
-	cfg.APIKey = *apiKey
 	return saveConfig(cfg)
 }
 
 func runConfig(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: taskpilot config show|set-server|set-email|set-api-key <value> OR taskpilot config set-actor <actor-id> <actor-secret>")
+		return fmt.Errorf("usage: taskpilot config show|set-server|set-email OR taskpilot config set-actor <actor-id> <actor-secret>")
 	}
 	cfg, _ := loadConfig()
 	switch args[0] {
@@ -1960,12 +1810,8 @@ func runConfig(args []string) error {
 			"has_secret": cfg.ActorSecret != "",
 			"auth":       "actor_secret",
 		}
-		if cfg.APIKey != "" {
-			safe["auth"] = "api_key"
-		} else if cfg.ActorID == "" || cfg.ActorSecret == "" {
+		if cfg.ActorID == "" || cfg.ActorSecret == "" {
 			safe["auth"] = "not_configured"
-		} else if cfg.Token != "" {
-			safe["deprecated_team_token_configured"] = true
 		}
 		b, _ := json.MarshalIndent(safe, "", "  ")
 		fmt.Println(string(b))
@@ -1980,16 +1826,6 @@ func runConfig(args []string) error {
 			return fmt.Errorf("usage: taskpilot config set-email <email>")
 		}
 		cfg.Email = strings.TrimSpace(args[1])
-	case "set-token":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: taskpilot config set-token <token>")
-		}
-		cfg.Token = args[1]
-	case "set-api-key":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: taskpilot config set-api-key <key>")
-		}
-		cfg.APIKey = args[1]
 	case "set-actor":
 		if len(args) < 3 {
 			return fmt.Errorf("usage: taskpilot config set-actor <actor-id> <actor-secret>")
@@ -2004,25 +1840,9 @@ func runConfig(args []string) error {
 
 func runActor(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot actor register|list")
+		return fmt.Errorf("usage: taskpilot actor list")
 	}
 	switch args[0] {
-	case "register":
-		fs := flag.NewFlagSet("actor register", flag.ExitOnError)
-		name := fs.String("name", "", "actor name")
-		kind := fs.String("kind", "agent", "human or agent")
-		machine := fs.String("machine", "", "machine name")
-		jsonOut := fs.Bool("json", false, "print JSON")
-		_ = fs.Parse(args[1:])
-		var out Actor
-		if err := requestNoActor("POST", "/api/actors/register", map[string]any{"name": *name, "kind": *kind, "machine_name": *machine}, &out); err != nil {
-			return err
-		}
-		cfg, _ := loadConfig()
-		cfg.ActorID = out.ID
-		cfg.ActorSecret = out.Secret
-		_ = saveConfig(cfg)
-		return print(out, *jsonOut)
 	case "list":
 		var out []Actor
 		if err := request("GET", "/api/actors", nil, &out); err != nil {
@@ -2527,11 +2347,6 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "ApiKey "+cfg.APIKey)
-	} else if cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	}
 	if includeActor && cfg.ActorID != "" {
 		req.Header.Set("X-Actor-ID", cfg.ActorID)
 	}
@@ -2629,24 +2444,10 @@ func print(v any, jsonOut bool) error {
 			fmt.Printf("%s\tbranch=%s\tcommit=%s\tpr=%s\tfiles=%s\n", g.ID, g.Branch, g.CommitSHA, g.PRURL, strings.Join(g.ChangedFiles, ","))
 		}
 	case User:
-		fmt.Printf("%s\t%s\t%s\t%s\tactive=%t\n", x.ID, x.Email, x.Name, x.Role, x.Active)
+		fmt.Printf("%s\t%s\t%s\tactive=%t\n", x.ID, x.Email, x.Name, x.Active)
 	case []User:
 		for _, u := range x {
-			fmt.Printf("%s\t%s\t%s\t%s\tactive=%t\n", u.ID, u.Email, u.Name, u.Role, u.Active)
-		}
-	case APIKey:
-		secret := ""
-		if x.Secret != "" {
-			secret = "\tapi_key=" + x.Secret
-		}
-		fmt.Printf("%s\t%s\tactor=%s\trole=%s\tscopes=%s%s\n", x.ID, x.Name, x.ActorID, x.Role, strings.Join(x.Scopes, ","), secret)
-	case []APIKey:
-		for _, k := range x {
-			revoked := ""
-			if k.RevokedAt != nil {
-				revoked = "\trevoked=true"
-			}
-			fmt.Printf("%s\t%s\tactor=%s\trole=%s\tscopes=%s\tprefix=%s%s\n", k.ID, k.Name, k.ActorID, k.Role, strings.Join(k.Scopes, ","), k.Prefix, revoked)
+			fmt.Printf("%s\t%s\t%s\tactive=%t\n", u.ID, u.Email, u.Name, u.Active)
 		}
 	case TaskDetail:
 		fmt.Printf("%s\t%s\t%s\nProject: %s\nRepo: %s\nWorkspace: %s\nParent: %s\nGoal: %s\nOwner: %s\nScope: %s\n", x.Task.ID, x.Task.Status, x.Task.Title, x.Task.ProjectID, x.Task.RepoID, x.Task.WorkspaceID, x.Task.ParentTaskID, x.Task.Goal, x.Task.OwnerID, strings.Join(x.Task.Scope, ", "))

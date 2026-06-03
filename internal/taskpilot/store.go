@@ -181,16 +181,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, password_hash TEXT NOT NULL,
-			role TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT
+			active INTEGER NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
 			created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS api_keys (
-			id TEXT PRIMARY KEY, name TEXT NOT NULL, actor_id TEXT NOT NULL, role TEXT NOT NULL,
-			scopes TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
-			created_by TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS projects (
 			id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL,
@@ -294,6 +289,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := s.exec(ctx, stmt); err != nil {
 			return err
 		}
+	}
+	_, _ = s.exec(ctx, `DROP TABLE IF EXISTS api_keys`)
+	if s.dialect == "postgres" {
+		_, _ = s.exec(ctx, `ALTER TABLE users DROP COLUMN IF EXISTS role`)
+	} else {
+		_, _ = s.exec(ctx, `ALTER TABLE users DROP COLUMN role`)
 	}
 	_, _ = s.exec(ctx, `ALTER TABLE actors ADD COLUMN actor_secret_hash TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE actors ADD COLUMN created_by_user_id TEXT`)

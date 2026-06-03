@@ -31,44 +31,6 @@ func hashToken(v string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func parseScopes(v string) []string {
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func joinScopes(v []string) string {
-	return strings.Join(v, ",")
-}
-
-func hasScope(scopes []string, required string) bool {
-	for _, scope := range scopes {
-		if scope == "admin" || scope == required {
-			return true
-		}
-	}
-	return false
-}
-
-func roleAllows(role, required string) bool {
-	if required == "read" {
-		return oneOf(role, "admin", "maintainer", "developer", "agent", "viewer")
-	}
-	if required == "write" {
-		return oneOf(role, "admin", "maintainer", "developer", "agent")
-	}
-	if required == "admin" {
-		return role == "admin"
-	}
-	return false
-}
-
 func defaultNameFromEmail(email string) string {
 	local := strings.TrimSpace(strings.Split(strings.ToLower(email), "@")[0])
 	if local == "" {
@@ -90,7 +52,7 @@ func defaultNameFromEmail(email string) string {
 	return out
 }
 
-func (s *Store) CreateUser(ctx context.Context, email, name, password, role string) (User, error) {
+func (s *Store) CreateUser(ctx context.Context, email, name, password, _ string) (User, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
 		return User{}, userErr("validation", "email is required")
@@ -98,31 +60,29 @@ func (s *Store) CreateUser(ctx context.Context, email, name, password, role stri
 	if strings.TrimSpace(name) == "" {
 		name = defaultNameFromEmail(email)
 	}
-	if role == "" {
-		role = "developer"
-	}
-	if !oneOf(role, "admin", "maintainer", "developer", "viewer") {
-		return User{}, userErr("validation", "invalid user role")
-	}
 	hash, err := hashPassword(password)
 	if err != nil {
 		return User{}, err
 	}
 	now := time.Now().UTC()
-	u := User{ID: newID("user"), Email: email, Name: name, Role: role, Active: true, CreatedAt: now}
-	_, err = s.exec(ctx, `INSERT INTO users (id,email,name,password_hash,role,active,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?,NULL)`,
-		u.ID, u.Email, u.Name, hash, u.Role, 1, ts(u.CreatedAt))
+	u := User{ID: newID("user"), Email: email, Name: name, Active: true, CreatedAt: now}
+	_, err = s.exec(ctx, `INSERT INTO users (id,email,name,password_hash,active,created_at,last_seen_at) VALUES (?,?,?,?,?,?,NULL)`,
+		u.ID, u.Email, u.Name, hash, 1, ts(u.CreatedAt))
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "role") {
+		_, err = s.exec(ctx, `INSERT INTO users (id,email,name,password_hash,role,active,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?,NULL)`,
+			u.ID, u.Email, u.Name, hash, "developer", 1, ts(u.CreatedAt))
+	}
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return User{}, userErr("validation", "an account with this email already exists")
 		}
 		return User{}, err
 	}
-	return u, s.addEvent(ctx, "", u.ID, "user.created", map[string]any{"id": u.ID, "email": u.Email, "role": u.Role})
+	return u, s.addEvent(ctx, "", u.ID, "user.created", map[string]any{"id": u.ID, "email": u.Email})
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := s.query(ctx, `SELECT id,email,name,role,active,created_at,last_seen_at FROM users ORDER BY created_at DESC`)
+	rows, err := s.query(ctx, `SELECT id,email,name,active,created_at,last_seen_at FROM users ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +93,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 		var created string
 		var last sql.NullString
 		var active int
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &active, &created, &last); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &active, &created, &last); err != nil {
 			return nil, err
 		}
 		u.Active = active == 1
@@ -147,7 +107,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) UpdateUser(ctx context.Context, actorID, userID, name, role string, active *bool) (User, error) {
+func (s *Store) UpdateUser(ctx context.Context, actorID, userID, name, _ string, active *bool) (User, error) {
 	current, err := s.GetUser(ctx, userID)
 	if err != nil {
 		return User{}, err
@@ -157,12 +117,6 @@ func (s *Store) UpdateUser(ctx context.Context, actorID, userID, name, role stri
 	}
 	if strings.TrimSpace(name) == "" {
 		name = current.Name
-	}
-	if role == "" {
-		role = current.Role
-	}
-	if !oneOf(role, "admin", "maintainer", "developer", "viewer") {
-		return User{}, userErr("validation", "invalid user role")
 	}
 	activeInt := 0
 	if current.Active {
@@ -175,7 +129,7 @@ func (s *Store) UpdateUser(ctx context.Context, actorID, userID, name, role stri
 			activeInt = 0
 		}
 	}
-	_, err = s.exec(ctx, `UPDATE users SET name=?, role=?, active=? WHERE id=?`, strings.TrimSpace(name), role, activeInt, userID)
+	_, err = s.exec(ctx, `UPDATE users SET name=?, active=? WHERE id=?`, strings.TrimSpace(name), activeInt, userID)
 	if err != nil {
 		return User{}, err
 	}
@@ -183,7 +137,7 @@ func (s *Store) UpdateUser(ctx context.Context, actorID, userID, name, role stri
 	if err != nil {
 		return User{}, err
 	}
-	return *u, s.addEvent(ctx, "", actorID, "user.updated", map[string]any{"id": userID, "role": role, "active": activeInt == 1})
+	return *u, s.addEvent(ctx, "", actorID, "user.updated", map[string]any{"id": userID, "active": activeInt == 1})
 }
 
 func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
@@ -191,8 +145,8 @@ func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
 	var created string
 	var last sql.NullString
 	var active int
-	err := s.queryRow(ctx, `SELECT id,email,name,role,active,created_at,last_seen_at FROM users WHERE id=?`, id).
-		Scan(&u.ID, &u.Email, &u.Name, &u.Role, &active, &created, &last)
+	err := s.queryRow(ctx, `SELECT id,email,name,active,created_at,last_seen_at FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Email, &u.Name, &active, &created, &last)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -238,8 +192,8 @@ func (s *Store) AuthenticateUser(ctx context.Context, email, password string) (U
 	var passwordHash, created string
 	var last sql.NullString
 	var active int
-	err := s.queryRow(ctx, `SELECT id,email,name,password_hash,role,active,created_at,last_seen_at FROM users WHERE email=?`, email).
-		Scan(&u.ID, &u.Email, &u.Name, &passwordHash, &u.Role, &active, &created, &last)
+	err := s.queryRow(ctx, `SELECT id,email,name,password_hash,active,created_at,last_seen_at FROM users WHERE email=?`, email).
+		Scan(&u.ID, &u.Email, &u.Name, &passwordHash, &active, &created, &last)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, userErr("unauthorized", "invalid email or password")
 	}
@@ -274,120 +228,19 @@ func (s *Store) VerifySession(ctx context.Context, token string) (Principal, err
 	if token == "" {
 		return Principal{}, userErr("unauthorized", "missing session")
 	}
-	var userID, role, email, name string
-	err := s.queryRow(ctx, `SELECT users.id, users.role, users.email, users.name FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.revoked_at IS NULL AND sessions.expires_at>? AND users.active=1`,
-		hashToken(token), ts(time.Now().UTC())).Scan(&userID, &role, &email, &name)
+	var userID, email, name string
+	err := s.queryRow(ctx, `SELECT users.id, users.email, users.name FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.revoked_at IS NULL AND sessions.expires_at>? AND users.active=1`,
+		hashToken(token), ts(time.Now().UTC())).Scan(&userID, &email, &name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Principal{}, userErr("unauthorized", "invalid session")
 	}
 	if err != nil {
 		return Principal{}, err
 	}
-	return Principal{ID: userID, Kind: "user", Role: role, UserID: userID, ActorID: userID, Email: email, Name: name}, nil
+	return Principal{ID: userID, Kind: "user", UserID: userID, ActorID: userID, Email: email, Name: name}, nil
 }
 
 func (s *Store) RevokeSession(ctx context.Context, token string) error {
 	_, err := s.exec(ctx, `UPDATE sessions SET revoked_at=? WHERE token_hash=?`, ts(time.Now().UTC()), hashToken(token))
 	return err
-}
-
-func (s *Store) CreateAPIKey(ctx context.Context, name, actorID, role string, scopes []string, createdBy string) (APIKey, error) {
-	if name == "" {
-		return APIKey{}, userErr("validation", "api key name is required")
-	}
-	if actorID == "" {
-		return APIKey{}, userErr("validation", "actor_id is required")
-	}
-	actor, err := s.GetActor(ctx, actorID)
-	if err != nil {
-		return APIKey{}, err
-	}
-	if actor == nil {
-		return APIKey{}, userErr("validation", "actor_id does not exist")
-	}
-	if role == "" {
-		role = "agent"
-	}
-	if !oneOf(role, "admin", "maintainer", "developer", "agent", "viewer") {
-		return APIKey{}, userErr("validation", "invalid api key role")
-	}
-	if len(scopes) == 0 {
-		scopes = []string{"task:read", "task:write", "lock:write", "context:write", "handoff:write"}
-	}
-	for _, scope := range scopes {
-		if !oneOf(scope, "task:read", "task:write", "lock:write", "context:write", "handoff:write", "artifact:request", "admin") {
-			return APIKey{}, userErr("validation", "invalid api key scope")
-		}
-		if scope == "admin" && role != "admin" {
-			return APIKey{}, userErr("validation", "admin scope requires admin api key role")
-		}
-	}
-	secret := "tpk_" + newSecret()
-	prefix := secret
-	if len(prefix) > 12 {
-		prefix = prefix[:12]
-	}
-	now := time.Now().UTC()
-	key := APIKey{ID: newID("key"), Name: name, ActorID: actorID, Role: role, Scopes: scopes, Prefix: prefix, Secret: secret, CreatedBy: createdBy, CreatedAt: now}
-	_, err = s.exec(ctx, `INSERT INTO api_keys (id,name,actor_id,role,scopes,key_hash,prefix,created_by,created_at,revoked_at) VALUES (?,?,?,?,?,?,?,?,?,NULL)`,
-		key.ID, key.Name, key.ActorID, key.Role, joinScopes(key.Scopes), hashToken(secret), key.Prefix, key.CreatedBy, ts(key.CreatedAt))
-	if err != nil {
-		return APIKey{}, err
-	}
-	return key, s.addEvent(ctx, "", createdBy, "api_key.created", map[string]any{"id": key.ID, "name": key.Name, "actor_id": key.ActorID, "scopes": key.Scopes})
-}
-
-func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
-	rows, err := s.query(ctx, `SELECT id,name,actor_id,role,scopes,prefix,created_by,created_at,revoked_at FROM api_keys ORDER BY created_at DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []APIKey{}
-	for rows.Next() {
-		var key APIKey
-		var scopes, created string
-		var revoked sql.NullString
-		if err := rows.Scan(&key.ID, &key.Name, &key.ActorID, &key.Role, &scopes, &key.Prefix, &key.CreatedBy, &created, &revoked); err != nil {
-			return nil, err
-		}
-		key.Scopes = parseScopes(scopes)
-		key.CreatedAt = parseTS(created)
-		if revoked.Valid {
-			t := parseTS(revoked.String)
-			key.RevokedAt = &t
-		}
-		out = append(out, key)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) RevokeAPIKey(ctx context.Context, actorID, keyID string) error {
-	res, err := s.exec(ctx, `UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL`, ts(time.Now().UTC()), keyID)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return userErr("not_found", "active api key not found")
-	}
-	return s.addEvent(ctx, "", actorID, "api_key.revoked", map[string]any{"id": keyID})
-}
-
-func (s *Store) VerifyAPIKey(ctx context.Context, secret string) (Principal, error) {
-	if secret == "" {
-		return Principal{}, userErr("unauthorized", "missing api key")
-	}
-	var key APIKey
-	var scopes, created string
-	err := s.queryRow(ctx, `SELECT id,name,actor_id,role,scopes,prefix,created_by,created_at FROM api_keys WHERE key_hash=? AND revoked_at IS NULL`,
-		hashToken(secret)).Scan(&key.ID, &key.Name, &key.ActorID, &key.Role, &scopes, &key.Prefix, &key.CreatedBy, &created)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Principal{}, userErr("unauthorized", "invalid api key")
-	}
-	if err != nil {
-		return Principal{}, err
-	}
-	key.Scopes = parseScopes(scopes)
-	return Principal{ID: key.ID, Kind: "api_key", Role: key.Role, ActorID: key.ActorID, Scopes: key.Scopes}, nil
 }

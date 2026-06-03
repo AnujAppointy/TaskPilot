@@ -1,7 +1,4 @@
 const apiState = {
-  token: loadSetting("taskpilot.token", "dev-token"),
-  apiKey: loadSetting("taskpilot.apiKey", ""),
-  legacyEnabled: false,
   actor: loadSetting("taskpilot.actor", ""),
   actorSecret: loadSetting("taskpilot.actorSecret", ""),
   principal: null,
@@ -23,7 +20,6 @@ const apiState = {
     stale: "",
   },
   users: [],
-  apiKeys: [],
   handoffs: [],
   conflicts: [],
   staleClaims: [],
@@ -46,8 +42,6 @@ const apiState = {
 };
 
 const statuses = ["ready", "claimed", "in_progress", "blocked", "handoff_ready", "in_review", "completed"];
-const writeRoles = ["admin", "maintainer", "developer", "agent"];
-
 try {
   localStorage.removeItem("taskpilot.theme");
 } catch {
@@ -110,17 +104,8 @@ function clearActorSettings() {
   saveSetting("taskpilot.actorSecret", "");
 }
 
-function setLegacyEnabled(value) {
-  apiState.legacyEnabled = value;
-  saveSetting("taskpilot.legacyEnabled", value ? "true" : "");
-}
-
-function isAdmin() {
-  return apiState.principal && apiState.principal.role === "admin";
-}
-
 function canWrite() {
-  return apiState.principal && writeRoles.includes(apiState.principal.role);
+  return !!apiState.principal;
 }
 
 function currentUserID() {
@@ -143,13 +128,7 @@ function actorOwnershipLabel(actor) {
 
 function authHeaders(includeActor = true) {
   const headers = { "Content-Type": "application/json" };
-  if (apiState.apiKey) {
-    headers.Authorization = `ApiKey ${apiState.apiKey}`;
-  } else if (apiState.legacyEnabled && apiState.token) {
-    headers.Authorization = `Bearer ${apiState.token}`;
-    if (includeActor && apiState.actor) headers["X-Actor-ID"] = apiState.actor;
-    if (includeActor && apiState.actorSecret) headers["X-Actor-Secret"] = apiState.actorSecret;
-  } else if (includeActor && apiState.actor && apiState.actorSecret) {
+  if (includeActor && apiState.actor && apiState.actorSecret) {
     headers["X-Actor-ID"] = apiState.actor;
     headers["X-Actor-Secret"] = apiState.actorSecret;
   }
@@ -186,16 +165,6 @@ async function loadMe() {
     apiState.authChecked = true;
     return true;
   } catch (err) {
-    if (!apiState.apiKey && apiState.legacyEnabled && apiState.token && err.status === 401) {
-      try {
-        await ensureLegacyActor();
-        apiState.principal = await api("/api/me");
-        apiState.authChecked = true;
-        return true;
-      } catch {
-        clearActorSettings();
-      }
-    }
     apiState.principal = null;
     apiState.authChecked = true;
     return false;
@@ -227,7 +196,6 @@ async function refreshNow() {
       renderWhenSafe();
       return;
     }
-    if (apiState.principal.kind === "legacy_actor") await ensureLegacyActor();
     const calls = [
       apiState.selectedProject ? api(`/api/tasks?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/tasks"),
       api("/api/actors"),
@@ -239,11 +207,7 @@ async function refreshNow() {
       api("/api/conflicts/stale-claims"),
       api("/api/events"),
     ];
-    if (isAdmin()) {
-      calls.push(api("/api/users"));
-      calls.push(api("/api/api-keys"));
-    }
-    const [tasks, actors, projects, repositories, workspaces, handoffs, conflicts, staleClaims, events, users = [], apiKeys = []] = await Promise.all(calls);
+    const [tasks, actors, projects, repositories, workspaces, handoffs, conflicts, staleClaims, events] = await Promise.all(calls);
     apiState.tasks = Array.isArray(tasks) ? tasks : [];
     apiState.actors = Array.isArray(actors) ? actors : [];
     apiState.projects = Array.isArray(projects) ? projects : [];
@@ -258,8 +222,7 @@ async function refreshNow() {
     apiState.staleClaims = Array.isArray(staleClaims) ? staleClaims : [];
     apiState.events = Array.isArray(events) ? events : [];
     apiState.lastEventID = apiState.events.reduce((max, e) => Math.max(max, e.id || 0), apiState.lastEventID || 0);
-    apiState.users = Array.isArray(users) ? users : [];
-    apiState.apiKeys = Array.isArray(apiKeys) ? apiKeys : [];
+    apiState.users = [];
     if (apiState.selected) apiState.detail = await api(`/api/tasks/${apiState.selected}`);
     ensureEventStream();
   } catch (err) {
@@ -352,26 +315,6 @@ function handleStreamFrame(frame) {
     // Refresh on malformed frames; the next full load will reconcile state.
   }
   scheduleRefresh(150);
-}
-
-async function ensureLegacyActor() {
-  if (apiState.actor && apiState.actorSecret) {
-    try {
-      await api("/api/actors");
-      return;
-    } catch (err) {
-      if (err.status !== 401) throw err;
-      clearActorSettings();
-    }
-  }
-  const actor = await apiNoActor("/api/actors/register", {
-    method: "POST",
-    body: JSON.stringify({ name: "Dashboard User", kind: "human", machine_name: navigator.platform || "browser" }),
-  });
-  apiState.actor = actor.id;
-  apiState.actorSecret = actor.actor_secret;
-  saveSetting("taskpilot.actor", actor.id);
-  saveSetting("taskpilot.actorSecret", actor.actor_secret);
 }
 
 function actorName(id) {
@@ -493,7 +436,6 @@ function navIcon(tab) {
     conflicts: "report",
     actors: "groups",
     handoffs: "call_split",
-    admin: "admin_panel_settings",
     settings: "settings",
   };
   return icons[tab] || "•";
@@ -977,7 +919,7 @@ function gitItem(g) {
 }
 
 function actionsPanel(task) {
-  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Actions"), h("p", { class: "meta" }, "Your role is read-only."));
+  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Actions"), h("p", { class: "meta" }, "Sign in to make task changes."));
   const status = h("select", {}, ["blocked", "handoff_ready", "in_review", "cancelled"].map(v => h("option", { value: v, selected: v === task.status }, v)));
   const lockScope = h("input", { placeholder: "Lock scope, e.g. src/auth/*" });
   const decision = h("textarea", { placeholder: "Decision" });
@@ -1320,7 +1262,7 @@ function projectsView() {
 }
 
 function createProjectForm() {
-  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Create Project"), h("p", { class: "meta" }, "Your role is read-only."));
+  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Create Project"), h("p", { class: "meta" }, "Sign in to create projects."));
   const name = h("input", { placeholder: "Project name" });
   const description = h("textarea", { placeholder: "Description" });
   return h("div", { class: "panel form" }, h("h2", {}, "Create Project"), name, description,
@@ -1364,74 +1306,6 @@ function createWorkspaceForm() {
     }}, "Add Workspace"));
 }
 
-function adminView() {
-  if (!isAdmin()) return h("div", { class: "panel" }, h("h2", {}, "Admin"), h("p", { class: "meta" }, "Admin role required."));
-  return h("div", { class: "grid2" },
-    h("div", {}, createUserForm(), h("br"), createKeyForm(), h("br"), changePasswordForm()),
-    h("div", {},
-      h("div", { class: "panel list" }, h("h2", {}, "Users"), apiState.users.map(userItem)),
-      h("br"),
-      h("div", { class: "panel list" }, h("h2", {}, "API Keys"), apiState.apiKeys.map(keyItem))
-    )
-  );
-}
-
-function createUserForm() {
-  const email = h("input", { placeholder: "Email" });
-  const name = h("input", { placeholder: "Name" });
-  const password = h("input", { type: "password", placeholder: "Temporary password" });
-  const role = h("select", {}, ["developer","maintainer","viewer","admin"].map(v => h("option", { value: v }, v)));
-  return h("div", { class: "panel form" }, h("h2", {}, "Invite User"), email, name, password, role,
-    h("button", { class: "primary", onclick: async () => {
-      await api("/api/users", { method: "POST", body: JSON.stringify({ email: email.value, name: name.value, password: password.value, role: role.value }) });
-      email.value = ""; name.value = ""; password.value = "";
-      await refresh();
-    }}, "Create User"));
-}
-
-function userItem(u) {
-  const role = h("select", {}, ["admin","maintainer","developer","viewer"].map(v => h("option", { value: v, selected: v === u.role }, v)));
-  const active = h("input", { type: "checkbox", checked: u.active });
-  const newPassword = h("input", { type: "password", placeholder: "New password" });
-  return h("div", { class: "item" },
-    h("strong", {}, `${u.name} · ${u.email}`),
-    h("p", { class: "meta" }, `${u.id} · last seen ${u.last_seen_at ? new Date(u.last_seen_at).toLocaleString() : "never"}`),
-    h("div", { class: "row" }, role, h("label", { class: "check" }, active, " Active")),
-    h("div", { class: "row" },
-      h("button", { onclick: async () => { await api(`/api/users/${u.id}`, { method: "PATCH", body: JSON.stringify({ role: role.value, active: active.checked }) }); await refresh(); } }, "Save User"),
-      h("button", { class: "danger", onclick: async () => { active.checked = false; await api(`/api/users/${u.id}`, { method: "PATCH", body: JSON.stringify({ active: false }) }); await refresh(); } }, "Deactivate")
-    ),
-    h("div", { class: "row" }, newPassword, h("button", { onclick: async () => { await api(`/api/users/${u.id}/password`, { method: "POST", body: JSON.stringify({ new_password: newPassword.value }) }); newPassword.value = ""; await refresh(); } }, "Reset Password"))
-  );
-}
-
-function createKeyForm() {
-  const name = h("input", { placeholder: "Key name" });
-  const actor = h("select", {}, apiState.actors.map(a => h("option", { value: a.id }, `${a.name} · ${a.id}`)));
-  const role = h("select", {}, ["agent","developer","maintainer","viewer","admin"].map(v => h("option", { value: v }, v)));
-  const scopes = h("input", { placeholder: "Scopes comma separated", value: "task:read,task:write,lock:write,context:write,handoff:write" });
-  const output = h("textarea", { readonly: "readonly", placeholder: "New API key appears here once" });
-  return h("div", { class: "panel form" }, h("h2", {}, "Create API Key"), name, actor, role, scopes,
-    h("button", { class: "primary", onclick: async () => {
-      const key = await api("/api/api-keys", { method: "POST", body: JSON.stringify({
-        name: name.value, actor_id: actor.value, role: role.value,
-        scopes: scopes.value.split(",").map(s => s.trim()).filter(Boolean),
-      }) });
-      output.value = key.api_key || "";
-      await refresh();
-    }}, "Create Key"),
-    output);
-}
-
-function keyItem(k) {
-  return h("div", { class: "item" },
-    h("strong", {}, `${k.name} · ${k.prefix}`),
-    h("p", { class: "meta" }, `${k.id} · actor ${actorName(k.actor_id)} · ${k.role} · ${(k.scopes || []).join(", ")}`),
-    k.revoked_at ? h("span", { class: "pill amber" }, `revoked ${new Date(k.revoked_at).toLocaleString()}`) :
-      h("button", { class: "danger", onclick: async () => { await api(`/api/api-keys/${k.id}`, { method: "DELETE" }); await refresh(); } }, "Revoke")
-  );
-}
-
 function changePasswordForm() {
   if (!apiState.principal || apiState.principal.kind !== "user") return null;
   const current = h("input", { type: "password", placeholder: "Current password" });
@@ -1441,7 +1315,6 @@ function changePasswordForm() {
 }
 
 function settings() {
-  const apiKey = h("input", { value: apiState.apiKey, placeholder: "API key" });
   const mine = apiState.actors.filter(a => a.created_by_user_id && a.created_by_user_id === currentUserID());
   return h("div", { class: "grid2" },
     h("div", { class: "panel form" },
@@ -1453,18 +1326,6 @@ function settings() {
       h("h2", {}, "My CLI Actor Setup"),
       h("p", { class: "meta" }, "Only your own actors are shown here. Generate a fresh secret, then paste the command into the machine where that agent runs."),
       mine.length ? mine.map(cliSetupItem) : h("p", { class: "meta" }, "No owned actors yet. Add one from the Actors page.")
-    ),
-    h("div", { class: "panel form" },
-      h("h2", {}, "Advanced Connection"),
-      h("p", { class: "meta" }, "Optional compatibility setting for scoped API-key agents. CLI actor setup is available from the Actors page."),
-      apiKey,
-      h("button", { class: "primary", onclick: async () => {
-        saveSetting("taskpilot.apiKey", apiKey.value);
-        apiState.apiKey = apiKey.value;
-        clearActorSettings();
-        setLegacyEnabled(false);
-        await refresh();
-      }}, "Save Advanced Connection")
     )
   );
 }
@@ -1472,14 +1333,10 @@ function settings() {
 function loginView() {
   const email = h("input", { placeholder: "Email" });
   const password = h("input", { type: "password", placeholder: "Password" });
-  const apiKey = h("input", { placeholder: "Agent/API key" });
   async function finishPasswordAuth(path) {
     try {
       const res = await apiRequest(path, { method: "POST", body: JSON.stringify({ email: email.value, password: password.value }) }, false);
-      apiState.apiKey = "";
       clearActorSettings();
-      setLegacyEnabled(false);
-      saveSetting("taskpilot.apiKey", "");
       apiState.error = res.actor_recommendation || "";
       await refresh();
     } catch (err) {
@@ -1496,19 +1353,7 @@ function loginView() {
         h("button", { class: "primary", onclick: async () => finishPasswordAuth("/api/auth/login") }, "Log In"),
         h("button", { onclick: async () => finishPasswordAuth("/api/auth/signup") }, "Sign Up")
       ),
-      h("p", { class: "meta" }, "You can add, rename, or delete agent identities later from the Actors page."),
-      h("details", { class: "memory-edit" },
-        h("summary", {}, "Advanced CLI / agent access"),
-        h("p", { class: "meta" }, "Use this only for scoped automation keys. Most teammates should use email/password and manage actors inside TaskPilot."),
-        apiKey,
-        h("button", { onclick: async () => {
-          apiState.apiKey = apiKey.value;
-          saveSetting("taskpilot.apiKey", apiKey.value);
-          clearActorSettings();
-          setLegacyEnabled(false);
-          await refresh();
-        }}, "Use API Key")
-      )
+      h("p", { class: "meta" }, "You can add, rename, or delete agent identities later from the Actors page.")
     )
   );
 }
@@ -1519,9 +1364,6 @@ async function logout(callServer = true) {
     try { await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch {}
   }
   apiState.principal = null;
-  apiState.apiKey = "";
-  setLegacyEnabled(false);
-  saveSetting("taskpilot.apiKey", "");
   render();
 }
 
@@ -1540,14 +1382,12 @@ function render() {
       return;
     }
     const tabs = ["board", "detail", "projects", "conflicts", "actors", "handoffs", "settings"];
-    if (isAdmin()) tabs.splice(5, 0, "admin");
     const content = apiState.tab === "board" ? board()
       : apiState.tab === "detail" ? detailView()
       : apiState.tab === "projects" ? projectsView()
       : apiState.tab === "conflicts" ? conflictsView()
       : apiState.tab === "actors" ? actorsView()
       : apiState.tab === "handoffs" ? handoffsView()
-      : apiState.tab === "admin" ? adminView()
       : settings();
     root.append(h("div", { class: "shell" },
       h("div", { class: "topbar" },

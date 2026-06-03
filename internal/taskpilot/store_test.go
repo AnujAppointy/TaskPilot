@@ -130,15 +130,14 @@ func TestActorSecretVerification(t *testing.T) {
 	}
 }
 
-func TestUserSessionAndAPIKeyAuth(t *testing.T) {
+func TestUserSessionAuth(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	a := testActor(t, s, "Agent A")
-	u, err := s.CreateUser(ctx, "ADMIN@example.com", "Admin", "strong-password", "admin")
+	u, err := s.CreateUser(ctx, "DEV@example.com", "Developer", "strong-password", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Email != "admin@example.com" || u.Role != "admin" {
+	if u.Email != "dev@example.com" {
 		t.Fatalf("unexpected user normalization: %+v", u)
 	}
 	if _, err := s.AuthenticateUser(ctx, u.Email, "wrong-password"); err == nil || errorCode(err) != "unauthorized" {
@@ -155,7 +154,7 @@ func TestUserSessionAndAPIKeyAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Kind != "user" || p.Role != "admin" || p.UserID != u.ID {
+	if p.Kind != "user" || p.UserID != u.ID {
 		t.Fatalf("unexpected session principal: %+v", p)
 	}
 	if err := s.RevokeSession(ctx, session); err != nil {
@@ -164,30 +163,13 @@ func TestUserSessionAndAPIKeyAuth(t *testing.T) {
 	if _, err := s.VerifySession(ctx, session); err == nil || errorCode(err) != "unauthorized" {
 		t.Fatalf("expected revoked session to fail, got %v", err)
 	}
-	if _, err := s.CreateAPIKey(ctx, "bad key", "missing-actor", "agent", nil, u.ID); err == nil || errorCode(err) != "validation" {
-		t.Fatalf("expected missing actor validation, got %v", err)
-	}
-	key, err := s.CreateAPIKey(ctx, "agent key", a.ID, "agent", []string{"task:read", "context:write"}, u.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if key.Secret == "" {
-		t.Fatal("expected one-time API key secret in create response")
-	}
-	p, err = s.VerifyAPIKey(ctx, key.Secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Kind != "api_key" || p.ActorID != a.ID || !hasScope(p.Scopes, "context:write") || hasScope(p.Scopes, "lock:write") {
-		t.Fatalf("unexpected api key principal/scopes: %+v", p)
-	}
 	events, err := s.ListEvents(ctx, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range events {
 		raw := js(e.Payload)
-		if contains(raw, key.Secret) || contains(raw, "strong-password") {
+		if contains(raw, "strong-password") {
 			t.Fatal("secret leaked into audit event payload")
 		}
 	}

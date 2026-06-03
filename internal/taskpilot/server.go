@@ -22,16 +22,12 @@ var staticFS embed.FS
 
 type Server struct {
 	store   *Store
-	token   string
 	mux     *http.ServeMux
 	metrics serverMetrics
 }
 
-func NewServer(store *Store, token string) *Server {
-	if token == "" {
-		token = "dev-token"
-	}
-	s := &Server{store: store, token: token, mux: http.NewServeMux(), metrics: serverMetrics{Started: time.Now().UTC().Format(time.RFC3339)}}
+func NewServer(store *Store, _ string) *Server {
+	s := &Server{store: store, mux: http.NewServeMux(), metrics: serverMetrics{Started: time.Now().UTC().Format(time.RFC3339)}}
 	s.routes()
 	return s
 }
@@ -65,13 +61,6 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/auth/logout", s.auth(http.HandlerFunc(s.handleLogout)))
 	s.mux.Handle("GET /api/me", s.auth(http.HandlerFunc(s.handleMe)))
 	s.mux.Handle("POST /api/me/password", s.requireScope("task:read", s.handleChangeOwnPassword))
-	s.mux.Handle("GET /api/users", s.requireScope("admin", s.handleUsers))
-	s.mux.Handle("POST /api/users", s.requireScope("admin", s.handleCreateUser))
-	s.mux.Handle("PATCH /api/users/{id}", s.requireScope("admin", s.handleUpdateUser))
-	s.mux.Handle("POST /api/users/{id}/password", s.requireScope("admin", s.handleResetUserPassword))
-	s.mux.Handle("GET /api/api-keys", s.requireScope("admin", s.handleAPIKeys))
-	s.mux.Handle("POST /api/api-keys", s.requireScope("admin", s.handleCreateAPIKey))
-	s.mux.Handle("DELETE /api/api-keys/{id}", s.requireScope("admin", s.handleRevokeAPIKey))
 	s.mux.Handle("GET /api/projects", s.requireScope("task:read", s.handleProjects))
 	s.mux.Handle("POST /api/projects", s.requireScope("task:write", s.handleCreateProject))
 	s.mux.Handle("GET /api/repositories", s.requireScope("task:read", s.handleRepositories))
@@ -154,16 +143,8 @@ func (s *Server) auth(next http.Handler) http.Handler {
 				return
 			}
 			s.store.TouchActor(r.Context(), actorID)
-			p := Principal{ID: actorID, Kind: "legacy_actor", Role: "agent", ActorID: actorID, Scopes: []string{"admin"}}
+			p := Principal{ID: actorID, Kind: "legacy_actor", ActorID: actorID}
 			ctx := context.WithValue(r.Context(), actorKey{}, actorID)
-			ctx = context.WithValue(ctx, principalKey{}, p)
-			next.ServeHTTP(w, r.WithContext(ctx))
-			return
-		}
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if got != "" && got == s.token && r.URL.Path == "/api/actors/register" {
-			p := Principal{Kind: "legacy_actor", Role: "agent", Scopes: []string{"admin"}}
-			ctx := context.WithValue(r.Context(), actorKey{}, "")
 			ctx = context.WithValue(ctx, principalKey{}, p)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
@@ -186,11 +167,6 @@ func principal(r *http.Request) Principal {
 }
 
 func (s *Server) authPrincipal(r *http.Request) (Principal, bool) {
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "ApiKey ") {
-		p, err := s.store.VerifyAPIKey(r.Context(), strings.TrimPrefix(auth, "ApiKey "))
-		return p, err == nil
-	}
 	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
 		p, err := s.store.VerifySession(r.Context(), cookie.Value)
 		return p, err == nil
@@ -200,31 +176,6 @@ func (s *Server) authPrincipal(r *http.Request) (Principal, bool) {
 
 func (s *Server) requireScope(required string, next http.HandlerFunc) http.Handler {
 	return s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := principal(r)
-		if p.Kind == "api_key" {
-			need := "read"
-			if required == "admin" {
-				need = "admin"
-			} else if required != "task:read" {
-				need = "write"
-			}
-			if !hasScope(p.Scopes, required) || !roleAllows(p.Role, need) {
-				writeErr(w, http.StatusForbidden, userErr("forbidden", "api key role or scope does not allow this action"))
-				return
-			}
-		}
-		if p.Kind == "user" {
-			need := "read"
-			if required == "admin" {
-				need = "admin"
-			} else if required != "task:read" {
-				need = "write"
-			}
-			if !roleAllows(p.Role, need) {
-				writeErr(w, http.StatusForbidden, userErr("forbidden", "role does not allow this action"))
-				return
-			}
-		}
 		next.ServeHTTP(w, r)
 	}))
 }
@@ -337,79 +288,6 @@ func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	err := s.store.ChangeUserPassword(r.Context(), actorID(r), p.UserID, in.CurrentPassword, in.NewPassword, true)
-	writeResult(w, map[string]string{"status": "ok"}, err)
-}
-
-func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.ListUsers(r.Context())
-	writeResult(w, out, err)
-}
-
-func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Email    string `json:"email"`
-		Name     string `json:"name"`
-		Password string `json:"password"`
-		Role     string `json:"role"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
-	u, err := s.store.CreateUser(r.Context(), in.Email, in.Name, in.Password, in.Role)
-	if err == nil {
-		_, err = s.store.EnsureDefaultActorForUser(r.Context(), u)
-	}
-	if err == nil {
-		err = s.store.addEvent(r.Context(), "", actorID(r), "user.invited", map[string]any{"id": u.ID, "email": u.Email, "role": u.Role})
-	}
-	writeResult(w, u, err)
-}
-
-func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Name   string `json:"name"`
-		Role   string `json:"role"`
-		Active *bool  `json:"active"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
-	out, err := s.store.UpdateUser(r.Context(), actorID(r), r.PathValue("id"), in.Name, in.Role, in.Active)
-	writeResult(w, out, err)
-}
-
-func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		NewPassword string `json:"new_password"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
-	err := s.store.ChangeUserPassword(r.Context(), actorID(r), r.PathValue("id"), "", in.NewPassword, false)
-	writeResult(w, map[string]string{"status": "ok"}, err)
-}
-
-func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.ListAPIKeys(r.Context())
-	writeResult(w, out, err)
-}
-
-func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Name    string   `json:"name"`
-		ActorID string   `json:"actor_id"`
-		Role    string   `json:"role"`
-		Scopes  []string `json:"scopes"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
-	key, err := s.store.CreateAPIKey(r.Context(), in.Name, in.ActorID, in.Role, in.Scopes, actorID(r))
-	writeResult(w, key, err)
-}
-
-func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
-	err := s.store.RevokeAPIKey(r.Context(), actorID(r), r.PathValue("id"))
 	writeResult(w, map[string]string{"status": "ok"}, err)
 }
 
@@ -1061,7 +939,7 @@ func ListenAndServeConfig(cfg ServerConfig) error {
 	defer store.Close()
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           NewServer(store, cfg.Token),
+		Handler:           NewServer(store, ""),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1)
@@ -1069,7 +947,6 @@ func ListenAndServeConfig(cfg ServerConfig) error {
 		errCh <- server.ListenAndServe()
 	}()
 	fmt.Printf("TaskPilot server listening on %s\n", cfg.EffectiveBaseURL())
-	fmt.Printf("Team token: %s\n", cfg.Token)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	select {
