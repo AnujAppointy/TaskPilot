@@ -1,0 +1,138 @@
+i cloned the repo in a folder in the windows , now how to do a fresh setup , give step wise explanation
+
+---
+
+# Selected text:
+
+## Selection 1
+C:\Users\<you>\.local\bin\taskpilot.exe
+add that folder to your User PATH
+
+## My request for Codex:
+in environments variable?
+
+---
+
+in user variables or system varibale ?
+
+---
+
+# Selected text:
+
+## Selection 1
+C:\Users\<you>\.local\bin\taskpilot.exe
+add that folder to your User PATH
+
+## My request for Codex:
+is this happen automatically with powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 this command or we have to manually add the path
+
+---
+
+after setting this all when i run in the other windows laptop this happen "PS D:\SnakeGame> taskpilot run task_1780485704346172975 -- codex 
+TaskPilot: injected task context into codex prompt. Full injected prompt: C:\Users\hp\AppData\Local\Temp\taskpilot-task_1780485704346172975-prompt-3547451
+TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint task_1780485704346172975 --file "C:\\Users\\hp\\AppData\\Local\\Temp\\taskpilot-task_1780485704346172975-handoff-917853160.md"
+╭─────────────────────────────────────────────────╮
+│ ✨ Update available! 0.134.0 -> 0.136.0         │
+│ Run npm install -g @openai/codex to update.     │
+│                                                 │
+│ See full release notes:                         │
+│ https://github.com/openai/codex/releases/latest │
+╰─────────────────────────────────────────────────╯
+
+╭───────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.134.0)                │
+│                                           │
+│ model:     gpt-5.4 low   /model to change │
+
+  Tip: Try the Codex App. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true
+
+
+› Work on the current TaskPilot task.
+
+
+• I’m locating the active TaskPilot task in this workspace first, then I’ll inspect the relevant code and implement whatever the task requires end to end.
+
+• Running Get-ChildItem -Force
+
+• Ran Get-ChildItem -Force
+  └
+
+    … +6 lines (ctrl + t to view transcript)
+
+
+
+• Ran rg -n "TaskPilot|taskpilot|TASKPILOT|current task|active task" -S .
+  └ (no output)
+
+• The workspace only has a .git directory at the top level, so I’m checking the repo state and metadata to find where the TaskPilot task is defined.
+
+• Running git branch --show-current
+
+• Running git log --oneline -5
+
+• Running git rev-parse --show-toplevel
+
+• Ran git log --oneline -5
+  └ fatal: your current branch 'main' does not have any commits yet
+
+• Ran git rev-parse --show-toplevel
+  └ D:/SnakeGame
+
+• Ran git branch --show-current
+  └ main
+
+• Ran git status --short --branch
+  └ ## No commits yet on main
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• This repo has no commits and no tracked files yet. I’m expanding the search for task metadata inside the repo internals and nearby workspace files so I
+  can identify the requested TaskPilot item.
+
+• Running Get-ChildItem -Force -Recurse -Depth 3 | Select-Object FullName
+
+• Running Get-ChildItem -Force .. | Select-Object Name,FullName,Mode
+  └ [core]
+        repositoryformatversion = 0
+    … +3 lines (ctrl + t to view transcript)
+        symlinks = false
+        ignorecase = true
+
+• Ran Get-ChildItem -Force -Recurse -Depth 3 | Select-Object FullName
+  └
+    FullName
+    … +28 lines (ctrl + t to view transcript)
+
+
+
+• Ran Get-ChildItem -Force .. | Select-Object Name,FullName,Mode
+  └
+    Name                      FullName                     Mode
+    … +36 lines (ctrl + t to view transcript)
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• There’s no project content in D:\SnakeGame yet. I’m checking Codex memory/task storage next, since “current TaskPilot task” is likely tracked outside
+  the repo.
+
+• Running Get-ChildItem -Force C:\Users\hp\.codex\memories | Select-Object Name,FullName,Mode,LastWriteTime
+
+• Ran rg -n "TaskPilot|taskpilot|current task|active task|SnakeGame" -S C:\Users\hp\.codex\memories
+  └ (no output)
+
+• Ran Get-ChildItem -Force C:\Users\hp\.codex\memories | Select-Object Name,FullName,Mode,LastWriteTime
+  └ (no output)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• I can’t act on a TaskPilot item yet because there’s no task metadata available in this workspace or Codex memory.
+
+  What I found:
+
+  - D:\SnakeGame only contains .git
+  - the repo has no commits and no project files
+  - there’s no active Codex goal and no TaskPilot-related local state I can read
+
+  Send the current TaskPilot task details, or point me to where TaskPilot stores them in this environment, and I’ll work it through end to end."     as you see again the context is not injecting . check in depth that why this problem is occuring on the others laptop while taskpilot is working fine on me

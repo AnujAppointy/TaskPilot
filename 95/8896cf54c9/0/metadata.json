@@ -1,0 +1,53 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "958896cf54c9",
+  "session_id": "019e2a49-3055-7411-a345-72ca82da0ef0",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-03T16:42:06.741487Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "bin/taskpilot",
+    "docs/ONBOARDING.md",
+    "docs/TECHNICAL_DECISIONS.md",
+    "internal/taskpilot/cli.go",
+    "internal/taskpilot/cli_run_test.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.5",
+  "turn_id": "475cb67689bb",
+  "checkpoint_transcript_start": 13270,
+  "transcript_lines_at_start": 13270,
+  "token_usage": {
+    "input_tokens": 276738,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 5543168,
+    "output_tokens": 6724,
+    "api_call_count": 26
+  },
+  "session_metrics": {
+    "turn_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-03T16:42:05.877869Z",
+    "agent_lines": 45,
+    "agent_removed": 15,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 45,
+    "total_lines_changed": 60,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
