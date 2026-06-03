@@ -228,10 +228,11 @@ func runAgentCommand(args []string) error {
 		return err
 	}
 	defer promptCleanup()
+	launchPrompt := agentLaunchPrompt(taskID, promptPath)
 	injectedPrompt := false
 	if !*noPromptInject {
 		before := strings.Join(commandArgs, "\x00")
-		commandArgs = injectAgentStartupPrompt(commandArgs, startupPrompt)
+		commandArgs = injectAgentStartupPrompt(commandArgs, launchPrompt)
 		injectedPrompt = strings.Join(commandArgs, "\x00") != before
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -261,7 +262,7 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_AGENT_INSTRUCTIONS="+agentInstructions(taskID),
 	)
 	if injectedPrompt {
-		_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: injected task context into %s prompt. Full injected prompt: %s\n", filepath.Base(commandArgs[0]), promptPath)
+		_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: injected startup pointer into %s prompt. Full TaskPilot prompt file: %s\n", filepath.Base(commandArgs[0]), promptPath)
 	}
 	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: handoff draft file: %s\n", handoffPath)
 	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint %s --file %q\n", taskID, handoffPath)
@@ -695,6 +696,10 @@ func injectAgentStartupPrompt(commandArgs []string, prompt string) []string {
 	return commandArgs
 }
 
+func agentLaunchPrompt(taskID, promptPath string) string {
+	return "TaskPilot task " + taskID + ": before doing any repository analysis or edits, read the full TaskPilot instructions from " + promptPath + " and follow them exactly. If you cannot read that file, stop and report the TaskPilot context problem. Do not infer the task from repo files."
+}
+
 func injectPromptIntoAgentArgs(commandArgs []string, prompt string) []string {
 	out := append([]string{}, commandArgs...)
 	if idx := lastAgentPromptArgIndex(out); idx > 0 {
@@ -748,7 +753,7 @@ func combineTaskPilotAndUserPrompt(taskPilotPrompt, userPrompt string) string {
 	if userPrompt == "" {
 		return taskPilotPrompt
 	}
-	return taskPilotPrompt + "\n\nHuman prompt for this work unit:\n" + userPrompt
+	return taskPilotPrompt + " Human prompt for this work unit: " + userPrompt
 }
 
 func isAgentResumeCommand(commandArgs []string) bool {

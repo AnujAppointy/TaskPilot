@@ -206,16 +206,15 @@ taskpilot run <task-id> -- gemini "your prompt"
 When prompt injection is active, the terminal shows:
 
 ```text
-TaskPilot: injected task context into codex prompt. Full injected prompt: /tmp/taskpilot-...-prompt-....txt
+TaskPilot: injected startup pointer into codex prompt. Full TaskPilot prompt file: /tmp/taskpilot-...-prompt-....txt
 TaskPilot: handoff draft file: /tmp/taskpilot-...-handoff-....md
 TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint ...
 ```
 
-The injected prompt includes the human prompt:
+The visible agent prompt points to the full prompt file and includes the human prompt:
 
 ```text
-Human prompt for this work unit:
-your prompt
+TaskPilot task <task-id>: before doing any repository analysis or edits, read the full TaskPilot instructions from <prompt-file> and follow them exactly. Human prompt for this work unit: your prompt
 ```
 
 ## Agent Context And Handoff Files

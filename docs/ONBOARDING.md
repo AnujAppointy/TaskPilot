@@ -298,10 +298,18 @@ Do not manually paste all task context. `taskpilot run` injects it.
 The terminal will show:
 
 ```text
-TaskPilot: injected task context into codex prompt. Full injected prompt: /tmp/taskpilot-...-prompt-....txt
+TaskPilot: injected startup pointer into codex prompt. Full TaskPilot prompt file: /tmp/taskpilot-...-prompt-....txt
 TaskPilot: handoff draft file: /tmp/taskpilot-...-handoff-....md
 TaskPilot: after each meaningful work unit, update the handoff draft and run: taskpilot handoff checkpoint ...
 ```
+
+Inside Codex or Gemini, the first visible instruction should tell the agent to read the full TaskPilot prompt file before doing any repo analysis:
+
+```text
+TaskPilot task <task-id>: before doing any repository analysis or edits, read the full TaskPilot instructions from <prompt-file> and follow them exactly.
+```
+
+If the agent starts searching the repo for “current task” metadata, the installed TaskPilot binary is stale or prompt injection is not working. Run `git pull`, reinstall with `make install` on Mac/Linux or `.\scripts\install-windows.ps1` on Windows, then verify `which taskpilot` or `where.exe taskpilot`.
 
 ### What the agent should do
 

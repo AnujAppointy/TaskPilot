@@ -203,7 +203,7 @@ Add a technology section to PLANNING.md
 TaskPilot also prints the injected prompt file path:
 
 ```text
-TaskPilot: injected task context into codex prompt. Full injected prompt: /tmp/taskpilot-...-prompt-....txt
+TaskPilot: injected startup pointer into codex prompt. Full TaskPilot prompt file: /tmp/taskpilot-...-prompt-....txt
 ```
 
 **Why:**

@@ -78,32 +78,50 @@ func TestRunSyncIntervalCapsLongProgressInterval(t *testing.T) {
 }
 
 func TestInjectAgentStartupPromptCombinesHumanPrompt(t *testing.T) {
-	got := injectAgentStartupPrompt([]string{"codex", "add planning section"}, "TASKPILOT CONTEXT")
+	prompt := agentLaunchPrompt("task_1", `C:\Temp\taskpilot-prompt.txt`)
+	got := injectAgentStartupPrompt([]string{"codex", "add planning section"}, prompt)
 	if len(got) != 2 {
 		t.Fatalf("expected two args, got %+v", got)
 	}
-	if !strings.Contains(got[1], "TASKPILOT CONTEXT") || !strings.Contains(got[1], "Human prompt for this work unit:") || !strings.Contains(got[1], "add planning section") {
+	if !strings.Contains(got[1], `C:\Temp\taskpilot-prompt.txt`) || !strings.Contains(got[1], "Human prompt for this work unit:") || !strings.Contains(got[1], "add planning section") {
 		t.Fatalf("prompt was not combined correctly: %q", got[1])
+	}
+	if strings.Contains(got[1], "\n") {
+		t.Fatalf("launch prompt should stay single-line for Windows argv safety: %q", got[1])
 	}
 }
 
 func TestInjectAgentStartupPromptPreservesModelFlagAndCombinesLastPrompt(t *testing.T) {
-	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5", "review README"}, "TASKPILOT CONTEXT")
+	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
+	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5", "review README"}, prompt)
 	if len(got) != 4 {
 		t.Fatalf("expected four args, got %+v", got)
 	}
 	if got[2] != "gpt-5" {
 		t.Fatalf("model flag value should be preserved, got %+v", got)
 	}
-	if !strings.Contains(got[3], "TASKPILOT CONTEXT") || !strings.Contains(got[3], "review README") {
+	if !strings.Contains(got[3], "/tmp/taskpilot-prompt.txt") || !strings.Contains(got[3], "review README") {
 		t.Fatalf("last prompt arg was not combined: %+v", got)
 	}
 }
 
 func TestInjectAgentStartupPromptAppendsWhenOnlyFlagsExist(t *testing.T) {
-	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5"}, "TASKPILOT CONTEXT")
-	if len(got) != 4 || got[1] != "--model" || got[2] != "gpt-5" || got[3] != "TASKPILOT CONTEXT" {
+	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
+	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5"}, prompt)
+	if len(got) != 4 || got[1] != "--model" || got[2] != "gpt-5" || got[3] != prompt {
 		t.Fatalf("expected prompt appended after flag-only command, got %+v", got)
+	}
+}
+
+func TestAgentLaunchPromptPointsToFullPromptFile(t *testing.T) {
+	got := agentLaunchPrompt("task_123", `C:\Users\hp\AppData\Local\Temp\taskpilot-prompt.txt`)
+	for _, want := range []string{"task_123", `C:\Users\hp\AppData\Local\Temp\taskpilot-prompt.txt`, "read the full TaskPilot instructions", "Do not infer"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("launch prompt missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("launch prompt should be single-line, got %q", got)
 	}
 }
 
