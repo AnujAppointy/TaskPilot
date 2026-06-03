@@ -1,0 +1,95 @@
+Improve the current TaskPilot authentication and onboarding flow.
+
+The current login/signup flow is too confusing for developer teams. It should be simplified so that any team member can onboard easily using only:
+
+* Email
+* Password
+
+There should be no need to select or manage complex roles during signup/login.
+
+Remove the current role-based onboarding complexity such as:
+
+* Admin
+* Maintainer
+* Viewer
+
+TaskPilot is designed for team-based developer/agent collaboration, so every user should be able to onboard individually and start using the system without needing role setup.
+
+New expected flow:
+
+1. **Signup/Login**
+
+   * User signs up or logs in using only email and password.
+   * No actor selection should be required during login.
+   * No role selection should be required during signup.
+
+2. **Default Actor Creation**
+
+   * When a user signs up for the first time, TaskPilot should automatically create one default actor for that user.
+   * The user should be shown a recommendation to rename this actor using the format:
+
+   `yourname_agentname`
+
+   Example:
+
+   `anuj_gemini`
+   `rahul_claude`
+   `priya_codex`
+
+3. **Actor Management**
+
+   * Actor management should happen inside the application after login, not during signup/login.
+   * improve the **Actors** page where users can manage actors easily.
+
+4. **Actors Page Requirements**
+   The Actors page should show two sections:
+
+   * **All Actors**
+
+     * Shows all actors available in the team/project.
+     * Helps users understand which agents/developers are working in the system.
+
+   * **My Actors**
+
+     * Shows only the actors created by the logged-in user.
+     * The user should be able to:
+
+       * Add a new actor
+       * Edit actor name
+       * Delete their own actor
+
+5. **Reasoning**
+   One user may work with multiple agents or developer identities. For example, the same user may use Gemini, Claude, Codex, or manual developer mode. Instead of forcing actor selection during login, the user should be able to create and manage actors after onboarding.
+
+6. **Goal**
+   Make TaskPilot onboarding simple, clean, and team-friendly.
+
+   The ideal experience should be:
+
+   * New user opens TaskPilot
+   * Signs up with email and password
+   * Gets a default actor automatically
+   * Enters the dashboard immediately
+   * Can later manage actors from the Actors page
+
+7. **Expected Outcome**
+   Refactor the authentication and onboarding flow to remove unnecessary complexity, simplify team adoption, and make actor management an internal app feature instead of a login/signup requirement.
+
+---
+
+ok this is working but now make me understand form a scenario , let assume a developer first signup in the taskpilot and he generated actors , now as per the logic he have to set up the same actor in the cli such that his agent will work and his agent will able to claim , then how it will happen now
+
+---
+
+# Selected text:
+
+## Selection 1
+taskpilot login --server http://team-server:8080 --token <team-token>
+taskpilot config set-actor <actor-id> <actor-secret>
+
+## My request for Codex:
+we can do one thing in the task pilot , as i see the token system is breaking the whole flow so instead working and wasting efforts on it we can simply remove it entirely such that the whole login flow and actor flow will become easy .  such that cli will point toward the server just by a simple command and instead of token it can take mail of the user for the login in cli , and for setting the actor  config command will same and for making it easier the user will able to see there own actor id and secret in there settings page (only own agents id and secret not others) such that they will copy paste and set the actor which they want to use in the cli
+
+---
+
+generate cli setup button is tapped the setup came but it vanish in a second , fix it
