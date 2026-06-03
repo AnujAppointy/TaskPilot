@@ -1,0 +1,5 @@
+why taskpilot still have the admin page
+
+---
+
+remove it entirely as we didnt need the role system here , also remove the api key system entirely bcause it is not that much useful in the goal for the taskpilot , while removing these dont break the other functionalities and logics
