@@ -1,0 +1,96 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "d550fa6ead65",
+  "session_id": "019e86f4-ad12-7ec1-beef-2c46e2e8995d",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-03T08:09:08.877123Z",
+  "branch": "main",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "bin/taskpilot",
+    "docker-compose.yml",
+    "internal/taskpilot/auth.go",
+    "internal/taskpilot/cli.go",
+    "internal/taskpilot/config.go",
+    "internal/taskpilot/models.go",
+    "internal/taskpilot/server.go",
+    "internal/taskpilot/server_auth_test.go",
+    "internal/taskpilot/static/app.js",
+    "internal/taskpilot/static/index.html",
+    "internal/taskpilot/store.go",
+    "internal/taskpilot/store_test.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.4",
+  "turn_id": "befb60f6aa5d",
+  "token_usage": {
+    "input_tokens": 720846,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 2573952,
+    "output_tokens": 21770,
+    "api_call_count": 39
+  },
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-03T08:09:08.838885Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 825,
+    "total_committed": 0,
+    "total_lines_changed": 825,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 81,
+      "user_lines_removed": 825,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "internal/taskpilot/auth.go": 22,
+        "internal/taskpilot/cli.go": 10,
+        "internal/taskpilot/config.go": 1,
+        "internal/taskpilot/models.go": 1,
+        "internal/taskpilot/server.go": 4,
+        "internal/taskpilot/server_auth_test.go": 22,
+        "internal/taskpilot/static/app.js": 7,
+        "internal/taskpilot/static/index.html": 2,
+        "internal/taskpilot/store.go": 7,
+        "internal/taskpilot/store_test.go": 5
+      },
+      "user_removed_per_file": {
+        "docker-compose.yml": 1,
+        "internal/taskpilot/auth.go": 169,
+        "internal/taskpilot/cli.go": 209,
+        "internal/taskpilot/config.go": 12,
+        "internal/taskpilot/models.go": 16,
+        "internal/taskpilot/server.go": 127,
+        "internal/taskpilot/server_auth_test.go": 93,
+        "internal/taskpilot/static/app.js": 167,
+        "internal/taskpilot/static/index.html": 2,
+        "internal/taskpilot/store.go": 6,
+        "internal/taskpilot/store_test.go": 23
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 81,
+      "agent_lines_removed": 825
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 81,
+      "agent_lines_removed": 825
+    }
+  ]
+}
