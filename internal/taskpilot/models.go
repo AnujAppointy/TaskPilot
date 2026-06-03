@@ -8,13 +8,14 @@ const (
 )
 
 type Actor struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Kind        string     `json:"kind"`
-	MachineName string     `json:"machine_name,omitempty"`
-	Secret      string     `json:"actor_secret,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	Kind            string     `json:"kind"`
+	MachineName     string     `json:"machine_name,omitempty"`
+	Secret          string     `json:"actor_secret,omitempty"`
+	CreatedByUserID string     `json:"created_by_user_id,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
 }
 
 type User struct {
@@ -46,6 +47,8 @@ type Principal struct {
 	Role    string   `json:"role"`
 	ActorID string   `json:"actor_id,omitempty"`
 	UserID  string   `json:"user_id,omitempty"`
+	Email   string   `json:"email,omitempty"`
+	Name    string   `json:"name,omitempty"`
 	Scopes  []string `json:"scopes,omitempty"`
 }
 

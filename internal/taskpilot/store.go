@@ -177,7 +177,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`PRAGMA journal_mode=WAL`,
 		`CREATE TABLE IF NOT EXISTS actors (
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, machine_name TEXT,
-			created_at TEXT NOT NULL, last_seen_at TEXT, actor_secret_hash TEXT
+			created_at TEXT NOT NULL, last_seen_at TEXT, actor_secret_hash TEXT, created_by_user_id TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, password_hash TEXT NOT NULL,
@@ -296,6 +296,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	_, _ = s.exec(ctx, `ALTER TABLE actors ADD COLUMN actor_secret_hash TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE actors ADD COLUMN created_by_user_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT 'project_default'`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN repo_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN workspace_id TEXT`)
@@ -492,6 +493,50 @@ func (s *Store) ListWorkspaces(ctx context.Context, projectID string) ([]Workspa
 }
 
 func (s *Store) RegisterActor(ctx context.Context, name, kind, machine string) (Actor, error) {
+	return s.RegisterActorForUser(ctx, name, kind, machine, "")
+}
+
+func actorSlugFromUser(u User) string {
+	base := strings.TrimSpace(strings.Split(strings.ToLower(u.Email), "@")[0])
+	if base == "" {
+		base = strings.ToLower(strings.TrimSpace(u.Name))
+	}
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore && b.Len() > 0 {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		out = "user"
+	}
+	return out + "_agent"
+}
+
+func (s *Store) EnsureDefaultActorForUser(ctx context.Context, u User) (Actor, error) {
+	if u.ID == "" {
+		return Actor{}, userErr("validation", "user id is required")
+	}
+	row := s.queryRow(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at,created_by_user_id FROM actors WHERE created_by_user_id=? ORDER BY created_at ASC LIMIT 1`, u.ID)
+	a, err := scanActor(row)
+	if err == nil {
+		return a, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Actor{}, err
+	}
+	return s.RegisterActorForUser(ctx, actorSlugFromUser(u), "agent", "", u.ID)
+}
+
+func (s *Store) RegisterActorForUser(ctx context.Context, name, kind, machine, createdByUserID string) (Actor, error) {
 	if strings.TrimSpace(name) == "" {
 		return Actor{}, userErr("validation", "actor name is required")
 	}
@@ -503,15 +548,19 @@ func (s *Store) RegisterActor(ctx context.Context, name, kind, machine string) (
 	}
 	now := time.Now().UTC()
 	secret := newSecret()
-	a := Actor{ID: newID("actor"), Name: name, Kind: kind, MachineName: machine, Secret: secret, CreatedAt: now, LastSeenAt: &now}
-	_, err := s.exec(ctx, `INSERT INTO actors (id,name,kind,machine_name,created_at,last_seen_at,actor_secret_hash) VALUES (?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.Kind, a.MachineName, ts(a.CreatedAt), tsPtr(a.LastSeenAt), secretHash(secret))
+	a := Actor{ID: newID("actor"), Name: strings.TrimSpace(name), Kind: kind, MachineName: strings.TrimSpace(machine), Secret: secret, CreatedByUserID: createdByUserID, CreatedAt: now, LastSeenAt: &now}
+	_, err := s.exec(ctx, `INSERT INTO actors (id,name,kind,machine_name,created_at,last_seen_at,actor_secret_hash,created_by_user_id) VALUES (?,?,?,?,?,?,?,?)`,
+		a.ID, a.Name, a.Kind, a.MachineName, ts(a.CreatedAt), tsPtr(a.LastSeenAt), secretHash(secret), a.CreatedByUserID)
 	if err != nil {
 		return Actor{}, err
 	}
 	eventActor := a
 	eventActor.Secret = ""
-	return a, s.addEvent(ctx, "", a.ID, "actor.registered", eventActor)
+	eventBy := a.ID
+	if createdByUserID != "" {
+		eventBy = createdByUserID
+	}
+	return a, s.addEvent(ctx, "", eventBy, "actor.registered", eventActor)
 }
 
 func (s *Store) VerifyActorSecret(ctx context.Context, actorID, secret string) (bool, error) {
@@ -538,7 +587,7 @@ func (s *Store) TouchActor(ctx context.Context, actorID string) {
 }
 
 func (s *Store) ListActors(ctx context.Context) ([]Actor, error) {
-	rows, err := s.query(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at FROM actors ORDER BY created_at DESC`)
+	rows, err := s.query(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at,created_by_user_id FROM actors ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -555,12 +604,86 @@ func (s *Store) ListActors(ctx context.Context) ([]Actor, error) {
 }
 
 func (s *Store) GetActor(ctx context.Context, id string) (*Actor, error) {
-	row := s.queryRow(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at FROM actors WHERE id=?`, id)
+	row := s.queryRow(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at,created_by_user_id FROM actors WHERE id=?`, id)
 	a, err := scanActor(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	return &a, err
+}
+
+func (s *Store) UpdateActorForUser(ctx context.Context, actorID, userID, name, kind, machine string) (Actor, error) {
+	current, err := s.GetActor(ctx, actorID)
+	if err != nil {
+		return Actor{}, err
+	}
+	if current == nil {
+		return Actor{}, userErr("not_found", "actor not found")
+	}
+	if userID == "" || current.CreatedByUserID != userID {
+		return Actor{}, userErr("forbidden", "you can only edit actors created by your account")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Actor{}, userErr("validation", "actor name is required")
+	}
+	if kind == "" {
+		kind = current.Kind
+	}
+	if kind != "human" && kind != "agent" {
+		return Actor{}, userErr("validation", "actor kind must be human or agent")
+	}
+	_, err = s.exec(ctx, `UPDATE actors SET name=?, kind=?, machine_name=? WHERE id=?`, name, kind, strings.TrimSpace(machine), actorID)
+	if err != nil {
+		return Actor{}, err
+	}
+	updated, err := s.GetActor(ctx, actorID)
+	if err != nil {
+		return Actor{}, err
+	}
+	return *updated, s.addEvent(ctx, "", userID, "actor.updated", map[string]any{"id": actorID, "name": name, "kind": kind})
+}
+
+func (s *Store) DeleteActorForUser(ctx context.Context, actorID, userID string) error {
+	current, err := s.GetActor(ctx, actorID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return userErr("not_found", "actor not found")
+	}
+	if userID == "" || current.CreatedByUserID != userID {
+		return userErr("forbidden", "you can only delete actors created by your account")
+	}
+	_, err = s.exec(ctx, `DELETE FROM actors WHERE id=?`, actorID)
+	if err != nil {
+		return err
+	}
+	return s.addEvent(ctx, "", userID, "actor.deleted", map[string]any{"id": actorID, "name": current.Name})
+}
+
+func (s *Store) ResetActorSecretForUser(ctx context.Context, actorID, userID string) (Actor, error) {
+	current, err := s.GetActor(ctx, actorID)
+	if err != nil {
+		return Actor{}, err
+	}
+	if current == nil {
+		return Actor{}, userErr("not_found", "actor not found")
+	}
+	if userID == "" || current.CreatedByUserID != userID {
+		return Actor{}, userErr("forbidden", "you can only generate CLI secrets for actors created by your account")
+	}
+	secret := newSecret()
+	_, err = s.exec(ctx, `UPDATE actors SET actor_secret_hash=? WHERE id=?`, secretHash(secret), actorID)
+	if err != nil {
+		return Actor{}, err
+	}
+	updated, err := s.GetActor(ctx, actorID)
+	if err != nil {
+		return Actor{}, err
+	}
+	updated.Secret = secret
+	return *updated, s.addEvent(ctx, "", userID, "actor.secret_rotated", map[string]any{"id": actorID, "name": updated.Name})
 }
 
 type TaskInput struct {
@@ -2499,11 +2622,12 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanActor(row scanner) (Actor, error) {
 	var a Actor
-	var created, last sql.NullString
-	if err := row.Scan(&a.ID, &a.Name, &a.Kind, &a.MachineName, &created, &last); err != nil {
+	var created, last, createdBy sql.NullString
+	if err := row.Scan(&a.ID, &a.Name, &a.Kind, &a.MachineName, &created, &last, &createdBy); err != nil {
 		return Actor{}, err
 	}
 	a.CreatedAt = parseTS(created.String)
+	a.CreatedByUserID = createdBy.String
 	if last.Valid {
 		t := parseTS(last.String)
 		a.LastSeenAt = &t

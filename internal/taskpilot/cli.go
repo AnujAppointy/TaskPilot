@@ -27,6 +27,7 @@ type Config struct {
 	Server      string `json:"server"`
 	Token       string `json:"token"`
 	APIKey      string `json:"api_key,omitempty"`
+	Email       string `json:"email,omitempty"`
 	ActorID     string `json:"actor_id"`
 	ActorSecret string `json:"actor_secret"`
 }
@@ -99,11 +100,11 @@ Server:
   taskpilot serve --addr 0.0.0.0:8080 --db taskpilot.db --token dev-token
 
 Config:
-  taskpilot login --server http://127.0.0.1:8080 --token dev-token
+  taskpilot login --server http://127.0.0.1:8080 --email anuj@company.com
   taskpilot login --server http://127.0.0.1:8080 --api-key tpk_...
   taskpilot config show
   taskpilot config set-server http://127.0.0.1:8080
-  taskpilot config set-token dev-token
+  taskpilot config set-email anuj@company.com
   taskpilot config set-api-key tpk_...
   taskpilot config set-actor actor_... <actor-secret>
 
@@ -1933,11 +1934,13 @@ func runBackup(args []string) error {
 func runLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	server := fs.String("server", "http://127.0.0.1:8080", "server URL")
-	token := fs.String("token", "dev-token", "team token")
+	email := fs.String("email", "", "user email for local CLI identity notes")
+	token := fs.String("token", "", "deprecated team token")
 	apiKey := fs.String("api-key", "", "production API key")
 	_ = fs.Parse(args)
 	cfg, _ := loadConfig()
 	cfg.Server = strings.TrimRight(*server, "/")
+	cfg.Email = strings.TrimSpace(*email)
 	cfg.Token = *token
 	cfg.APIKey = *apiKey
 	return saveConfig(cfg)
@@ -1945,19 +1948,24 @@ func runLogin(args []string) error {
 
 func runConfig(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: taskpilot config show|set-server|set-token|set-api-key <value> OR taskpilot config set-actor <actor-id> <actor-secret>")
+		return fmt.Errorf("usage: taskpilot config show|set-server|set-email|set-api-key <value> OR taskpilot config set-actor <actor-id> <actor-secret>")
 	}
 	cfg, _ := loadConfig()
 	switch args[0] {
 	case "show":
 		safe := map[string]any{
 			"server":     cfg.Server,
+			"email":      cfg.Email,
 			"actor_id":   cfg.ActorID,
 			"has_secret": cfg.ActorSecret != "",
-			"auth":       "team_token",
+			"auth":       "actor_secret",
 		}
 		if cfg.APIKey != "" {
 			safe["auth"] = "api_key"
+		} else if cfg.ActorID == "" || cfg.ActorSecret == "" {
+			safe["auth"] = "not_configured"
+		} else if cfg.Token != "" {
+			safe["deprecated_team_token_configured"] = true
 		}
 		b, _ := json.MarshalIndent(safe, "", "  ")
 		fmt.Println(string(b))
@@ -1967,6 +1975,11 @@ func runConfig(args []string) error {
 			return fmt.Errorf("usage: taskpilot config set-server <url>")
 		}
 		cfg.Server = strings.TrimRight(args[1], "/")
+	case "set-email":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: taskpilot config set-email <email>")
+		}
+		cfg.Email = strings.TrimSpace(args[1])
 	case "set-token":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: taskpilot config set-token <token>")
@@ -2504,9 +2517,6 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 	if cfg.Server == "" {
 		cfg.Server = "http://127.0.0.1:8080"
 	}
-	if cfg.Token == "" {
-		cfg.Token = "dev-token"
-	}
 	var reader io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -2519,7 +2529,7 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.APIKey != "" {
 		req.Header.Set("Authorization", "ApiKey "+cfg.APIKey)
-	} else {
+	} else if cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
 	if includeActor && cfg.ActorID != "" {
@@ -2532,7 +2542,7 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 	if err != nil {
 		var netErr net.Error
 		if errors.As(err, &netErr) || strings.Contains(err.Error(), "connect: connection refused") || strings.Contains(err.Error(), "operation not permitted") {
-			return fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080 --token <token>` and check `taskpilot config set-server`", cfg.Server)
+			return fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080` and check `taskpilot config set-server`", cfg.Server)
 		}
 		return err
 	}

@@ -1,7 +1,7 @@
 const apiState = {
   token: loadSetting("taskpilot.token", "dev-token"),
   apiKey: loadSetting("taskpilot.apiKey", ""),
-  legacyEnabled: loadSetting("taskpilot.legacyEnabled", "") === "true",
+  legacyEnabled: false,
   actor: loadSetting("taskpilot.actor", ""),
   actorSecret: loadSetting("taskpilot.actorSecret", ""),
   principal: null,
@@ -42,6 +42,7 @@ const apiState = {
   memoryError: "",
   memoryMode: "auto",
   handoffModal: null,
+  actorSetupCommands: {},
 };
 
 const statuses = ["ready", "claimed", "in_progress", "blocked", "handoff_ready", "in_review", "completed"];
@@ -122,6 +123,24 @@ function canWrite() {
   return apiState.principal && writeRoles.includes(apiState.principal.role);
 }
 
+function currentUserID() {
+  return apiState.principal && (apiState.principal.user_id || apiState.principal.id || "");
+}
+
+function identityLabel() {
+  if (!apiState.principal) return "Not signed in";
+  if (apiState.principal.kind === "user") return apiState.principal.name || apiState.principal.email || "TaskPilot user";
+  if (apiState.principal.kind === "api_key") return "Agent API key";
+  if (apiState.principal.kind === "legacy_actor") return "Development actor";
+  return apiState.principal.kind;
+}
+
+function actorOwnershipLabel(actor) {
+  if (actor.created_by_user_id && actor.created_by_user_id === currentUserID()) return "Yours";
+  if (actor.created_by_user_id) return "Team actor";
+  return "Legacy actor";
+}
+
 function authHeaders(includeActor = true) {
   const headers = { "Content-Type": "application/json" };
   if (apiState.apiKey) {
@@ -130,6 +149,9 @@ function authHeaders(includeActor = true) {
     headers.Authorization = `Bearer ${apiState.token}`;
     if (includeActor && apiState.actor) headers["X-Actor-ID"] = apiState.actor;
     if (includeActor && apiState.actorSecret) headers["X-Actor-Secret"] = apiState.actorSecret;
+  } else if (includeActor && apiState.actor && apiState.actorSecret) {
+    headers["X-Actor-ID"] = apiState.actor;
+    headers["X-Actor-Secret"] = apiState.actorSecret;
   }
   return headers;
 }
@@ -1045,22 +1067,111 @@ function actionsPanel(task) {
 }
 
 function actorsView() {
-  return h("div", { class: "grid2" }, actorForm(), h("div", { class: "panel list" }, h("h2", {}, "People / Agents"), apiState.actors.map(a => h("div", { class: "item" }, h("strong", {}, a.name), h("p", {}, `${a.kind} · ${a.machine_name || "no machine"} · ${a.id}`)))));
+  const mine = apiState.actors.filter(a => a.created_by_user_id && a.created_by_user_id === currentUserID());
+  return h("div", { class: "grid2" },
+    myActorsPanel(mine),
+    h("div", { class: "panel list" },
+      h("h2", {}, "All Actors"),
+      h("p", { class: "meta" }, "Team-visible human and agent identities currently registered in TaskPilot."),
+      apiState.actors.length ? apiState.actors.map(a => h("div", { class: "item" },
+        h("div", { class: "item-head" },
+          h("strong", {}, a.name),
+          h("span", { class: "pill" }, actorOwnershipLabel(a))
+        ),
+        h("p", {}, `${a.kind} · ${a.machine_name || "no machine"} · ${a.id}`)
+      )) : h("p", { class: "meta" }, "No actors yet.")
+    )
+  );
 }
 
-function actorForm() {
-  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "Register Actor"), h("p", { class: "meta" }, "Your role is read-only."));
+function myActorsPanel(mine) {
+  if (!canWrite()) return h("div", { class: "panel" }, h("h2", {}, "My Actors"), h("p", { class: "meta" }, "This account is read-only."));
   const name = h("input", { placeholder: "Name" });
-  const machine = h("input", { placeholder: "Machine name" });
-  const kind = h("select", {}, h("option", { value: "agent" }, "agent"), h("option", { value: "human" }, "human"));
-  return h("div", { class: "panel form" }, h("h2", {}, "Register Actor"), name, kind, machine, h("button", { class: "primary", onclick: async () => {
-    const actor = await apiNoActor("/api/actors/register", { method: "POST", body: JSON.stringify({ name: name.value, kind: kind.value, machine_name: machine.value }) });
-    saveSetting("taskpilot.actor", actor.id);
-    saveSetting("taskpilot.actorSecret", actor.actor_secret);
-    apiState.actor = actor.id;
-    apiState.actorSecret = actor.actor_secret;
-    await refresh();
-  }}, "Register and Use"));
+  const machine = h("input", { placeholder: "Machine or tool, optional" });
+  const kind = h("select", {}, h("option", { value: "agent" }, "Agent"), h("option", { value: "human" }, "Manual developer"));
+  return h("div", { class: "panel form" },
+    h("h2", {}, "My Actors"),
+    h("p", { class: "meta" }, "Create one actor per agent or work mode. Recommended names: yourname_agentname, for example anuj_codex or priya_gemini."),
+    h("div", { class: "row" }, name, kind, machine),
+    h("button", { class: "primary", onclick: async () => {
+      await api("/api/actors/register", { method: "POST", body: JSON.stringify({ name: name.value, kind: kind.value, machine_name: machine.value }) });
+      name.value = "";
+      machine.value = "";
+      await refresh();
+    }}, "Add Actor"),
+    h("div", { class: "list" },
+      mine.length ? mine.map(myActorItem) : h("p", { class: "meta" }, "Your default actor will appear here after signup. Add more actors for Gemini, Claude, Codex, or manual developer mode.")
+    )
+  );
+}
+
+function myActorItem(actor) {
+  const name = h("input", { value: actor.name, placeholder: "Actor name" });
+  const machine = h("input", { value: actor.machine_name || "", placeholder: "Machine or tool" });
+  const existingSetup = apiState.actorSetupCommands[actor.id] || "";
+  const setup = h("textarea", { readonly: "readonly", style: `${existingSetup ? "" : "display:none;"}min-height:110px;`, value: existingSetup });
+  const kind = h("select", {},
+    h("option", { value: "agent", selected: actor.kind === "agent" }, "Agent"),
+    h("option", { value: "human", selected: actor.kind === "human" }, "Manual developer")
+  );
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", {}, actor.name),
+      h("span", { class: "pill amber" }, actor.kind)
+    ),
+    h("p", { class: "meta" }, actor.id),
+    h("div", { class: "row" }, name, kind, machine),
+    h("div", { class: "button-row" },
+      h("button", { onclick: async () => {
+        await api(`/api/actors/${actor.id}`, { method: "PATCH", body: JSON.stringify({ name: name.value, kind: kind.value, machine_name: machine.value }) });
+        await refresh();
+      }}, "Save"),
+      h("button", { onclick: async () => {
+        const fresh = await api(`/api/actors/${actor.id}/secret`, { method: "POST", body: "{}" });
+        const server = window.location.origin;
+        const email = apiState.principal.email || "";
+        apiState.actorSetupCommands[actor.id] = [
+          `taskpilot login --server ${server}${email ? ` --email ${email}` : ""}`,
+          `taskpilot config set-actor ${fresh.id} ${fresh.actor_secret}`,
+          "taskpilot config show",
+        ].join("\n");
+        setup.value = apiState.actorSetupCommands[actor.id];
+        setup.style.display = "block";
+      }}, "Generate CLI Setup"),
+      h("button", { class: "danger", onclick: async () => {
+        if (!confirm(`Delete actor "${actor.name}"?`)) return;
+        await api(`/api/actors/${actor.id}`, { method: "DELETE" });
+        await refresh();
+      }}, "Delete")
+    ),
+    setup,
+    h("p", { class: "meta" }, "The CLI secret is shown only after generation. Generating a new one replaces the previous actor secret.")
+  );
+}
+
+function cliSetupItem(actor) {
+  const existingSetup = apiState.actorSetupCommands[actor.id] || "";
+  const setup = h("textarea", { readonly: "readonly", style: `${existingSetup ? "" : "display:none;"}min-height:110px;`, value: existingSetup });
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", {}, actor.name),
+      h("span", { class: "pill" }, actor.kind)
+    ),
+    h("p", { class: "meta" }, `Actor ID: ${actor.id}`),
+    h("button", { onclick: async () => {
+      const fresh = await api(`/api/actors/${actor.id}/secret`, { method: "POST", body: "{}" });
+      const server = window.location.origin;
+      const email = apiState.principal.email || "";
+      apiState.actorSetupCommands[actor.id] = [
+        `taskpilot login --server ${server}${email ? ` --email ${email}` : ""}`,
+        `taskpilot config set-actor ${fresh.id} ${fresh.actor_secret}`,
+        "taskpilot config show",
+      ].join("\n");
+      setup.value = apiState.actorSetupCommands[actor.id];
+      setup.style.display = "block";
+    }}, "Generate CLI Secret"),
+    setup
+  );
 }
 
 function handoffsView() {
@@ -1330,56 +1441,31 @@ function changePasswordForm() {
 }
 
 function settings() {
-  const token = h("input", { value: apiState.token, placeholder: "Team token" });
   const apiKey = h("input", { value: apiState.apiKey, placeholder: "API key" });
-  const actorID = h("input", { value: apiState.actor, placeholder: "Actor ID from CLI config" });
-  const actorSecret = h("input", { value: apiState.actorSecret, placeholder: "Actor secret from CLI config" });
-  const identity = apiState.principal
-    ? `${apiState.principal.kind} · ${apiState.principal.role} · ${apiState.principal.actor_id || apiState.principal.user_id || "session"}`
-    : "Not signed in";
-  return h("div", { class: "panel form" },
-    h("h2", {}, "Connection"),
-    h("p", { class: "meta" }, `Current identity: ${identity}`),
-    h("p", { class: "meta" }, "Use a team token for local testing, an API key for an agent, or paste the CLI actor credentials so dashboard and CLI act as the same identity."),
-    token,
-    apiKey,
-    h("button", { class: "primary", onclick: async () => {
-    saveSetting("taskpilot.token", token.value);
-    saveSetting("taskpilot.apiKey", apiKey.value);
-    apiState.token = token.value;
-    apiState.apiKey = apiKey.value;
-    setLegacyEnabled(!apiKey.value && !!token.value);
-    await refresh();
-  }}, "Save Connection"),
-    h("hr", {}),
-    h("p", { class: "meta" }, "Match dashboard identity to CLI. Use values from `taskpilot config show` and the local config file."),
-    actorID,
-    actorSecret,
-    h("button", { onclick: async () => {
-      apiState.error = "";
-      stopEventStream();
-      apiState.apiKey = "";
-      apiState.token = token.value.trim();
-      apiState.actor = actorID.value.trim();
-      apiState.actorSecret = actorSecret.value.trim();
-      saveSetting("taskpilot.apiKey", "");
-      saveSetting("taskpilot.token", apiState.token);
-      saveSetting("taskpilot.actor", apiState.actor);
-      saveSetting("taskpilot.actorSecret", apiState.actorSecret);
-      setLegacyEnabled(true);
-      try {
-        await api("/api/me");
+  const mine = apiState.actors.filter(a => a.created_by_user_id && a.created_by_user_id === currentUserID());
+  return h("div", { class: "grid2" },
+    h("div", { class: "panel form" },
+      h("h2", {}, "Account"),
+      h("p", { class: "meta" }, `Signed in as ${identityLabel()}. Manage Gemini, Claude, Codex, and manual identities from the Actors page.`)
+    ),
+    changePasswordForm(),
+    h("div", { class: "panel list" },
+      h("h2", {}, "My CLI Actor Setup"),
+      h("p", { class: "meta" }, "Only your own actors are shown here. Generate a fresh secret, then paste the command into the machine where that agent runs."),
+      mine.length ? mine.map(cliSetupItem) : h("p", { class: "meta" }, "No owned actors yet. Add one from the Actors page.")
+    ),
+    h("div", { class: "panel form" },
+      h("h2", {}, "Advanced Connection"),
+      h("p", { class: "meta" }, "Optional compatibility setting for scoped API-key agents. CLI actor setup is available from the Actors page."),
+      apiKey,
+      h("button", { class: "primary", onclick: async () => {
+        saveSetting("taskpilot.apiKey", apiKey.value);
+        apiState.apiKey = apiKey.value;
+        clearActorSettings();
+        setLegacyEnabled(false);
         await refresh();
-      } catch (err) {
-        apiState.error = `Could not use that actor identity. Check actor id, actor secret, and team token. (${err.message})`;
-        render();
-      }
-    }}, "Use This Actor In Dashboard"),
-    h("button", { onclick: async () => {
-      clearActorSettings();
-      await ensureLegacyActor();
-      await refresh();
-    }}, "Reset Dashboard Actor")
+      }}, "Save Advanced Connection")
+    )
   );
 }
 
@@ -1387,61 +1473,42 @@ function loginView() {
   const email = h("input", { placeholder: "Email" });
   const password = h("input", { type: "password", placeholder: "Password" });
   const apiKey = h("input", { placeholder: "Agent/API key" });
-  const token = h("input", { value: apiState.token, placeholder: "Development team token" });
-  const actorID = h("input", { value: apiState.actor, placeholder: "Existing actor ID, optional" });
-  const actorSecret = h("input", { value: apiState.actorSecret, placeholder: "Existing actor secret, optional" });
+  async function finishPasswordAuth(path) {
+    try {
+      const res = await apiRequest(path, { method: "POST", body: JSON.stringify({ email: email.value, password: password.value }) }, false);
+      apiState.apiKey = "";
+      clearActorSettings();
+      setLegacyEnabled(false);
+      saveSetting("taskpilot.apiKey", "");
+      apiState.error = res.actor_recommendation || "";
+      await refresh();
+    } catch (err) {
+      apiState.error = err.message || "Could not authenticate";
+      render();
+    }
+  }
   return h("div", { class: "login" },
     h("div", { class: "panel form login-panel" },
       h("h1", {}, "TaskPilot"),
-      h("p", { class: "meta" }, "Sign in as a human, paste an agent API key, or use the development token flow."),
+      h("p", { class: "meta" }, "Sign up or log in with email and password. TaskPilot creates your first actor automatically."),
       email, password,
-      h("button", { class: "primary", onclick: async () => {
-        await apiRequest("/api/auth/login", { method: "POST", body: JSON.stringify({ email: email.value, password: password.value }) }, false);
-        apiState.apiKey = "";
-        setLegacyEnabled(false);
-        saveSetting("taskpilot.apiKey", "");
-        await refresh();
-      }}, "Log In"),
-      h("hr", {}),
-      apiKey,
-      h("button", { onclick: async () => {
-        apiState.apiKey = apiKey.value;
-        saveSetting("taskpilot.apiKey", apiKey.value);
-        setLegacyEnabled(false);
-        await refresh();
-      }}, "Use API Key"),
-      h("hr", {}),
-      h("p", { class: "meta" }, "Docker default token: change-this-team-token-before-use. Local SQLite default token: dev-token."),
-      token,
-      actorID,
-      actorSecret,
-      h("button", { onclick: async () => {
-        try {
-          apiState.error = "";
-          stopEventStream();
-          apiState.token = token.value.trim();
-          apiState.apiKey = "";
-          saveSetting("taskpilot.apiKey", "");
-          saveSetting("taskpilot.token", apiState.token);
-          setLegacyEnabled(true);
-          if (actorID.value.trim() || actorSecret.value.trim()) {
-            apiState.actor = actorID.value.trim();
-            apiState.actorSecret = actorSecret.value.trim();
-            saveSetting("taskpilot.actor", apiState.actor);
-            saveSetting("taskpilot.actorSecret", apiState.actorSecret);
-            await api("/api/me");
-          } else {
-            await ensureLegacyActor();
-          }
-          await refresh();
-        } catch (err) {
-          setLegacyEnabled(false);
+      h("div", { class: "button-row" },
+        h("button", { class: "primary", onclick: async () => finishPasswordAuth("/api/auth/login") }, "Log In"),
+        h("button", { onclick: async () => finishPasswordAuth("/api/auth/signup") }, "Sign Up")
+      ),
+      h("p", { class: "meta" }, "You can add, rename, or delete agent identities later from the Actors page."),
+      h("details", { class: "memory-edit" },
+        h("summary", {}, "Advanced CLI / agent access"),
+        h("p", { class: "meta" }, "Use this only for scoped automation keys. Most teammates should use email/password and manage actors inside TaskPilot."),
+        apiKey,
+        h("button", { onclick: async () => {
+          apiState.apiKey = apiKey.value;
+          saveSetting("taskpilot.apiKey", apiKey.value);
           clearActorSettings();
-          apiState.principal = null;
-          apiState.error = `Development token was rejected. For the Docker setup use change-this-team-token-before-use. (${err.message})`;
-          render();
-        }
-      }}, "Use Development Token")
+          setLegacyEnabled(false);
+          await refresh();
+        }}, "Use API Key")
+      )
     )
   );
 }
@@ -1490,7 +1557,7 @@ function render() {
           h("span", {}, t)
         ))),
         h("div", { class: "identity" },
-          h("span", {}, `${apiState.principal.kind} · ${apiState.principal.role}`),
+          h("span", {}, identityLabel()),
           h("button", { onclick: () => logout(true) }, "Log Out")
         )
       ),

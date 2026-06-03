@@ -60,6 +60,7 @@ func (s *Server) routes() {
 			Started:  s.metrics.Started,
 		}, stats)))
 	})
+	s.mux.Handle("POST /api/auth/signup", http.HandlerFunc(s.handleSignup))
 	s.mux.Handle("POST /api/auth/login", http.HandlerFunc(s.handleLogin))
 	s.mux.Handle("POST /api/auth/logout", s.auth(http.HandlerFunc(s.handleLogout)))
 	s.mux.Handle("GET /api/me", s.auth(http.HandlerFunc(s.handleMe)))
@@ -79,6 +80,9 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/workspaces", s.requireScope("task:write", s.handleCreateWorkspace))
 	s.mux.Handle("POST /api/actors/register", s.auth(http.HandlerFunc(s.handleRegisterActor)))
 	s.mux.Handle("GET /api/actors", s.requireScope("task:read", s.handleActors))
+	s.mux.Handle("PATCH /api/actors/{id}", s.requireScope("task:write", s.handleUpdateActor))
+	s.mux.Handle("DELETE /api/actors/{id}", s.requireScope("task:write", s.handleDeleteActor))
+	s.mux.Handle("POST /api/actors/{id}/secret", s.requireScope("task:write", s.handleResetActorSecret))
 	s.mux.Handle("POST /api/tasks", s.requireScope("task:write", s.handleCreateTask))
 	s.mux.Handle("GET /api/tasks", s.requireScope("task:read", s.handleTasks))
 	s.mux.Handle("GET /api/tasks/{id}", s.requireScope("task:read", s.handleTaskDetail))
@@ -138,16 +142,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if got != s.token {
-			writeErr(w, http.StatusUnauthorized, userErr("unauthorized", "invalid or missing team token"))
-			return
-		}
 		actorID := r.Header.Get("X-Actor-ID")
-		if actorID == "" && r.URL.Path != "/api/actors/register" {
-			writeErr(w, http.StatusUnauthorized, userErr("unauthorized", "missing X-Actor-ID"))
-			return
-		}
 		if actorID != "" {
 			ok, err := s.store.VerifyActorSecret(r.Context(), actorID, r.Header.Get("X-Actor-Secret"))
 			if err != nil {
@@ -159,11 +154,21 @@ func (s *Server) auth(next http.Handler) http.Handler {
 				return
 			}
 			s.store.TouchActor(r.Context(), actorID)
+			p := Principal{ID: actorID, Kind: "legacy_actor", Role: "agent", ActorID: actorID, Scopes: []string{"admin"}}
+			ctx := context.WithValue(r.Context(), actorKey{}, actorID)
+			ctx = context.WithValue(ctx, principalKey{}, p)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
 		}
-		p := Principal{ID: actorID, Kind: "legacy_actor", Role: "agent", ActorID: actorID, Scopes: []string{"admin"}}
-		ctx := context.WithValue(r.Context(), actorKey{}, actorID)
-		ctx = context.WithValue(ctx, principalKey{}, p)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if got != "" && got == s.token && r.URL.Path == "/api/actors/register" {
+			p := Principal{Kind: "legacy_actor", Role: "agent", Scopes: []string{"admin"}}
+			ctx := context.WithValue(r.Context(), actorKey{}, "")
+			ctx = context.WithValue(ctx, principalKey{}, p)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		writeErr(w, http.StatusUnauthorized, userErr("unauthorized", "sign in or provide valid actor credentials"))
 	})
 }
 
@@ -237,6 +242,48 @@ func (s *Server) dashboard() http.Handler {
 	})
 }
 
+func actorRecommendation() string {
+	return "Recommended actor names use yourname_agentname, for example anuj_gemini, rahul_claude, or priya_codex."
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "taskpilot_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Now().Add(sessionTTL),
+	})
+}
+
+func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	u, err := s.store.CreateUser(r.Context(), in.Email, "", in.Password, "developer")
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
+	actor, err := s.store.EnsureDefaultActorForUser(r.Context(), u)
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
+	token, err := s.store.CreateSession(r.Context(), u.ID)
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
+	s.setSessionCookie(w, token)
+	writeJSON(w, http.StatusCreated, map[string]any{"user": u, "default_actor": actor, "actor_recommendation": actorRecommendation()})
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Email    string `json:"email"`
@@ -250,20 +297,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeResult(w, nil, err)
 		return
 	}
+	actor, err := s.store.EnsureDefaultActorForUser(r.Context(), u)
+	if err != nil {
+		writeResult(w, nil, err)
+		return
+	}
 	token, err := s.store.CreateSession(r.Context(), u.ID)
 	if err != nil {
 		writeResult(w, nil, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "taskpilot_session",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Expires:  time.Now().Add(sessionTTL),
-	})
-	writeJSON(w, http.StatusOK, map[string]any{"user": u})
+	s.setSessionCookie(w, token)
+	writeJSON(w, http.StatusOK, map[string]any{"user": u, "default_actor": actor, "actor_recommendation": actorRecommendation()})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -311,6 +356,9 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.store.CreateUser(r.Context(), in.Email, in.Name, in.Password, in.Role)
+	if err == nil {
+		_, err = s.store.EnsureDefaultActorForUser(r.Context(), u)
+	}
 	if err == nil {
 		err = s.store.addEvent(r.Context(), "", actorID(r), "user.invited", map[string]any{"id": u.ID, "email": u.Email, "role": u.Role})
 	}
@@ -430,12 +478,54 @@ func (s *Server) handleRegisterActor(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	a, err := s.store.RegisterActor(r.Context(), in.Name, in.Kind, in.MachineName)
+	userID := ""
+	if p := principal(r); p.Kind == "user" {
+		userID = p.UserID
+	}
+	a, err := s.store.RegisterActorForUser(r.Context(), in.Name, in.Kind, in.MachineName, userID)
 	writeResult(w, a, err)
 }
 
 func (s *Server) handleActors(w http.ResponseWriter, r *http.Request) {
 	out, err := s.store.ListActors(r.Context())
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleUpdateActor(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	if p.Kind != "user" || p.UserID == "" {
+		writeErr(w, http.StatusForbidden, userErr("forbidden", "only signed-in users can edit their actors"))
+		return
+	}
+	var in struct {
+		Name        string `json:"name"`
+		Kind        string `json:"kind"`
+		MachineName string `json:"machine_name"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.UpdateActorForUser(r.Context(), r.PathValue("id"), p.UserID, in.Name, in.Kind, in.MachineName)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleDeleteActor(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	if p.Kind != "user" || p.UserID == "" {
+		writeErr(w, http.StatusForbidden, userErr("forbidden", "only signed-in users can delete their actors"))
+		return
+	}
+	err := s.store.DeleteActorForUser(r.Context(), r.PathValue("id"), p.UserID)
+	writeResult(w, map[string]string{"status": "ok"}, err)
+}
+
+func (s *Server) handleResetActorSecret(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	if p.Kind != "user" || p.UserID == "" {
+		writeErr(w, http.StatusForbidden, userErr("forbidden", "only signed-in users can generate CLI secrets for their actors"))
+		return
+	}
+	out, err := s.store.ResetActorSecretForUser(r.Context(), r.PathValue("id"), p.UserID)
 	writeResult(w, out, err)
 }
 

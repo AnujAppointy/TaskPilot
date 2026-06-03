@@ -69,13 +69,34 @@ func roleAllows(role, required string) bool {
 	return false
 }
 
+func defaultNameFromEmail(email string) string {
+	local := strings.TrimSpace(strings.Split(strings.ToLower(email), "@")[0])
+	if local == "" {
+		return "TaskPilot User"
+	}
+	parts := strings.FieldsFunc(local, func(r rune) bool {
+		return r == '.' || r == '_' || r == '-' || r == '+'
+	})
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	out := strings.TrimSpace(strings.Join(parts, " "))
+	if out == "" {
+		return "TaskPilot User"
+	}
+	return out
+}
+
 func (s *Store) CreateUser(ctx context.Context, email, name, password, role string) (User, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
 		return User{}, userErr("validation", "email is required")
 	}
 	if strings.TrimSpace(name) == "" {
-		return User{}, userErr("validation", "name is required")
+		name = defaultNameFromEmail(email)
 	}
 	if role == "" {
 		role = "developer"
@@ -92,6 +113,9 @@ func (s *Store) CreateUser(ctx context.Context, email, name, password, role stri
 	_, err = s.exec(ctx, `INSERT INTO users (id,email,name,password_hash,role,active,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?,NULL)`,
 		u.ID, u.Email, u.Name, hash, u.Role, 1, ts(u.CreatedAt))
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return User{}, userErr("validation", "an account with this email already exists")
+		}
 		return User{}, err
 	}
 	return u, s.addEvent(ctx, "", u.ID, "user.created", map[string]any{"id": u.ID, "email": u.Email, "role": u.Role})
@@ -250,16 +274,16 @@ func (s *Store) VerifySession(ctx context.Context, token string) (Principal, err
 	if token == "" {
 		return Principal{}, userErr("unauthorized", "missing session")
 	}
-	var userID, role string
-	err := s.queryRow(ctx, `SELECT users.id, users.role FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.revoked_at IS NULL AND sessions.expires_at>? AND users.active=1`,
-		hashToken(token), ts(time.Now().UTC())).Scan(&userID, &role)
+	var userID, role, email, name string
+	err := s.queryRow(ctx, `SELECT users.id, users.role, users.email, users.name FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.revoked_at IS NULL AND sessions.expires_at>? AND users.active=1`,
+		hashToken(token), ts(time.Now().UTC())).Scan(&userID, &role, &email, &name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Principal{}, userErr("unauthorized", "invalid session")
 	}
 	if err != nil {
 		return Principal{}, err
 	}
-	return Principal{ID: userID, Kind: "user", Role: role, UserID: userID, ActorID: userID}, nil
+	return Principal{ID: userID, Kind: "user", Role: role, UserID: userID, ActorID: userID, Email: email, Name: name}, nil
 }
 
 func (s *Store) RevokeSession(ctx context.Context, token string) error {
