@@ -994,6 +994,75 @@ func TestHandoffCheckpointAcceptsConciseCoreSectionsOnlyDraft(t *testing.T) {
 	}
 }
 
+func TestHandoffCheckpointFiltersTaskPilotOperationalNoise(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Planning", Goal: "Create brief planning.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noisy := `# Task Handoff
+
+## Objective
+Create brief planning.md
+
+## Current Status
+in_progress
+
+## Current State
+The requested planning document has been created and verified locally. TaskPilot context log and handoff are updated. The handoff checkpoint command still depends on TaskPilot server reachability.
+
+## Completed Work
+- Read the TaskPilot instruction prompt before any repository analysis.
+- Read the authoritative task snapshot JSON and confirmed the current goal is to create a brief planning.md for making a 2D snake game.
+- Read the related-context JSON; it contained no related tasks.
+- Recorded initial progress in the TaskPilot context log.
+- Corrected the handoff file heading to satisfy TaskPilot markdown validation.
+- Created D:\SnakeGame\planning.md with a concise plan for a 2D snake game.
+- Verified the file contents and checked git status; only planning.md is untracked.
+
+## Important Decisions
+- Follow the injected TaskPilot files as the source of truth and ignore repo-local TaskPilot state.
+- Place planning.md in the repository root because the repository had no existing docs structure and no source files that suggested a different location.
+
+## Known Issues
+- taskpilot handoff checkpoint could not reach the TaskPilot server from this runtime; continuing from injected context as instructed.
+
+## Remaining Work
+- Run taskpilot handoff checkpoint once the TaskPilot server is reachable, if checkpoint persistence is required.
+
+## Suggested Next Steps
+- If the user wants implementation work next, use planning.md as the baseline for project setup and milestone breakdown.
+- If TaskPilot server access is restored, rerun the handoff checkpoint command to persist the final handoff state.
+
+## Handoff Message
+planning.md is complete in the repo root and verified. The only remaining external step is TaskPilot handoff checkpointing once server connectivity is available.
+`
+	if _, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", noisy); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.LatestHandoffPacket(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := latest.Markdown
+	for _, notWant := range []string{"TaskPilot instruction prompt", "authoritative task snapshot", "related-context JSON", "context log", "handoff file heading", "TaskPilot server", "taskpilot handoff checkpoint", "source of truth"} {
+		if strings.Contains(rendered, notWant) {
+			t.Fatalf("handoff should filter operational noise %q:\n%s", notWant, rendered)
+		}
+	}
+	for _, want := range []string{"Created D:\\SnakeGame\\planning.md", "Verified the file contents", "Place planning.md in the repository root", "use planning.md as the baseline"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("handoff should preserve task insight %q:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestAgentAuthoredPlaceholderHandoffMergesRunEvidence(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

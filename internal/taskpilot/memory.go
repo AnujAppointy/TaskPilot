@@ -333,19 +333,21 @@ func mergeAgentAuthoredHandoffWithFallback(agent HandoffPacketContent, detail Ta
 }
 
 func cleanHandoffPacketContent(out HandoffPacketContent) HandoffPacketContent {
-	out.CompletedWork = compactHandoffWorkItems(uniqueStrings(out.CompletedWork))
-	out.ImportantDecisions = uniqueStrings(out.ImportantDecisions)
-	out.RejectedApproaches = compactContainedStrings(uniqueStrings(out.RejectedApproaches))
-	out.ArchitectureNotes = compactContainedStrings(uniqueStrings(out.ArchitectureNotes))
-	out.ImplementationNotes = appendUsefulImplementationNotes(nil, uniqueStrings(out.ImplementationNotes)...)
-	out.FilesComponentsAffected = uniqueStrings(out.FilesComponentsAffected)
-	out.KnownIssues = compactContainedStrings(uniqueStrings(out.KnownIssues))
-	out.FailedSessions = compactContainedStrings(uniqueStrings(out.FailedSessions))
-	out.RemainingWork = latestActionableNextSteps(uniqueStrings(out.RemainingWork))
-	out.SuggestedNextSteps = latestActionableNextSteps(uniqueStrings(out.SuggestedNextSteps))
-	out.Assumptions = compactContainedStrings(uniqueStrings(out.Assumptions))
-	out.Risks = compactContainedStrings(uniqueStrings(out.Risks))
-	out.Dependencies = compactContainedStrings(uniqueStrings(out.Dependencies))
+	out.CurrentState = cleanOperationalHandoffText(out.CurrentState)
+	out.CompletedWork = compactHandoffWorkItems(filterOperationalHandoffItems(uniqueStrings(out.CompletedWork)))
+	out.ImportantDecisions = filterOperationalHandoffItems(uniqueStrings(out.ImportantDecisions))
+	out.RejectedApproaches = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.RejectedApproaches)))
+	out.ArchitectureNotes = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.ArchitectureNotes)))
+	out.ImplementationNotes = appendUsefulImplementationNotes(nil, filterOperationalHandoffItems(uniqueStrings(out.ImplementationNotes))...)
+	out.FilesComponentsAffected = filterOperationalHandoffItems(uniqueStrings(out.FilesComponentsAffected))
+	out.KnownIssues = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.KnownIssues)))
+	out.FailedSessions = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.FailedSessions)))
+	out.RemainingWork = latestActionableNextSteps(filterOperationalHandoffItems(uniqueStrings(out.RemainingWork)))
+	out.SuggestedNextSteps = latestActionableNextSteps(filterOperationalHandoffItems(uniqueStrings(out.SuggestedNextSteps)))
+	out.Assumptions = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.Assumptions)))
+	out.Risks = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.Risks)))
+	out.Dependencies = compactContainedStrings(filterOperationalHandoffItems(uniqueStrings(out.Dependencies)))
+	out.HandoffMessage = cleanOperationalHandoffText(out.HandoffMessage)
 	return out
 }
 
@@ -1054,6 +1056,126 @@ func isNoisyContext(content string) bool {
 	}
 	for _, item := range noisy {
 		if strings.Contains(content, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterOperationalHandoffItems(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || isOperationalHandoffContent(value) {
+			continue
+		}
+		out = append(out, cleanOperationalHandoffText(value))
+	}
+	return uniqueStrings(out)
+}
+
+func cleanOperationalHandoffText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || isOperationalHandoffContent(value) {
+		return ""
+	}
+	if !containsOperationalHandoffPhrase(value) {
+		return value
+	}
+	parts := splitHandoffSentences(value)
+	kept := []string{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || isOperationalHandoffContent(part) {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if len(kept) == 0 {
+		return value
+	}
+	return strings.TrimSpace(strings.Join(kept, " "))
+}
+
+func splitHandoffSentences(value string) []string {
+	value = strings.ReplaceAll(value, "\n", " ")
+	value = strings.Join(strings.Fields(value), " ")
+	parts := []string{}
+	start := 0
+	for i, r := range value {
+		if r != '.' && r != '!' && r != '?' {
+			continue
+		}
+		end := i + len(string(r))
+		parts = append(parts, strings.TrimSpace(value[start:end]))
+		start = end
+	}
+	if start < len(value) {
+		parts = append(parts, strings.TrimSpace(value[start:]))
+	}
+	return parts
+}
+
+func isOperationalHandoffContent(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return false
+	}
+	if containsOperationalHandoffPhrase(normalized) {
+		return true
+	}
+	if strings.Contains(normalized, "read") && strings.Contains(normalized, "task snapshot") {
+		return true
+	}
+	if strings.Contains(normalized, "read") && strings.Contains(normalized, "prompt") {
+		return true
+	}
+	if strings.Contains(normalized, "recorded") && strings.Contains(normalized, "progress") && strings.Contains(normalized, "context") {
+		return true
+	}
+	if strings.Contains(normalized, "rerun") && strings.Contains(normalized, "checkpoint") {
+		return true
+	}
+	return false
+}
+
+func containsOperationalHandoffPhrase(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	phrases := []string{
+		"taskpilot instruction prompt",
+		"taskpilot prompt",
+		"taskpilot context log",
+		"taskpilot context was",
+		"taskpilot markdown validation",
+		"taskpilot server",
+		"taskpilot handoff checkpoint",
+		"handoff checkpoint command",
+		"checkpoint persistence",
+		"checkpointing once server",
+		"server reachability",
+		"server is reachable",
+		"server access is restored",
+		"server access",
+		"source of truth",
+		"repo-local taskpilot",
+		"ignore repo-local",
+		"injected taskpilot",
+		"injected context",
+		"injected prompt",
+		"authoritative task snapshot",
+		"task snapshot json",
+		"related-context json",
+		"related context json",
+		"related context before",
+		"related context files",
+		"context log",
+		"handoff file heading",
+		"updated the handoff draft",
+		"updated handoff draft",
+		"local handoff markdown",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(normalized, phrase) {
 			return true
 		}
 	}
