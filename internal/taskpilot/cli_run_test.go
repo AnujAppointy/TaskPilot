@@ -125,6 +125,84 @@ func TestAgentLaunchPromptPointsToFullPromptFile(t *testing.T) {
 	}
 }
 
+func TestRelatedTaskCandidatesIncludeSameProjectPriorContextFallback(t *testing.T) {
+	now := time.Date(2026, 6, 4, 6, 0, 0, 0, time.UTC)
+	current := TaskDetail{Task: Task{ID: "task_current", ProjectID: "project_1", Title: "game.md", Goal: "Create game overview", UpdatedAt: now}}
+	tasks := []Task{
+		{
+			ID:         "task_prior",
+			ProjectID:  "project_1",
+			Title:      "planning.md",
+			Goal:       "Plan the same game",
+			Status:     "completed",
+			UpdatedAt:  now.Add(-1 * time.Hour),
+			SearchText: "Created planning.md with game rules and implementation notes.",
+		},
+	}
+
+	got := relatedTaskCandidates(current, tasks, now)
+	if len(got) != 1 {
+		t.Fatalf("expected same-project prior context fallback, got %+v", got)
+	}
+	if got[0].Task.ID != "task_prior" {
+		t.Fatalf("expected task_prior, got %+v", got[0])
+	}
+	reasons := strings.Join(got[0].Reasons, "\n")
+	for _, want := range []string{"same-project prior context", "has recorded task context"} {
+		if !strings.Contains(reasons, want) {
+			t.Fatalf("fallback reasons missing %q: %+v", want, got[0].Reasons)
+		}
+	}
+}
+
+func TestRelatedTaskCandidatesIgnoreSameProjectTasksWithoutMemorySignals(t *testing.T) {
+	now := time.Date(2026, 6, 4, 6, 0, 0, 0, time.UTC)
+	current := TaskDetail{Task: Task{ID: "task_current", ProjectID: "project_1", Title: "game.md", Goal: "Create game overview", UpdatedAt: now}}
+	tasks := []Task{
+		{
+			ID:        "task_empty",
+			ProjectID: "project_1",
+			Title:     "unstarted idea",
+			Goal:      "No recorded work yet",
+			Status:    "ready",
+			UpdatedAt: now.Add(-1 * time.Hour),
+		},
+	}
+
+	if got := relatedTaskCandidates(current, tasks, now); len(got) != 0 {
+		t.Fatalf("expected empty same-project task without memory to be ignored, got %+v", got)
+	}
+}
+
+func TestSummarizeRelatedTaskIncludesLatestHandoffMarkdown(t *testing.T) {
+	now := time.Date(2026, 6, 4, 6, 0, 0, 0, time.UTC)
+	detail := TaskDetail{
+		Task: Task{ID: "task_prior", ProjectID: "project_1", Title: "game.md", Goal: "Create game overview", Status: "completed", UpdatedAt: now},
+		HandoffPacket: &HandoffPacket{
+			ID: "packet_1",
+			Packet: HandoffPacketContent{
+				HandoffMessage: "game.md is complete and ready for related tasks.",
+			},
+			Markdown: "# Old Handoff\n\nOlder packet markdown.",
+		},
+		HandoffCheckpoints: []HandoffCheckpoint{
+			{ID: "checkpoint_1", Sequence: 1, Markdown: "# Task Handoff\n\n## Completed Work\n- Created game.md"},
+			{ID: "checkpoint_2", Sequence: 2, Markdown: "# Task Handoff\n\n## Completed Work\n- Added colors section"},
+		},
+	}
+
+	got := summarizeRelatedTask(detail, nil, []string{"same-project prior context"})
+	if got.HandoffSummary != "game.md is complete and ready for related tasks." {
+		t.Fatalf("expected handoff packet message as summary, got %q", got.HandoffSummary)
+	}
+	if got.HandoffSource != "handoff_checkpoint:checkpoint_2" {
+		t.Fatalf("expected latest checkpoint source, got %q", got.HandoffSource)
+	}
+	if !strings.Contains(got.HandoffMarkdown, "Added colors section") || strings.Contains(got.HandoffMarkdown, "Created game.md") {
+		t.Fatalf("expected latest checkpoint markdown only, got %q", got.HandoffMarkdown)
+	}
+}
+
 func TestTouchedFilesSummary(t *testing.T) {
 	before := map[string]gitFileState{"auth/old.go": {Status: "M", ModTime: 1, Size: 10}, "planning.md": {Status: "M", ModTime: 1, Size: 20}}
 	after := map[string]gitFileState{"auth/old.go": {Status: "M", ModTime: 1, Size: 10}, "auth/new.go": {Status: "??", ModTime: 2, Size: 10}, "planning.md": {Status: "M", ModTime: 3, Size: 25}}
@@ -179,6 +257,12 @@ func TestAgentHandoffTemplateRequiresRealAgentEdits(t *testing.T) {
 	errs := validateHandoffQuality(content)
 	if len(errs) == 0 {
 		t.Fatalf("expected placeholder handoff template to require real agent edits:\n%s", markdown)
+	}
+	if strings.Contains(markdown, "TaskPilot") || strings.Contains(markdown, "Be concise by default") || strings.Contains(markdown, "Preserve important long context") {
+		t.Fatal("handoff template should not include TaskPilot mechanics or writing rules")
+	}
+	if !strings.Contains(agentStartupPrompt("task_1", "task.json", "related.json", "context.log", "handoff.md"), "Preserve important long context") || !strings.Contains(agentInstructions("task_1"), "Be concise by default") {
+		t.Fatal("startup instructions should include handoff writing quality rules")
 	}
 	if !strings.Contains(agentStartupPrompt("task_1", "task.json", "related.json", "context.log", "handoff.md"), "handoff checkpoint") || !strings.Contains(agentInstructions("task_1"), "taskpilot handoff checkpoint") {
 		t.Fatal("startup instructions should tell the agent to maintain the handoff file")

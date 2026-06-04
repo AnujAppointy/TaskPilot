@@ -560,9 +560,21 @@ func agentHandoffTemplate(taskID string, detail TaskDetail, packet HandoffPacket
 	if len(content.SuggestedNextSteps) == 0 {
 		content.SuggestedNextSteps = []string{"Replace this with the next concrete action for another agent or human."}
 	}
-	body := renderHandoffMarkdown(content)
-	header := fmt.Sprintf("<!-- TaskPilot handoff draft for %s. Keep this file updated during work. Required before publish: Completed Work, Important Decisions, Current State, Remaining Work, Suggested Next Steps, Handoff Message. -->\n\n", taskID)
-	return header + body
+	return renderHandoffMarkdown(content)
+}
+
+func handoffWritingRules() string {
+	return `Handoff writing rules:
+- Write for the next agent, not for a transcript archive.
+- Be concise by default: keep bullets specific, outcome-focused, and non-repetitive.
+- Include only durable insight: completed work, important decisions and reasons, current state, remaining work, risks, blockers, verification, files/artifacts, and assumptions.
+- Do not paste raw command logs, raw prompts, screenshots, secrets, customer data, or long copied files.
+- Do not record every small action. Merge routine steps into one useful bullet.
+- Preserve important long context when shortening would remove meaning. If a complex decision, risk, failure, or verification needs detail, write the necessary detail clearly.
+- Prefer exact references over prose dumps: task IDs, file paths, checkpoint IDs, commands run, test names, artifact links, and concise excerpts.
+- Keep timeline entries short. Use them to explain meaningful state changes, not every command.
+- Keep Remaining Work and Suggested Next Steps limited to work that is still actually pending.
+- If nothing material changed, say that plainly instead of inflating the handoff.`
 }
 
 type agentTaskContextFile struct {
@@ -614,7 +626,11 @@ type agentRelatedContext struct {
 	Artifacts        []Artifact       `json:"artifacts,omitempty"`
 	GitRefs          []GitRef         `json:"git_refs,omitempty"`
 	HandoffSummary   string           `json:"handoff_summary,omitempty"`
+	HandoffMarkdown  string           `json:"handoff_markdown,omitempty"`
+	HandoffSource    string           `json:"handoff_source,omitempty"`
 }
+
+const maxRelatedHandoffMarkdownChars = 24000
 
 func createAgentContextFiles(taskID string, detail TaskDetail) (string, string, func(), error) {
 	taskSnapshot := agentTaskContextFile{
@@ -625,7 +641,7 @@ func createAgentContextFiles(taskID string, detail TaskDetail) (string, string, 
 	relatedSnapshot := agentRelatedContextFile{
 		GeneratedAt:   time.Now().UTC(),
 		Usage:         "Use this as prior work context. These tasks were selected because they are linked or relevant to the current task; unrelated tasks are intentionally omitted.",
-		SelectionRule: "Includes directly linked tasks plus up to five same-project tasks with overlapping scope/repo/parent signals. Related tasks contain summaries, decisions, risks, blockers, outputs, artifacts, and git refs, not full event history.",
+		SelectionRule: "Includes directly linked tasks plus up to five same-project tasks with strong scope/repo/parent signals. If those signals are sparse, fills remaining slots with recent same-project tasks that have useful recorded memory. Related tasks include the latest handoff markdown when available, plus summaries, decisions, risks, blockers, outputs, artifacts, and git refs.",
 		RelatedTasks:  collectRelatedAgentContexts(detail),
 	}
 	taskPath, taskCleanup, err := createJSONTemp("taskpilot-"+taskID+"-task-*.json", taskSnapshot)
@@ -815,6 +831,8 @@ Handoff checkpoint rules for ` + handoffPath + `:
 - Handoff Message must be a concise message to the next agent.
 - Do not leave placeholder text in required sections.
 
+` + handoffWritingRules() + `
+
 Useful examples:
 - summary: Traced invite signup failure to expiry comparison after token lookup.
 - finding: Token format is reused by existing invite links, so changing it would break old emails.
@@ -855,6 +873,12 @@ type relatedCandidate struct {
 	Relations []string
 }
 
+const (
+	maxRelatedAgentContexts   = 5
+	strongRelatedTaskScore    = 50
+	sameProjectFallbackWeight = 35
+)
+
 func collectRelatedAgentContexts(current TaskDetail) []agentRelatedContext {
 	var tasks []Task
 	path := "/api/tasks"
@@ -864,32 +888,7 @@ func collectRelatedAgentContexts(current TaskDetail) []agentRelatedContext {
 	if err := request("GET", path, nil, &tasks); err != nil {
 		return nil
 	}
-	linked := linkedTaskRelations(current)
-	candidates := []relatedCandidate{}
-	for _, task := range tasks {
-		if task.ID == current.Task.ID {
-			continue
-		}
-		score, reasons := relatedTaskScore(current.Task, task)
-		relations := linked[task.ID]
-		if len(relations) > 0 {
-			score += 100
-			reasons = append(reasons, "directly linked to current task")
-		}
-		if score < 50 {
-			continue
-		}
-		candidates = append(candidates, relatedCandidate{Task: task, Score: score, Reasons: uniqueStrings(reasons), Relations: uniqueStrings(relations)})
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].Score == candidates[j].Score {
-			return candidates[i].Task.UpdatedAt.After(candidates[j].Task.UpdatedAt)
-		}
-		return candidates[i].Score > candidates[j].Score
-	})
-	if len(candidates) > 5 {
-		candidates = candidates[:5]
-	}
+	candidates := relatedTaskCandidates(current, tasks, time.Now())
 	out := []agentRelatedContext{}
 	for _, candidate := range candidates {
 		var detail TaskDetail
@@ -899,6 +898,88 @@ func collectRelatedAgentContexts(current TaskDetail) []agentRelatedContext {
 		out = append(out, summarizeRelatedTask(detail, candidate.Relations, candidate.Reasons))
 	}
 	return out
+}
+
+func relatedTaskCandidates(current TaskDetail, tasks []Task, now time.Time) []relatedCandidate {
+	linked := linkedTaskRelations(current)
+	strong := []relatedCandidate{}
+	fallback := []relatedCandidate{}
+	for _, task := range tasks {
+		if task.ID == current.Task.ID {
+			continue
+		}
+		score, reasons := relatedTaskScoreAt(current.Task, task, now)
+		relations := linked[task.ID]
+		if len(relations) > 0 {
+			score += 100
+			reasons = append(reasons, "directly linked to current task")
+		}
+		candidate := relatedCandidate{Task: task, Score: score, Reasons: uniqueStrings(reasons), Relations: uniqueStrings(relations)}
+		if score >= strongRelatedTaskScore {
+			strong = append(strong, candidate)
+			continue
+		}
+		if fallbackScore, fallbackReasons, ok := sameProjectFallbackScore(current.Task, task, score, now); ok {
+			candidate.Score = fallbackScore
+			candidate.Reasons = uniqueStrings(append(candidate.Reasons, fallbackReasons...))
+			fallback = append(fallback, candidate)
+		}
+	}
+	sortRelatedCandidates(strong)
+	sortRelatedCandidates(fallback)
+	candidates := append([]relatedCandidate{}, strong...)
+	for _, candidate := range fallback {
+		if len(candidates) >= maxRelatedAgentContexts {
+			break
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) > maxRelatedAgentContexts {
+		candidates = candidates[:maxRelatedAgentContexts]
+	}
+	return candidates
+}
+
+func sortRelatedCandidates(candidates []relatedCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Score == candidates[j].Score {
+			return candidates[i].Task.UpdatedAt.After(candidates[j].Task.UpdatedAt)
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+}
+
+func sameProjectFallbackScore(current, candidate Task, baseScore int, now time.Time) (int, []string, bool) {
+	if current.ProjectID == "" || candidate.ProjectID != current.ProjectID {
+		return 0, nil, false
+	}
+	if current.RepoID != "" && candidate.RepoID != "" && current.RepoID != candidate.RepoID {
+		return 0, nil, false
+	}
+	if candidate.Status == "cancelled" || !hasUsefulTaskMemorySignal(candidate) {
+		return 0, nil, false
+	}
+	reasons := []string{"same-project prior context"}
+	if strings.TrimSpace(candidate.SearchText) != "" {
+		reasons = append(reasons, "has recorded task context")
+	}
+	if candidate.LatestHandoffStatus != "" {
+		reasons = append(reasons, "has handoff state")
+	}
+	if !candidate.UpdatedAt.IsZero() && now.Sub(candidate.UpdatedAt) <= 14*24*time.Hour {
+		reasons = append(reasons, "recently updated")
+	}
+	return baseScore + sameProjectFallbackWeight, uniqueStrings(reasons), true
+}
+
+func hasUsefulTaskMemorySignal(task Task) bool {
+	return strings.TrimSpace(task.SearchText) != "" ||
+		task.LatestHandoffStatus != "" ||
+		task.Status == "completed" ||
+		task.Status == "handoff_ready" ||
+		task.Status == "blocked" ||
+		len(task.Risks) > 0 ||
+		len(task.Blockers) > 0
 }
 
 func linkedTaskRelations(detail TaskDetail) map[string][]string {
@@ -923,6 +1004,10 @@ func linkedTaskRelations(detail TaskDetail) map[string][]string {
 }
 
 func relatedTaskScore(current, candidate Task) (int, []string) {
+	return relatedTaskScoreAt(current, candidate, time.Now())
+}
+
+func relatedTaskScoreAt(current, candidate Task, now time.Time) (int, []string) {
 	score := 0
 	reasons := []string{}
 	if current.ProjectID != "" && candidate.ProjectID == current.ProjectID {
@@ -944,7 +1029,7 @@ func relatedTaskScore(current, candidate Task) (int, []string) {
 		score += 10
 		reasons = append(reasons, "completed prior work")
 	}
-	if time.Since(candidate.UpdatedAt) <= 14*24*time.Hour {
+	if !candidate.UpdatedAt.IsZero() && now.Sub(candidate.UpdatedAt) <= 14*24*time.Hour {
 		score += 10
 		reasons = append(reasons, "recently updated")
 	}
@@ -1014,10 +1099,8 @@ func summarizeRelatedTask(detail TaskDetail, relations, reasons []string) agentR
 			outputs = append(outputs, entry.Content)
 		}
 	}
-	handoffSummary := ""
-	if len(detail.Handoffs) > 0 {
-		handoffSummary = detail.Handoffs[len(detail.Handoffs)-1].ResumeSummary
-	}
+	handoffSummary := relatedHandoffSummary(detail)
+	handoffMarkdown, handoffSource := relatedHandoffMarkdown(detail)
 	return agentRelatedContext{
 		ID:               detail.Task.ID,
 		Title:            detail.Task.Title,
@@ -1038,7 +1121,38 @@ func summarizeRelatedTask(detail TaskDetail, relations, reasons []string) agentR
 		Artifacts:        limitArtifacts(detail.Artifacts, 8),
 		GitRefs:          limitGitRefs(detail.GitRefs, 8),
 		HandoffSummary:   handoffSummary,
+		HandoffMarkdown:  handoffMarkdown,
+		HandoffSource:    handoffSource,
 	}
+}
+
+func relatedHandoffSummary(detail TaskDetail) string {
+	if detail.HandoffPacket != nil && detail.HandoffPacket.Packet.HandoffMessage != "" {
+		return detail.HandoffPacket.Packet.HandoffMessage
+	}
+	if len(detail.Handoffs) > 0 {
+		return detail.Handoffs[len(detail.Handoffs)-1].ResumeSummary
+	}
+	return ""
+}
+
+func relatedHandoffMarkdown(detail TaskDetail) (string, string) {
+	if len(detail.HandoffCheckpoints) > 0 {
+		checkpoint := detail.HandoffCheckpoints[len(detail.HandoffCheckpoints)-1]
+		return limitRelatedHandoffMarkdown(checkpoint.Markdown), "handoff_checkpoint:" + checkpoint.ID
+	}
+	if detail.HandoffPacket != nil && strings.TrimSpace(detail.HandoffPacket.Markdown) != "" {
+		return limitRelatedHandoffMarkdown(detail.HandoffPacket.Markdown), "handoff_packet:" + detail.HandoffPacket.ID
+	}
+	return "", ""
+}
+
+func limitRelatedHandoffMarkdown(markdown string) string {
+	markdown = strings.TrimSpace(markdown)
+	if len(markdown) <= maxRelatedHandoffMarkdownChars {
+		return markdown
+	}
+	return markdown[:maxRelatedHandoffMarkdownChars] + "\n\n<!-- Related handoff markdown truncated; inspect the source task for full checkpoint history. -->"
 }
 
 func compactContextEntries(entries []ContextEntry, max int) []ContextEntry {
@@ -1577,6 +1691,8 @@ Required workflow:
 
 Write useful updates to TASKPILOT_RUN_CONTEXT_FILE as soon as each meaningful unit of work finishes. Do not wait until the whole session ends.
 Update TASKPILOT_HANDOFF_FILE after every meaningful prompt response or work unit, then run ` + "`taskpilot handoff checkpoint $TASKPILOT_TASK_ID --file \"$TASKPILOT_HANDOFF_FILE\"`" + `. This file is the authoritative handoff draft. Do not erase previous completed work or decisions; append the new truth and update current state / remaining work / next steps. It must include completed work, important decisions, current state, remaining work, suggested next steps, and a handoff message. If no material decision was made, write exactly: No material decision made; work followed existing requirements.
+
+` + handoffWritingRules() + `
 
 Write context that would let a different agent continue the work without reading this chat. Prefer short, specific entries over vague status updates.
 
