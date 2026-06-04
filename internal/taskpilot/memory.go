@@ -600,6 +600,9 @@ func parseHandoffMarkdownStrict(markdown string, publish bool) (HandoffPacketCon
 		required = []string{"Objective", "Current Status"}
 	}
 	sections, err := parseMarkdownSectionsStrict(markdown, "Task Handoff", handoffMarkdownSections, required)
+	if err != nil && !publish {
+		sections, err = parseMarkdownSectionsStrict(normalizeLenientHandoffMarkdown(markdown), "Task Handoff", handoffMarkdownSections, required)
+	}
 	if err != nil {
 		return HandoffPacketContent{}, err
 	}
@@ -625,6 +628,56 @@ func parseHandoffMarkdownStrict(markdown string, publish bool) (HandoffPacketCon
 		HandoffMessage:          sectionsText(sections, "Handoff Message"),
 		ExtraSections:           unknownSections(sections, handoffMarkdownSections),
 	}, nil
+}
+
+func normalizeLenientHandoffMarkdown(markdown string) string {
+	lines := strings.Split(markdown, "\n")
+	out := []string{}
+	seenTitle := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "# ") && !strings.HasPrefix(trimmed, "## ") {
+			heading := strings.TrimSpace(strings.TrimPrefix(trimmed, "# "))
+			if isAllowedMarkdownTitleAlias("Task Handoff", heading) || strings.EqualFold(heading, "Task Handoff") {
+				seenTitle = true
+				out = append(out, "# Task Handoff")
+				continue
+			}
+			if canonical := canonicalHandoffSectionTitle(heading); canonical != "" {
+				out = append(out, "## "+canonical)
+				continue
+			}
+		}
+		if strings.HasPrefix(trimmed, "## ") {
+			heading := strings.TrimSpace(strings.TrimPrefix(trimmed, "## "))
+			if canonical := canonicalHandoffSectionTitle(heading); canonical != "" && canonical != heading {
+				out = append(out, "## "+canonical)
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	if !seenTitle {
+		out = append([]string{"# Task Handoff", ""}, out...)
+	}
+	return strings.Join(out, "\n")
+}
+
+func canonicalHandoffSectionTitle(title string) string {
+	normalized := strings.ToLower(strings.TrimSpace(title))
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	for _, item := range handoffMarkdownSections {
+		if normalized == strings.ToLower(item.Title) {
+			return item.Title
+		}
+	}
+	switch strings.ReplaceAll(normalized, " ", "") {
+	case "files/artifacts", "files/components", "files/componentsaffected", "filesandartifacts", "files":
+		return "Files / Components Affected"
+	case "verification", "validations", "validation":
+		return "Implementation Notes"
+	}
+	return ""
 }
 
 func parseMarkdownSections(markdown string) map[string]string {

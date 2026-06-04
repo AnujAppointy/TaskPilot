@@ -203,6 +203,61 @@ func TestSummarizeRelatedTaskIncludesLatestHandoffMarkdown(t *testing.T) {
 	}
 }
 
+func TestParseHandoffMarkdownAcceptsLenientAgentDraft(t *testing.T) {
+	markdown := `# Completed Work
+- Created D:\SnakeGame\planning.md.
+
+# Important Decisions
+- No material decision made; work followed existing requirements.
+
+# Current State
+- planning.md is present.
+
+# Remaining Work
+- No remaining work unless revisions are requested.
+
+# Suggested Next Steps
+- Review planning.md if more detail is needed.
+
+# Verification
+- Read back planning.md.
+
+# Files/Artifacts
+- D:\SnakeGame\planning.md
+
+# Handoff Message
+- planning.md has been created and verified.
+`
+	content, err := parseHandoffMarkdownStrict(markdown, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(content.CompletedWork, "\n"), "planning.md") {
+		t.Fatalf("expected completed work from lenient draft, got %+v", content.CompletedWork)
+	}
+	if !strings.Contains(strings.Join(content.ImplementationNotes, "\n"), "Read back planning.md") {
+		t.Fatalf("expected verification alias under implementation notes, got %+v", content.ImplementationNotes)
+	}
+	if !strings.Contains(strings.Join(content.FilesComponentsAffected, "\n"), `D:\SnakeGame\planning.md`) {
+		t.Fatalf("expected files alias under affected files, got %+v", content.FilesComponentsAffected)
+	}
+}
+
+func TestAPIErrorMessageIncludesMarkdownValidationDetails(t *testing.T) {
+	got := apiErrorMessage(APIError{
+		Message: "markdown validation failed",
+		Errors: []MarkdownValidationError{
+			{Line: 1, Message: "missing top-level heading '# Task Handoff'"},
+			{Section: "Objective", Message: "required section is empty"},
+		},
+	})
+	for _, want := range []string{"markdown validation failed", "line 1", "Objective", "required section is empty"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected API error message to include %q, got %q", want, got)
+		}
+	}
+}
+
 func TestTouchedFilesSummary(t *testing.T) {
 	before := map[string]gitFileState{"auth/old.go": {Status: "M", ModTime: 1, Size: 10}, "planning.md": {Status: "M", ModTime: 1, Size: 20}}
 	after := map[string]gitFileState{"auth/old.go": {Status: "M", ModTime: 1, Size: 10}, "auth/new.go": {Status: "??", ModTime: 2, Size: 10}, "planning.md": {Status: "M", ModTime: 3, Size: 25}}

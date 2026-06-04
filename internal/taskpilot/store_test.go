@@ -937,6 +937,63 @@ Planning draft is ready for the next agent to review and tighten.
 	}
 }
 
+func TestHandoffCheckpointAcceptsConciseCoreSectionsOnlyDraft(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Planning", Goal: "Create brief planning.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "summary", "Created planning.md with a brief 2D snake game plan."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "decision", "Used a standalone brief plan because the repository had no files beyond .git."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendContext(ctx, a.ID, task.ID, "output_ref", "D:\\SnakeGame\\planning.md"); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.GenerateHandoffPacket(ctx, a.ID, task.ID, "", "draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := `## Completed Work
+- Read the task prompt and task snapshot before repository analysis.
+- Confirmed the goal is a brief planning.md for a 2D snake game.
+- Created D:\SnakeGame\planning.md.
+- Verified the file contents.
+
+## Important Decisions
+- Used a standalone brief plan because the repository had no files other than .git and the task only required planning output.
+
+## Current State
+- planning.md is present and the requested work is complete.
+
+## Remaining Work
+- No remaining work unless the user requests revisions.
+
+## Suggested Next Steps
+- Review planning.md only if the user wants different wording or more detail.
+
+## Handoff Message
+- planning.md has been created and verified.
+`
+	checkpoint, err := s.CreateHandoffCheckpoint(ctx, a.ID, task.ID, packet.ID, "session-1", markdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.Packet.TaskObjective != "Create brief planning.md" || checkpoint.Packet.CurrentStatus == "" {
+		t.Fatalf("expected task objective/status to be merged from fallback, got %+v", checkpoint.Packet)
+	}
+	if len(checkpoint.ValidationErrors) != 0 {
+		t.Fatalf("expected concise checkpoint to validate after fallback merge, got %+v", checkpoint.ValidationErrors)
+	}
+	if !strings.Contains(checkpoint.Markdown, "# Task Handoff") || !strings.Contains(checkpoint.Markdown, "Created D:\\SnakeGame\\planning.md") {
+		t.Fatalf("expected checkpoint to be normalized to canonical handoff markdown, got %s", checkpoint.Markdown)
+	}
+}
+
 func TestAgentAuthoredPlaceholderHandoffMergesRunEvidence(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

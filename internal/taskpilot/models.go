@@ -353,8 +353,9 @@ type TaskDetail struct {
 }
 
 type APIError struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
+	Error   string                    `json:"error"`
+	Message string                    `json:"message"`
+	Errors  []MarkdownValidationError `json:"errors,omitempty"`
 }
 
 type MarkdownValidationError struct {

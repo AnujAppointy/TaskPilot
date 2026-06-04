@@ -2487,7 +2487,7 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 	if resp.StatusCode >= 300 {
 		var ae APIError
 		if json.Unmarshal(data, &ae) == nil && ae.Message != "" {
-			return fmt.Errorf("%s: %s", ae.Error, ae.Message)
+			return fmt.Errorf("%s: %s", ae.Error, apiErrorMessage(ae))
 		}
 		return fmt.Errorf("request failed: %s", resp.Status)
 	}
@@ -2495,6 +2495,29 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 		return json.Unmarshal(data, out)
 	}
 	return nil
+}
+
+func apiErrorMessage(ae APIError) string {
+	message := strings.TrimSpace(ae.Message)
+	if len(ae.Errors) == 0 {
+		return message
+	}
+	lines := []string{message}
+	for _, validationErr := range ae.Errors {
+		parts := []string{}
+		if validationErr.Section != "" {
+			parts = append(parts, validationErr.Section)
+		}
+		if validationErr.Line > 0 {
+			parts = append(parts, fmt.Sprintf("line %d", validationErr.Line))
+		}
+		prefix := ""
+		if len(parts) > 0 {
+			prefix = strings.Join(parts, " ") + ": "
+		}
+		lines = append(lines, "- "+prefix+validationErr.Message)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func print(v any, jsonOut bool) error {
