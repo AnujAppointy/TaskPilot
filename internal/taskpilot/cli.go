@@ -30,6 +30,39 @@ type Config struct {
 	ActorSecret string `json:"actor_secret"`
 }
 
+type retriableRequestError struct{ err error }
+
+func (e retriableRequestError) Error() string { return e.err.Error() }
+func (e retriableRequestError) Unwrap() error { return e.err }
+
+type queuedHandoffCheckpoint struct {
+	ID            string    `json:"id"`
+	Server        string    `json:"server"`
+	ActorID       string    `json:"actor_id"`
+	TaskID        string    `json:"task_id"`
+	PacketID      string    `json:"packet_id,omitempty"`
+	SessionID     string    `json:"session_id,omitempty"`
+	Markdown      string    `json:"markdown"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastAttemptAt time.Time `json:"last_attempt_at,omitempty"`
+	Attempts      int       `json:"attempts"`
+	LastError     string    `json:"last_error,omitempty"`
+}
+
+type handoffSyncOptions struct {
+	Watch       bool
+	Interval    time.Duration
+	MaxDuration time.Duration
+}
+
+type handoffSyncResult struct {
+	Flushed int  `json:"flushed"`
+	Failed  int  `json:"failed"`
+	Skipped bool `json:"skipped"`
+}
+
+var handoffSyncDaemonStarter = startHandoffSyncDaemon
+
 func Run(args []string) error {
 	if len(args) == 0 {
 		usage()
@@ -120,6 +153,7 @@ Agent CLI:
   taskpilot git attach-pr <task-id> https://github.com/org/repo/pull/42
   taskpilot handoff prepare <task-id> --summary "Ready for next agent" --next "Write test" --next "Patch logic"
   taskpilot handoff checkpoint <task-id> --file "$TASKPILOT_HANDOFF_FILE"
+  taskpilot handoff sync --watch
 
 Automation:
   taskpilot run <task-id> -- <agent-command> [args...]
@@ -172,6 +206,7 @@ func runAgentCommand(args []string) error {
 	if cfg.Server == "" {
 		cfg.Server = "http://127.0.0.1:8080"
 	}
+	_, _, _ = flushQueuedHandoffCheckpoints()
 	var detail TaskDetail
 	if err := request("GET", "/api/tasks/"+taskID, nil, &detail); err != nil {
 		return err
@@ -412,8 +447,8 @@ func checkpointRunHandoff(taskID, packetID, sessionID, handoffPath string) error
 	if err != nil {
 		return err
 	}
-	var out HandoffCheckpoint
-	return request("POST", "/api/tasks/"+taskID+"/handoff-checkpoints", map[string]any{"packet_id": packetID, "session_id": sessionID, "markdown": string(data)}, &out)
+	_, _, err = sendOrQueueHandoffCheckpoint(taskID, packetID, sessionID, string(data))
+	return err
 }
 
 func checkpointRunHandoffIfChanged(taskID, packetID, sessionID, handoffPath string, lastHash *string, force bool) (bool, error) {
@@ -431,6 +466,350 @@ func checkpointRunHandoffIfChanged(taskID, packetID, sessionID, handoffPath stri
 		*lastHash = currentHash
 	}
 	return true, nil
+}
+
+func sendOrQueueHandoffCheckpoint(taskID, packetID, sessionID, markdown string) (HandoffCheckpoint, *queuedHandoffCheckpoint, error) {
+	_, _, _ = flushQueuedHandoffCheckpoints()
+	checkpoint, err := postHandoffCheckpointPayload(taskID, packetID, sessionID, markdown)
+	if err != nil {
+		if !isRetriableRequestError(err) {
+			return HandoffCheckpoint{}, nil, err
+		}
+		queued, queueErr := queueHandoffCheckpoint(taskID, packetID, sessionID, markdown, err)
+		if queueErr != nil {
+			return HandoffCheckpoint{}, nil, fmt.Errorf("%w; additionally failed to queue checkpoint locally: %v", err, queueErr)
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: handoff checkpoint upload is queued locally as %s and will retry on the next run or `taskpilot handoff sync`.\n", queued.ID)
+		started, daemonErr := handoffSyncDaemonStarter()
+		if daemonErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: could not start background handoff sync: %v. Run `taskpilot handoff sync` after connectivity returns.\n", daemonErr)
+		} else if started {
+			_, _ = fmt.Fprintln(os.Stderr, "TaskPilot: background handoff sync started.")
+		}
+		return HandoffCheckpoint{}, &queued, nil
+	}
+	return checkpoint, nil, nil
+}
+
+func postHandoffCheckpointPayload(taskID, packetID, sessionID, markdown string) (HandoffCheckpoint, error) {
+	var out HandoffCheckpoint
+	err := request("POST", "/api/tasks/"+taskID+"/handoff-checkpoints", map[string]any{"packet_id": packetID, "session_id": sessionID, "markdown": markdown}, &out)
+	return out, err
+}
+
+func queueHandoffCheckpoint(taskID, packetID, sessionID, markdown string, cause error) (queuedHandoffCheckpoint, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return queuedHandoffCheckpoint{}, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	now := time.Now().UTC()
+	sum := sha256.Sum256([]byte(strings.Join([]string{cfg.Server, cfg.ActorID, taskID, packetID, sessionID, markdown}, "\x00")))
+	id := fmt.Sprintf("local_checkpoint_%x", sum[:8])
+	queued := queuedHandoffCheckpoint{
+		ID:            id,
+		Server:        cfg.Server,
+		ActorID:       cfg.ActorID,
+		TaskID:        taskID,
+		PacketID:      packetID,
+		SessionID:     sessionID,
+		Markdown:      markdown,
+		CreatedAt:     now,
+		LastAttemptAt: now,
+		Attempts:      1,
+		LastError:     cause.Error(),
+	}
+	path := queuedHandoffCheckpointPath(id)
+	if existing, err := readQueuedHandoffCheckpoint(path); err == nil {
+		queued.CreatedAt = existing.CreatedAt
+		queued.Attempts = existing.Attempts + 1
+	}
+	if err := writeQueuedHandoffCheckpoint(path, queued); err != nil {
+		return queuedHandoffCheckpoint{}, err
+	}
+	return queued, nil
+}
+
+func flushQueuedHandoffCheckpoints() (int, int, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return 0, 0, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	paths, err := queuedHandoffCheckpointPaths()
+	if err != nil {
+		return 0, 0, err
+	}
+	flushed := 0
+	failed := 0
+	for _, path := range paths {
+		queued, err := readQueuedHandoffCheckpoint(path)
+		if err != nil {
+			failed++
+			continue
+		}
+		if queued.Server != cfg.Server || queued.ActorID != cfg.ActorID {
+			continue
+		}
+		_, err = postHandoffCheckpointPayload(queued.TaskID, queued.PacketID, queued.SessionID, queued.Markdown)
+		if err == nil {
+			_ = os.Remove(path)
+			flushed++
+			continue
+		}
+		failed++
+		queued.Attempts++
+		queued.LastAttemptAt = time.Now().UTC()
+		queued.LastError = err.Error()
+		_ = writeQueuedHandoffCheckpoint(path, queued)
+		if !isRetriableRequestError(err) {
+			continue
+		}
+	}
+	return flushed, failed, nil
+}
+
+func runHandoffOutboxSync(ctx context.Context, opts handoffSyncOptions) (handoffSyncResult, error) {
+	if opts.Interval <= 0 {
+		opts.Interval = handoffSyncInterval()
+	}
+	if opts.MaxDuration <= 0 {
+		opts.MaxDuration = handoffSyncMaxDuration()
+	}
+	deadline := time.Now().Add(opts.MaxDuration)
+	if opts.Watch {
+		acquired, err := acquireHandoffSyncLock(opts.MaxDuration)
+		if err != nil {
+			return handoffSyncResult{}, err
+		}
+		if !acquired {
+			return handoffSyncResult{Skipped: true}, nil
+		}
+		defer releaseHandoffSyncLock()
+	}
+	result := handoffSyncResult{}
+	for {
+		flushed, failed, err := flushQueuedHandoffCheckpoints()
+		if err != nil {
+			return result, err
+		}
+		result.Flushed += flushed
+		result.Failed += failed
+		hasQueued, err := hasSyncableQueuedHandoffCheckpoints()
+		if err != nil {
+			return result, err
+		}
+		if !opts.Watch || !hasQueued {
+			return result, nil
+		}
+		wait := opts.Interval
+		if remaining := time.Until(deadline); remaining <= 0 {
+			return result, nil
+		} else if remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return result, nil
+		case <-timer.C:
+		}
+	}
+}
+
+func startHandoffSyncDaemon() (bool, error) {
+	fresh, err := handoffSyncLockIsFresh(handoffSyncMaxDuration())
+	if err != nil {
+		return false, err
+	}
+	if fresh {
+		return false, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return false, err
+	}
+	if err := ensureDir(filepath.Dir(handoffSyncLogPath())); err != nil {
+		return false, err
+	}
+	logFile, err := os.OpenFile(handoffSyncLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return false, err
+	}
+	cmd := exec.Command(exe, "handoff", "sync", "--watch", "--interval", handoffSyncInterval().String(), "--max-duration", handoffSyncMaxDuration().String())
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	cmd.Env = os.Environ()
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return false, err
+	}
+	_ = cmd.Process.Release()
+	_ = logFile.Close()
+	return true, nil
+}
+
+func hasSyncableQueuedHandoffCheckpoints() (bool, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return false, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	paths, err := queuedHandoffCheckpointPaths()
+	if err != nil {
+		return false, err
+	}
+	for _, path := range paths {
+		queued, err := readQueuedHandoffCheckpoint(path)
+		if err != nil {
+			continue
+		}
+		if queued.Server == cfg.Server && queued.ActorID == cfg.ActorID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func acquireHandoffSyncLock(maxAge time.Duration) (bool, error) {
+	if maxAge <= 0 {
+		maxAge = handoffSyncMaxDuration()
+	}
+	if err := ensureDir(filepath.Dir(handoffSyncLockPath())); err != nil {
+		return false, err
+	}
+	path := handoffSyncLockPath()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		_, _ = fmt.Fprintf(f, "%s\n", time.Now().UTC().Format(time.RFC3339Nano))
+		return true, f.Close()
+	}
+	if !os.IsExist(err) {
+		return false, err
+	}
+	fresh, err := handoffSyncLockIsFresh(maxAge)
+	if err != nil {
+		return false, err
+	}
+	if fresh {
+		return false, nil
+	}
+	_ = os.Remove(path)
+	return acquireHandoffSyncLock(maxAge)
+}
+
+func releaseHandoffSyncLock() {
+	_ = os.Remove(handoffSyncLockPath())
+}
+
+func handoffSyncLockIsFresh(maxAge time.Duration) (bool, error) {
+	if maxAge <= 0 {
+		maxAge = handoffSyncMaxDuration()
+	}
+	info, err := os.Stat(handoffSyncLockPath())
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return time.Since(info.ModTime()) < maxAge+time.Minute, nil
+}
+
+func queuedHandoffCheckpointPaths() ([]string, error) {
+	dir := handoffOutboxDir()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func queuedHandoffCheckpointPath(id string) string {
+	return filepath.Join(handoffOutboxDir(), id+".json")
+}
+
+func readQueuedHandoffCheckpoint(path string) (queuedHandoffCheckpoint, error) {
+	var queued queuedHandoffCheckpoint
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return queued, err
+	}
+	return queued, json.Unmarshal(data, &queued)
+}
+
+func writeQueuedHandoffCheckpoint(path string, queued queuedHandoffCheckpoint) error {
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(queued, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func handoffOutboxDir() string {
+	return filepath.Join(taskpilotHomeDir(), "outbox", "handoff-checkpoints")
+}
+
+func handoffSyncLockPath() string {
+	return filepath.Join(taskpilotHomeDir(), "outbox", "handoff-checkpoints.sync.lock")
+}
+
+func handoffSyncLogPath() string {
+	return filepath.Join(taskpilotHomeDir(), "outbox", "handoff-sync.log")
+}
+
+func handoffSyncInterval() time.Duration {
+	if v := os.Getenv("TASKPILOT_HANDOFF_SYNC_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * time.Second
+}
+
+func handoffSyncMaxDuration() time.Duration {
+	if v := os.Getenv("TASKPILOT_HANDOFF_SYNC_MAX_DURATION"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return time.Hour
+}
+
+func taskpilotHomeDir() string {
+	if v := os.Getenv("TASKPILOT_CONFIG"); v != "" {
+		return filepath.Dir(v)
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".taskpilot")
+}
+
+func isRetriableRequestError(err error) bool {
+	var retriable retriableRequestError
+	return errors.As(err, &retriable)
 }
 
 type runHandoffTracker struct {
@@ -2362,7 +2741,7 @@ func runLock(args []string) error {
 
 func runHandoff(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot handoff prepare|checkpoint|accept|reject")
+		return fmt.Errorf("usage: taskpilot handoff prepare|checkpoint|sync|accept|reject")
 	}
 	switch args[0] {
 	case "prepare":
@@ -2400,11 +2779,41 @@ func runHandoff(args []string) error {
 		if err != nil {
 			return err
 		}
-		var out HandoffCheckpoint
-		if err := request("POST", "/api/tasks/"+id+"/handoff-checkpoints", map[string]any{"packet_id": *packetID, "session_id": *sessionID, "markdown": string(data)}, &out); err != nil {
+		checkpoint, queued, err := sendOrQueueHandoffCheckpoint(id, *packetID, *sessionID, string(data))
+		if err != nil {
 			return err
 		}
-		return print(out, *jsonOut)
+		if *jsonOut {
+			if queued != nil {
+				return print(map[string]any{"status": "queued", "queued_checkpoint": queued}, true)
+			}
+			return print(checkpoint, true)
+		}
+		if queued != nil {
+			fmt.Printf("handoff checkpoint queued for sync: %s\n", queued.ID)
+			return nil
+		}
+		return print(checkpoint, false)
+	case "sync":
+		fs := flag.NewFlagSet("handoff sync", flag.ExitOnError)
+		watch := fs.Bool("watch", false, "keep retrying queued handoff checkpoints until synced or max duration elapses")
+		interval := fs.Duration("interval", handoffSyncInterval(), "retry interval for --watch")
+		maxDuration := fs.Duration("max-duration", handoffSyncMaxDuration(), "maximum runtime for --watch")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		result, err := runHandoffOutboxSync(context.Background(), handoffSyncOptions{Watch: *watch, Interval: *interval, MaxDuration: *maxDuration})
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return print(result, true)
+		}
+		if result.Skipped {
+			fmt.Println("handoff checkpoint sync: already running")
+			return nil
+		}
+		fmt.Printf("handoff checkpoint sync: flushed=%d failed=%d\n", result.Flushed, result.Failed)
+		return nil
 	case "accept", "reject":
 		id, jsonOut, err := idAndJSON(args[1:])
 		if err != nil {
@@ -2478,18 +2887,27 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 	if err != nil {
 		var netErr net.Error
 		if errors.As(err, &netErr) || strings.Contains(err.Error(), "connect: connection refused") || strings.Contains(err.Error(), "operation not permitted") {
-			return fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080` and check `taskpilot config set-server`", cfg.Server)
+			return retriableRequestError{err: fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080` and check `taskpilot config set-server`", cfg.Server)}
 		}
 		return err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
+		retriable := resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		var ae APIError
 		if json.Unmarshal(data, &ae) == nil && ae.Message != "" {
-			return fmt.Errorf("%s: %s", ae.Error, apiErrorMessage(ae))
+			err := fmt.Errorf("%s: %s", ae.Error, apiErrorMessage(ae))
+			if retriable {
+				return retriableRequestError{err: err}
+			}
+			return err
 		}
-		return fmt.Errorf("request failed: %s", resp.Status)
+		err := fmt.Errorf("request failed: %s", resp.Status)
+		if retriable {
+			return retriableRequestError{err: err}
+		}
+		return err
 	}
 	if out != nil {
 		return json.Unmarshal(data, out)
