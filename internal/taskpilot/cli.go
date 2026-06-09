@@ -1082,7 +1082,7 @@ func injectAgentStartupPrompt(commandArgs []string, prompt string) []string {
 	}
 	name := strings.ToLower(filepath.Base(commandArgs[0]))
 	switch name {
-	case "codex", "gemini":
+	case "codex", "gemini", "claude", "pi", "opencode":
 		if len(commandArgs) == 1 || isAgentResumeCommand(commandArgs) {
 			return append(commandArgs, prompt)
 		}

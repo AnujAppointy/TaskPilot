@@ -91,6 +91,30 @@ func TestInjectAgentStartupPromptCombinesHumanPrompt(t *testing.T) {
 	}
 }
 
+func TestInjectAgentStartupPromptSupportsClaude(t *testing.T) {
+	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
+	got := injectAgentStartupPrompt([]string{"claude", "review README"}, prompt)
+	if len(got) != 2 {
+		t.Fatalf("expected two args, got %+v", got)
+	}
+	if !strings.Contains(got[1], "/tmp/taskpilot-prompt.txt") || !strings.Contains(got[1], "review README") {
+		t.Fatalf("claude prompt was not combined correctly: %+v", got)
+	}
+}
+
+func TestInjectAgentStartupPromptSupportsPiAndOpenCode(t *testing.T) {
+	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
+	for _, agent := range []string{"pi", "opencode"} {
+		got := injectAgentStartupPrompt([]string{agent, "review README"}, prompt)
+		if len(got) != 2 {
+			t.Fatalf("%s: expected two args, got %+v", agent, got)
+		}
+		if !strings.Contains(got[1], "/tmp/taskpilot-prompt.txt") || !strings.Contains(got[1], "review README") {
+			t.Fatalf("%s: prompt was not combined correctly: %+v", agent, got)
+		}
+	}
+}
+
 func TestInjectAgentStartupPromptPreservesModelFlagAndCombinesLastPrompt(t *testing.T) {
 	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
 	got := injectAgentStartupPrompt([]string{"codex", "--model", "gpt-5", "review README"}, prompt)
