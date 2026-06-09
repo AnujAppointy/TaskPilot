@@ -65,6 +65,51 @@ func TestSessionLoginPasswordAndUserRoutes(t *testing.T) {
 	}
 }
 
+func TestSessionHandoffAcceptUsesDefaultActorOwner(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	user, err := store.CreateUser(ctx, "dev@example.com", "Developer", "strong-password", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := testActor(t, store, "Original Agent")
+	task, err := store.CreateTask(ctx, from.ID, TaskInput{Title: "Plan", Goal: "Plan the work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimTask(ctx, from.ID, task.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	handoff, err := store.PrepareHandoff(ctx, from.ID, task.ID, "", "Ready for next actor", []string{"Continue planning"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(store, "dev-token")
+	login := req(t, server, "POST", "/api/auth/login", map[string]any{"email": user.Email, "password": "strong-password"})
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
+	}
+	cookie := login.Result().Cookies()[0]
+	accept := reqWithCookie(t, server, "POST", "/api/handoffs/"+handoff.ID+"/accept", map[string]any{}, cookie)
+	if accept.Code != http.StatusOK {
+		t.Fatalf("accept status=%d body=%s", accept.Code, accept.Body.String())
+	}
+	detail := reqWithCookie(t, server, "GET", "/api/tasks/"+task.ID, nil, cookie)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	var out TaskDetail
+	if err := json.Unmarshal(detail.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Task.OwnerID == user.ID {
+		t.Fatalf("dashboard handoff accept should not store user id as owner: %+v", out.Task)
+	}
+	if out.Owner == nil || out.Owner.CreatedByUserID != user.ID {
+		t.Fatalf("expected owner to resolve to user's default actor, got owner=%+v task=%+v", out.Owner, out.Task)
+	}
+}
+
 func TestProtectedRoutesRequireAuth(t *testing.T) {
 	store := testStore(t)
 	server := NewServer(store, "dev-token")

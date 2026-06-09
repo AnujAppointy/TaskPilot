@@ -169,7 +169,18 @@ func principal(r *http.Request) Principal {
 func (s *Server) authPrincipal(r *http.Request) (Principal, bool) {
 	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
 		p, err := s.store.VerifySession(r.Context(), cookie.Value)
-		return p, err == nil
+		if err != nil {
+			return Principal{}, false
+		}
+		if p.Kind == "user" && p.UserID != "" {
+			actor, err := s.store.EnsureDefaultActorForUser(r.Context(), User{ID: p.UserID, Email: p.Email, Name: p.Name})
+			if err != nil {
+				return Principal{}, false
+			}
+			p.ActorID = actor.ID
+			s.store.TouchActor(r.Context(), actor.ID)
+		}
+		return p, true
 	}
 	return Principal{}, false
 }
