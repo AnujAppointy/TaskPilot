@@ -1,0 +1,5 @@
+when i do a handoff publish, and aquire it , it will not whowing the real actor name of mine which is login right now it is showing Owner: user_1780474767371793302 for task name plan . why this happening ?
+
+---
+
+what changes you did to solve this issue
