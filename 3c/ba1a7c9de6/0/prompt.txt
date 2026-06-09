@@ -1,0 +1,35 @@
+as i check the taskpilot with codex and gemini by " taskpilot run taskid -- agent " , is this same behavior will be with other agent also
+
+---
+
+is it same happen for the claude code
+
+---
+
+add it also
+
+---
+
+add it also
+
+---
+
+if i make new task and run "taskpilot run <task-id> -- claude" then now claude will inject the required things in the child agent for starting it and getting the related context ?
+
+---
+
+in case of codex taskpilot run <task-id> -- codex inject the prompt of task which is task objective from the task itself , can claude able to do that same
+
+---
+
+# Selected text:
+
+## Selection 1
+The only condition is that the claude CLI must accept the injected prompt as a positional argument. If it does, behavior matches Codex/Gemini.
+
+## My request for Codex:
+what it means
+
+---
+
+add for the pi and  opencode also
