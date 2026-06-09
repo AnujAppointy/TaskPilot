@@ -1,0 +1,27 @@
+app.js?v=39:147 
+ GET https://taskpilot-ix5t.onrender.com/api/tasks?project_id=project_1780480016425395287 502 (Bad Gateway)
+
+﻿this issue came , explain this
+
+---
+
+verify it
+
+---
+
+Failed to load resource: the server responded with a status of 502 ()Understand this error
+Node cannot be found in the current page.Understand this warning
+app.js?v=39:147  GET https://taskpilot-ix5t.onrender.com/api/conflicts/stale-claims 502 (Bad Gateway).    this happen again and "2026/06/09 07:05:28 http: panic serving [::1]:58142: runtime error: invalid memory address or nil pointer dereference
+goroutine 10942 [running]:
+net/http.(*conn).serve.func1()
+	/usr/local/go/src/net/http/server.go:1943 +0xd3
+panic({0xba9a20?, 0x12cb240?})
+	/usr/local/go/src/runtime/panic.go:783 +0x132
+taskpilot/internal/taskpilot.(*Store).hydrateLockDisplay(0xc000010168, {0xd94d60, 0xc00034e660}, 0xc00046aa10)
+	/src/internal/taskpilot/store.go:2374 +0x75
+taskpilot/internal/taskpilot.(*Store).ListLocks(0xc000010168, {0xd94d60, 0xc00034e660}, {0xc0007bf998, 0x18}, 0x1)
+	/src/internal/taskpilot/store.go:2176 +0x505
+taskpilot/internal/taskpilot.(*Store).countLockConflicts(0xc000010168, {0xd94d60, 0xc00034e660}, {0xc0007bf998?, 0x18?})
+	/src/internal/taskpilot/store.go:2560 +0x48
+taskpilot/internal/taskpilot.(*Store).listTasks(0xc000010168, {0xd94d60, 0xc00034e660}, {0xc000253dda?, 0xc00046b6e0?}, {0x0, 0x0})
+" this is the logs of render at that particular time
