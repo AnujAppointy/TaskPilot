@@ -1,0 +1,17 @@
+go through whole codebase of task pilot , understand its full working and then make its PRD doc , App flow doc , backend schema doc
+
+---
+
+why we are sending bin file in repo ?
+
+---
+
+add it in git ignore file
+
+---
+
+what this command will do
+
+---
+
+so i will run it now before pushing code in th git ?
