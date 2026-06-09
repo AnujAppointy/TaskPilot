@@ -5,6 +5,8 @@
 .env.*
 !.env.example
 /taskpilot
+bin/
+*.exe
 taskpilot.db
 *.db-shm
 *.db-wal

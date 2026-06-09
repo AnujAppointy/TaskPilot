@@ -13,6 +13,7 @@ Use it when two or more people or agents need to work on the same codebase witho
 ## Start Here
 
 - Team onboarding guide: [docs/ONBOARDING.md](docs/ONBOARDING.md)
+- Detailed working flow diagram: [docs/TASKPILOT_WORKING_FLOW.md](docs/TASKPILOT_WORKING_FLOW.md)
 - Technical decisions: [docs/TECHNICAL_DECISIONS.md](docs/TECHNICAL_DECISIONS.md)
 - Agent rules for this repo: [AGENTS.md](AGENTS.md)
 
