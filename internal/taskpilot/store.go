@@ -2370,7 +2370,7 @@ func (s *Store) hydrateLockDisplay(ctx context.Context, l *Lock) {
 	if l == nil {
 		return
 	}
-	if actor, err := s.GetActor(ctx, l.OwnerID); err == nil {
+	if actor, err := s.GetActor(ctx, l.OwnerID); err == nil && actor != nil {
 		l.OwnerName = actor.Name
 	}
 	if task, err := s.GetTask(ctx, l.TaskID); err == nil {

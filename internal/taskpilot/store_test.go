@@ -52,6 +52,39 @@ func TestLockConflictAndRelease(t *testing.T) {
 	}
 }
 
+func TestListTasksWithOrphanedLockOwnerDoesNotPanic(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Task", Goal: "Goal", Scope: []string{"src/auth/*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, err = s.exec(ctx, `INSERT INTO locks (id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at) VALUES (?,?,?,?,?,?,?,?,?,NULL)`,
+		"lock_orphaned_owner", task.ID, "actor_missing", "src/auth/*", "file_glob", "active", ts(now.Add(DefaultLockTTL)), ts(now), ts(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := s.ListTasks(ctx, task.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected task list to include task with orphaned lock owner, got %+v", tasks)
+	}
+	locks, err := s.ListLocks(ctx, task.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 {
+		t.Fatalf("expected orphaned lock to be listed, got %+v", locks)
+	}
+	if locks[0].OwnerName != "" || !strings.Contains(locks[0].Message, "actor_missing") {
+		t.Fatalf("expected lock message to fall back to owner id, got %+v", locks[0])
+	}
+}
+
 func TestHandoffTransfersTaskAndActiveLocks(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
