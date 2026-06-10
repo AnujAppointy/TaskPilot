@@ -1960,6 +1960,13 @@ func handleMCPRequest(req mcpRequest) (any, error) {
 
 func mcpTools() []map[string]any {
 	return []map[string]any{
+		mcpTool("create_project", "Create a TaskPilot project.", map[string]any{"name": mcpString("Project name"), "description": mcpString("Optional project description")}, []string{"name"}),
+		mcpTool("list_projects", "List TaskPilot projects.", map[string]any{}, []string{}),
+		mcpTool("create_repository", "Register a repository in TaskPilot.", map[string]any{"project_id": mcpString("Project ID"), "name": mcpString("Repository name"), "path": mcpString("Local path or remote URL"), "default_branch": mcpString("Default branch, defaults to main")}, []string{"project_id", "name"}),
+		mcpTool("list_repositories", "List TaskPilot repositories.", map[string]any{"project_id": mcpString("Optional project ID")}, []string{}),
+		mcpTool("create_workspace", "Create a TaskPilot workspace.", map[string]any{"project_id": mcpString("Project ID"), "name": mcpString("Workspace name"), "actor_id": mcpString("Optional actor ID"), "machine_name": mcpString("Optional machine name"), "kind": mcpString("Workspace kind, defaults to local")}, []string{"project_id", "name"}),
+		mcpTool("list_workspaces", "List TaskPilot workspaces.", map[string]any{"project_id": mcpString("Optional project ID")}, []string{}),
+		mcpTool("list_actors", "List TaskPilot actors.", map[string]any{}, []string{}),
 		mcpTool("search_tasks", "Search TaskPilot tasks by query, project, status, owner, priority, and completion state.", map[string]any{"query": mcpString("Text to search in title, goal, scope, blockers, risks, and task memory"), "project_id": mcpString("Optional project ID"), "status": mcpString("Optional task status"), "owner_id": mcpString("Optional owner actor ID"), "priority": mcpString("Optional priority"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
 		mcpTool("list_my_tasks", "List tasks owned by the configured TaskPilot actor.", map[string]any{"project_id": mcpString("Optional project ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
 		mcpTool("list_blocked_tasks", "List blocked tasks or tasks with blockers/dependencies.", map[string]any{"project_id": mcpString("Optional project ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
@@ -1972,18 +1979,43 @@ func mcpTools() []map[string]any {
 		mcpTool("create_task", "Create a new TaskPilot task.", map[string]any{"title": mcpString("Task title"), "goal": mcpString("Task goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "parent_task_id": mcpString("Optional parent task ID"), "scope": mcpStringArray("Task scopes such as files, globs, artifacts, or semantic areas"), "requirements": mcpStringArray("Task requirements"), "completion_criteria": mcpStringArray("Completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers"), "privacy_level": mcpString("Privacy level, defaults to sanitized_context")}, []string{"title", "goal"}),
 		mcpTool("create_subtask", "Create a subtask under an existing TaskPilot task.", map[string]any{"parent_task_id": mcpString("Parent task ID"), "title": mcpString("Subtask title"), "goal": mcpString("Subtask goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "scope": mcpStringArray("Subtask scopes"), "requirements": mcpStringArray("Subtask requirements"), "completion_criteria": mcpStringArray("Subtask completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers")}, []string{"parent_task_id", "title", "goal"}),
 		mcpTool("add_dependency", "Add a dependency so one task is blocked by another task.", map[string]any{"task_id": mcpString("Task ID that is blocked"), "depends_on_id": mcpString("Task ID this task depends on")}, []string{"task_id", "depends_on_id"}),
+		mcpTool("remove_dependency", "Remove a task dependency by dependency ID.", map[string]any{"dependency_id": mcpString("Dependency ID")}, []string{"dependency_id"}),
+		mcpTool("update_task", "Update editable TaskPilot task fields.", map[string]any{"task_id": mcpString("Task ID"), "title": mcpString("Optional title"), "goal": mcpString("Optional goal"), "type": mcpString("Optional type"), "priority": mcpString("Optional priority"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "parent_task_id": mcpString("Optional parent task ID"), "privacy_level": mcpString("Optional privacy level"), "scope": mcpStringArray("Replacement scopes"), "requirements": mcpStringArray("Replacement requirements"), "completion_criteria": mcpStringArray("Replacement completion criteria"), "risks": mcpStringArray("Replacement risks"), "blockers": mcpStringArray("Replacement blockers"), "reason": mcpString("Reason for update")}, []string{"task_id"}),
+		mcpTool("append_task_fields", "Append requirements, completion criteria, risks, blockers, or scopes to a task.", map[string]any{"task_id": mcpString("Task ID"), "scope": mcpStringArray("Scopes to append"), "requirements": mcpStringArray("Requirements to append"), "completion_criteria": mcpStringArray("Completion criteria to append"), "risks": mcpStringArray("Risks to append"), "blockers": mcpStringArray("Blockers to append"), "reason": mcpString("Reason for update")}, []string{"task_id"}),
 		mcpTool("update_task_status", "Update a TaskPilot task status.", map[string]any{"task_id": mcpString("Task ID"), "status": mcpString("New task status such as ready, claimed, in_progress, blocked, handoff_ready, in_review, completed, or cancelled")}, []string{"task_id", "status"}),
+		mcpTool("delete_task", "Delete a TaskPilot task by ID.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("claim_task", "Claim a TaskPilot task.", map[string]any{"task_id": mcpString("Task ID"), "force": map[string]any{"type": "boolean"}, "reason": mcpString("Reason for force claim")}, []string{"task_id"}),
 		mcpTool("heartbeat_task", "Renew active task ownership heartbeat.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("release_task", "Release ownership of a TaskPilot task.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
+		mcpTool("start_task_session", "Start a TaskPilot task session.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
+		mcpTool("finish_task_session", "Finish a TaskPilot task session.", map[string]any{"task_id": mcpString("Task ID"), "session_id": mcpString("Session ID"), "exit_status": mcpString("Exit status such as success or failed"), "finish_reason": mcpString("Finish reason")}, []string{"task_id", "session_id"}),
 		mcpTool("append_context", "Append sanitized task context.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content")}, []string{"task_id", "content"}),
 		mcpTool("add_decision", "Add a first-class decision record to a task.", map[string]any{"task_id": mcpString("Task ID"), "decision": mcpString("Decision made"), "reason": mcpString("Reason for the decision"), "impact": mcpString("Impact of the decision"), "alternatives": mcpStringArray("Alternatives considered")}, []string{"task_id", "decision"}),
 		mcpTool("add_comment", "Add a comment to a task.", map[string]any{"task_id": mcpString("Task ID"), "body": mcpString("Comment body")}, []string{"task_id", "body"}),
 		mcpTool("add_artifact", "Attach an external artifact reference to a task.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("Artifact kind such as pr, doc, build, report, link"), "title": mcpString("Artifact title"), "uri": mcpString("Artifact URI"), "description": mcpString("Optional description"), "metadata": map[string]any{"type": "object", "description": "Optional metadata object"}}, []string{"task_id", "kind", "title", "uri"}),
 		mcpTool("add_git_ref", "Attach git branch, commit, PR, changed files, or note to a task.", map[string]any{"task_id": mcpString("Task ID"), "branch": mcpString("Branch name"), "commit_sha": mcpString("Commit SHA"), "pr_url": mcpString("Pull request URL"), "changed_files": mcpStringArray("Changed files"), "note": mcpString("Optional note")}, []string{"task_id"}),
+		mcpTool("create_context_snapshot", "Create a compact context snapshot for a task.", map[string]any{"task_id": mcpString("Task ID"), "snapshot_type": mcpString("Snapshot type, defaults to manual")}, []string{"task_id"}),
 		mcpTool("acquire_lock", "Acquire a TaskPilot lock for a task scope.", map[string]any{"task_id": mcpString("Task ID"), "scope": mcpString("File, glob, artifact, task, or semantic scope"), "scope_type": mcpString("file, file_glob, artifact, task, or semantic")}, []string{"task_id", "scope"}),
+		mcpTool("check_scope_conflicts", "Check whether a scope conflicts with active TaskPilot locks.", map[string]any{"scope": mcpString("File, glob, artifact, task, or semantic scope"), "scope_type": mcpString("Scope type, defaults to file_glob"), "project_id": mcpString("Optional project ID"), "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{"scope"}),
+		mcpTool("release_lock", "Release a TaskPilot lock.", map[string]any{"lock_id": mcpString("Lock ID"), "reason": mcpString("Optional release reason")}, []string{"lock_id"}),
+		mcpTool("renew_lock", "Renew a TaskPilot lock.", map[string]any{"lock_id": mcpString("Lock ID")}, []string{"lock_id"}),
+		mcpTool("override_lock", "Override a TaskPilot lock.", map[string]any{"lock_id": mcpString("Lock ID"), "reason": mcpString("Override reason")}, []string{"lock_id", "reason"}),
 		mcpTool("prepare_handoff", "Prepare a TaskPilot handoff with summary and next steps.", map[string]any{"task_id": mcpString("Task ID"), "to_actor_id": mcpString("Optional target actor ID"), "summary": mcpString("Handoff summary"), "next_steps": map[string]any{"type": "array", "items": mcpString("Next step")}}, []string{"task_id", "summary"}),
+		mcpTool("generate_handoff_packet", "Generate a structured handoff packet for a task.", map[string]any{"task_id": mcpString("Task ID"), "handoff_id": mcpString("Optional handoff ID"), "status": mcpString("Packet status, defaults to draft")}, []string{"task_id"}),
+		mcpTool("read_latest_handoff", "Read the latest handoff packet for a task.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
+		mcpTool("publish_handoff", "Publish a handoff packet by packet ID.", map[string]any{"packet_id": mcpString("Handoff packet ID")}, []string{"packet_id"}),
+		mcpTool("accept_handoff", "Accept a handoff by handoff ID.", map[string]any{"handoff_id": mcpString("Handoff ID")}, []string{"handoff_id"}),
+		mcpTool("reject_handoff", "Reject a handoff by handoff ID.", map[string]any{"handoff_id": mcpString("Handoff ID")}, []string{"handoff_id"}),
+		mcpTool("list_handoffs", "List TaskPilot handoffs.", map[string]any{"task_id": mcpString("Optional task ID")}, []string{}),
 		mcpTool("checkpoint_handoff", "Save a handoff markdown checkpoint.", map[string]any{"task_id": mcpString("Task ID"), "packet_id": mcpString("Optional handoff packet ID"), "session_id": mcpString("Optional task session ID"), "markdown": mcpString("Sanitized handoff markdown")}, []string{"task_id", "markdown"}),
+		mcpTool("list_task_events", "List audit events for one task.", map[string]any{"task_id": mcpString("Task ID"), "since": map[string]any{"type": "integer", "description": "Only events after this event ID"}}, []string{"task_id"}),
+		mcpTool("list_recent_events", "List recent TaskPilot audit events.", map[string]any{"since": map[string]any{"type": "integer", "description": "Only events after this event ID"}}, []string{}),
+		mcpTool("find_related_tasks", "Find tasks related to a task by links, scope, repo, project, and memory signals.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
+		mcpTool("summarize_task", "Summarize one TaskPilot task from its structured memory.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
+		mcpTool("summarize_project", "Summarize TaskPilot project state from tasks and memory signals.", map[string]any{"project_id": mcpString("Optional project ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum tasks to inspect"}}, []string{}),
+		mcpTool("find_decisions", "Find TaskPilot decisions matching a query.", map[string]any{"query": mcpString("Optional decision search text"), "project_id": mcpString("Optional project ID"), "task_id": mcpString("Optional task ID"), "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
+		mcpTool("find_blockers", "Find blockers from task fields and blocker context.", map[string]any{"query": mcpString("Optional blocker search text"), "project_id": mcpString("Optional project ID"), "task_id": mcpString("Optional task ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
+		mcpTool("find_outputs", "Find outputs from context, artifacts, and git refs.", map[string]any{"query": mcpString("Optional output search text"), "project_id": mcpString("Optional project ID"), "task_id": mcpString("Optional task ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
 		mcpTool("complete_task", "Complete a task with a summary.", map[string]any{"task_id": mcpString("Task ID"), "summary": mcpString("Completion summary")}, []string{"task_id", "summary"}),
 	}
 }
@@ -2002,6 +2034,86 @@ func mcpTool(name, description string, properties map[string]any, required []str
 
 func callMCPTool(name string, args map[string]any) (any, error) {
 	switch name {
+	case "create_project":
+		name, err := mcpRequireArg(args, "name")
+		if err != nil {
+			return nil, err
+		}
+		var out Project
+		if err := request("POST", "/api/projects", map[string]any{"name": name, "description": mcpArg(args, "description")}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "list_projects":
+		var out []Project
+		if err := request("GET", "/api/projects", nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d TaskPilot projects.", len(out)), "records": out}), nil
+	case "create_repository":
+		projectID, err := mcpRequireArg(args, "project_id")
+		if err != nil {
+			return nil, err
+		}
+		name, err := mcpRequireArg(args, "name")
+		if err != nil {
+			return nil, err
+		}
+		branch := mcpArg(args, "default_branch")
+		if branch == "" {
+			branch = "main"
+		}
+		var out Repository
+		body := map[string]any{"project_id": projectID, "name": name, "path": mcpArg(args, "path"), "default_branch": branch}
+		if err := request("POST", "/api/repositories", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "list_repositories":
+		path := "/api/repositories"
+		if projectID := mcpArg(args, "project_id"); projectID != "" {
+			path += "?project_id=" + url.QueryEscape(projectID)
+		}
+		var out []Repository
+		if err := request("GET", path, nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d TaskPilot repositories.", len(out)), "records": out}), nil
+	case "create_workspace":
+		projectID, err := mcpRequireArg(args, "project_id")
+		if err != nil {
+			return nil, err
+		}
+		name, err := mcpRequireArg(args, "name")
+		if err != nil {
+			return nil, err
+		}
+		kind := mcpArg(args, "kind")
+		if kind == "" {
+			kind = "local"
+		}
+		var out Workspace
+		body := map[string]any{"project_id": projectID, "name": name, "actor_id": mcpArg(args, "actor_id"), "machine_name": mcpArg(args, "machine_name"), "kind": kind}
+		if err := request("POST", "/api/workspaces", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "list_workspaces":
+		path := "/api/workspaces"
+		if projectID := mcpArg(args, "project_id"); projectID != "" {
+			path += "?project_id=" + url.QueryEscape(projectID)
+		}
+		var out []Workspace
+		if err := request("GET", path, nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d TaskPilot workspaces.", len(out)), "records": out}), nil
+	case "list_actors":
+		var out []Actor
+		if err := request("GET", "/api/actors", nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d TaskPilot actors.", len(out)), "records": out}), nil
 	case "search_tasks":
 		tasks, err := mcpFilteredTasks(args)
 		if err != nil {
@@ -2128,6 +2240,32 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "remove_dependency":
+		dependencyID, err := mcpRequireArg(args, "dependency_id")
+		if err != nil {
+			return nil, err
+		}
+		if err := request("DELETE", "/api/dependencies/"+url.PathEscape(dependencyID), nil, nil); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"status": "ok", "dependency_id": dependencyID}), nil
+	case "update_task":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		body := mcpTaskUpdateInput(args)
+		var out Task
+		if err := request("PATCH", "/api/tasks/"+url.PathEscape(taskID), body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "append_task_fields":
+		out, err := mcpAppendTaskFields(args)
+		if err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
 	case "update_task_status":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2142,6 +2280,15 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "delete_task":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		if err := request("DELETE", "/api/tasks/"+url.PathEscape(taskID), nil, nil); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"status": "ok", "task_id": taskID}), nil
 	case "claim_task":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2170,6 +2317,35 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		}
 		var out Task
 		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/release", map[string]any{}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "start_task_session":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		var out TaskSession
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/sessions/start", map[string]any{}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "finish_task_session":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		sessionID, err := mcpRequireArg(args, "session_id")
+		if err != nil {
+			return nil, err
+		}
+		exitStatus := mcpArg(args, "exit_status")
+		if exitStatus == "" {
+			exitStatus = "success"
+		}
+		var out Task
+		body := map[string]any{"session_id": sessionID, "exit_status": exitStatus, "finish_reason": mcpArg(args, "finish_reason")}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/sessions/finish", body, &out); err != nil {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
@@ -2255,6 +2431,20 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "create_context_snapshot":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		snapshotType := mcpArg(args, "snapshot_type")
+		if snapshotType == "" {
+			snapshotType = "manual"
+		}
+		var out ContextSnapshot
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/snapshots", map[string]any{"snapshot_type": snapshotType}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
 	case "acquire_lock":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2273,6 +2463,41 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "check_scope_conflicts":
+		scope, err := mcpRequireArg(args, "scope")
+		if err != nil {
+			return nil, err
+		}
+		checkArgs := map[string]any{"project_id": mcpArg(args, "project_id"), "scope": scope, "limit": mcpIntArg(args, "limit", 50)}
+		locks, warnings, err := mcpActiveLocks(checkArgs)
+		if err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d active lock conflict candidate(s) for %s.", len(locks), scope), "matched_count": len(locks), "records": locks, "warnings": warnings}), nil
+	case "release_lock", "renew_lock", "override_lock":
+		lockID, err := mcpRequireArg(args, "lock_id")
+		if err != nil {
+			return nil, err
+		}
+		action := strings.TrimSuffix(strings.TrimPrefix(name, "release_"), "_lock")
+		if name == "release_lock" {
+			action = "release"
+		}
+		if name == "renew_lock" {
+			action = "renew"
+		}
+		if name == "override_lock" {
+			action = "override"
+		}
+		body := map[string]any{}
+		if action == "release" || action == "override" {
+			body["reason"] = mcpArg(args, "reason")
+		}
+		var out Lock
+		if err := request("POST", "/api/locks/"+url.PathEscape(lockID)+"/"+action, body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
 	case "prepare_handoff":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2287,6 +2512,68 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "generate_handoff_packet":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		status := mcpArg(args, "status")
+		if status == "" {
+			status = "draft"
+		}
+		var out HandoffPacket
+		body := map[string]any{"handoff_id": mcpArg(args, "handoff_id"), "status": status}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/handoff-packet/generate", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "read_latest_handoff":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		var out HandoffPacket
+		if err := request("GET", "/api/tasks/"+url.PathEscape(taskID)+"/handoff-packet", nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "publish_handoff":
+		packetID, err := mcpRequireArg(args, "packet_id")
+		if err != nil {
+			return nil, err
+		}
+		var out HandoffPacket
+		if err := request("POST", "/api/handoff-packets/"+url.PathEscape(packetID)+"/publish", map[string]any{}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "accept_handoff", "reject_handoff":
+		handoffID, err := mcpRequireArg(args, "handoff_id")
+		if err != nil {
+			return nil, err
+		}
+		action := "accept"
+		if name == "reject_handoff" {
+			action = "reject"
+		}
+		var out Handoff
+		if err := request("POST", "/api/handoffs/"+url.PathEscape(handoffID)+"/"+action, map[string]any{}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "list_handoffs":
+		if taskID := mcpArg(args, "task_id"); taskID != "" {
+			var detail TaskDetail
+			if err := request("GET", "/api/tasks/"+url.PathEscape(taskID), nil, &detail); err != nil {
+				return nil, err
+			}
+			return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d handoffs for %s.", len(detail.Handoffs), taskID), "records": detail.Handoffs}), nil
+		}
+		var out []Handoff
+		if err := request("GET", "/api/handoffs", nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d TaskPilot handoffs.", len(out)), "records": out}), nil
 	case "checkpoint_handoff":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2299,6 +2586,73 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		var out HandoffCheckpoint
 		body := map[string]any{"packet_id": mcpArg(args, "packet_id"), "session_id": mcpArg(args, "session_id"), "markdown": markdown}
 		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/handoff-checkpoints", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "list_task_events":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		var detail TaskDetail
+		if err := request("GET", "/api/tasks/"+url.PathEscape(taskID), nil, &detail); err != nil {
+			return nil, err
+		}
+		out := detail.Events
+		if since := mcpIntArg(args, "since", 0); since > 0 {
+			filtered := []Event{}
+			for _, event := range out {
+				if event.ID > int64(since) {
+					filtered = append(filtered, event)
+				}
+			}
+			out = filtered
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d events for %s.", len(out), taskID), "records": out}), nil
+	case "list_recent_events":
+		path := "/api/events"
+		if since := mcpIntArg(args, "since", 0); since > 0 {
+			path += "?since=" + url.QueryEscape(fmt.Sprint(since))
+		}
+		var out []Event
+		if err := request("GET", path, nil, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d recent TaskPilot events.", len(out)), "records": out}), nil
+	case "find_related_tasks":
+		detail, err := mcpReadTaskDetail(args)
+		if err != nil {
+			return nil, err
+		}
+		related := collectRelatedAgentContexts(detail)
+		return mcpToolResult(map[string]any{"summary": fmt.Sprintf("Found %d related tasks for %s.", len(related), detail.Task.ID), "records": related}), nil
+	case "summarize_task":
+		detail, err := mcpReadTaskDetail(args)
+		if err != nil {
+			return nil, err
+		}
+		return mcpToolResult(mcpSummarizeTask(detail)), nil
+	case "summarize_project":
+		out, err := mcpSummarizeProject(args)
+		if err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "find_decisions":
+		out, err := mcpFindDecisions(args)
+		if err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "find_blockers":
+		out, err := mcpFindBlockers(args)
+		if err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "find_outputs":
+		out, err := mcpFindOutputs(args)
+		if err != nil {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
@@ -2396,6 +2750,14 @@ func mcpMapArg(args map[string]any, key string) map[string]any {
 	return nil
 }
 
+func mcpHasArg(args map[string]any, key string) bool {
+	if args == nil {
+		return false
+	}
+	_, ok := args[key]
+	return ok
+}
+
 func mcpToolResult(v any) map[string]any {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": string(b)}}}
@@ -2436,6 +2798,71 @@ func mcpTaskInput(args map[string]any, subtask bool) (TaskInput, error) {
 		in.PrivacyLevel = ""
 	}
 	return in, nil
+}
+
+func mcpTaskUpdateInput(args map[string]any) map[string]any {
+	body := map[string]any{"reason": mcpArg(args, "reason")}
+	for _, key := range []string{"title", "goal", "type", "priority", "project_id", "repo_id", "workspace_id", "parent_task_id", "privacy_level"} {
+		if value := mcpArg(args, key); value != "" {
+			body[key] = value
+		}
+	}
+	for _, key := range []string{"scope", "requirements", "completion_criteria", "risks", "blockers"} {
+		if mcpHasArg(args, key) {
+			body[key] = mcpStringSliceArg(args, key)
+		}
+	}
+	return body
+}
+
+func mcpAppendTaskFields(args map[string]any) (Task, error) {
+	taskID, err := mcpRequireArg(args, "task_id")
+	if err != nil {
+		return Task{}, err
+	}
+	var detail TaskDetail
+	if err := request("GET", "/api/tasks/"+url.PathEscape(taskID), nil, &detail); err != nil {
+		return Task{}, err
+	}
+	body := map[string]any{"reason": mcpArg(args, "reason")}
+	if mcpHasArg(args, "scope") {
+		body["scope"] = appendUniqueStrings(detail.Task.Scope, mcpStringSliceArg(args, "scope")...)
+	}
+	if mcpHasArg(args, "requirements") {
+		body["requirements"] = appendUniqueStrings(detail.Task.Requirements, mcpStringSliceArg(args, "requirements")...)
+	}
+	if mcpHasArg(args, "completion_criteria") {
+		body["completion_criteria"] = appendUniqueStrings(detail.Task.CompletionCriteria, mcpStringSliceArg(args, "completion_criteria")...)
+	}
+	if mcpHasArg(args, "risks") {
+		body["risks"] = appendUniqueStrings(detail.Task.Risks, mcpStringSliceArg(args, "risks")...)
+	}
+	if mcpHasArg(args, "blockers") {
+		body["blockers"] = appendUniqueStrings(detail.Task.Blockers, mcpStringSliceArg(args, "blockers")...)
+	}
+	var out Task
+	if err := request("PATCH", "/api/tasks/"+url.PathEscape(taskID), body, &out); err != nil {
+		return Task{}, err
+	}
+	return out, nil
+}
+
+func appendUniqueStrings(base []string, additions ...string) []string {
+	out := append([]string{}, base...)
+	seen := map[string]bool{}
+	for _, item := range out {
+		seen[strings.ToLower(strings.TrimSpace(item))] = true
+	}
+	for _, item := range additions {
+		item = strings.TrimSpace(item)
+		key := strings.ToLower(item)
+		if item == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, item)
+	}
+	return out
 }
 
 func mcpReadTaskDetail(args map[string]any) (TaskDetail, error) {
@@ -2677,6 +3104,249 @@ func mcpAskResponse(query string, evidence []map[string]any) map[string]any {
 		"matched_count":       len(evidence),
 		"suggested_followups": []string{"Use read_task or read_task_memory for a specific task ID when you need complete context."},
 	}
+}
+
+func mcpSummarizeTask(detail TaskDetail) map[string]any {
+	summaries := []string{}
+	next := []string{}
+	outputs := []string{}
+	contextBlockers := []string{}
+	risks := append([]string{}, detail.Task.Risks...)
+	for _, entry := range compactContextEntries(detail.Context, 80) {
+		switch entry.Kind {
+		case "summary":
+			summaries = append(summaries, entry.Content)
+		case "next":
+			next = append(next, entry.Content)
+		case "output_ref":
+			outputs = append(outputs, entry.Content)
+		case "risk":
+			risks = append(risks, entry.Content)
+		case "blocker":
+			contextBlockers = append(contextBlockers, entry.Content)
+		}
+	}
+	return map[string]any{
+		"summary":              "Task " + detail.Task.ID + ": " + detail.Task.Title,
+		"task":                 detail.Task,
+		"owner":                detail.Owner,
+		"recent_summaries":     limitStrings(uniqueStrings(summaries), 8),
+		"decisions":            limitDecisions(detail.Decisions, 8),
+		"blockers":             limitStrings(uniqueStrings(append(append([]string{}, detail.Task.Blockers...), contextBlockers...)), 8),
+		"risks":                limitStrings(uniqueStrings(risks), 8),
+		"next_steps":           limitStrings(uniqueStrings(next), 8),
+		"outputs":              limitStrings(uniqueStrings(outputs), 8),
+		"artifacts":            limitArtifacts(detail.Artifacts, 8),
+		"git_refs":             limitGitRefs(detail.GitRefs, 8),
+		"active_locks":         activeLocksOnly(detail.Locks),
+		"handoff_summary":      relatedHandoffSummary(detail),
+		"event_count":          len(detail.Events),
+		"subtask_count":        len(detail.Subtasks),
+		"dependency_count":     len(detail.Dependencies),
+		"dependent_count":      len(detail.Dependents),
+		"checkpoint_count":     len(detail.HandoffCheckpoints),
+		"has_handoff_packet":   detail.HandoffPacket != nil,
+		"latest_snapshot_id":   latestSnapshotID(detail),
+		"latest_handoff_id":    latestHandoffID(detail.Handoffs),
+		"latest_checkpoint_id": latestCheckpointID(detail.HandoffCheckpoints),
+	}
+}
+
+func activeLocksOnly(locks []Lock) []Lock {
+	out := []Lock{}
+	for _, lock := range locks {
+		if lock.ReleasedAt == nil && (lock.Status == "active" || lock.Status == "stale") {
+			out = append(out, lock)
+		}
+	}
+	return out
+}
+
+func latestSnapshotID(detail TaskDetail) string {
+	if detail.LatestSnapshot != nil {
+		return detail.LatestSnapshot.ID
+	}
+	return ""
+}
+
+func latestHandoffID(handoffs []Handoff) string {
+	if len(handoffs) == 0 {
+		return ""
+	}
+	return handoffs[0].ID
+}
+
+func latestCheckpointID(checkpoints []HandoffCheckpoint) string {
+	if len(checkpoints) == 0 {
+		return ""
+	}
+	return checkpoints[len(checkpoints)-1].ID
+}
+
+func mcpSummarizeProject(args map[string]any) (map[string]any, error) {
+	tasks, err := mcpFilteredTasks(map[string]any{"project_id": mcpArg(args, "project_id"), "include_completed": mcpBoolArg(args, "include_completed"), "limit": mcpIntArg(args, "limit", 100)})
+	if err != nil {
+		return nil, err
+	}
+	statusCounts := map[string]int{}
+	priorityCounts := map[string]int{}
+	blocked := []Task{}
+	inProgress := []Task{}
+	ready := []Task{}
+	for _, task := range tasks {
+		statusCounts[task.Status]++
+		priorityCounts[task.Priority]++
+		if task.Status == "blocked" || len(task.Blockers) > 0 || task.OpenDependencyCount > 0 {
+			blocked = append(blocked, task)
+		}
+		if task.Status == "in_progress" || task.Status == "claimed" {
+			inProgress = append(inProgress, task)
+		}
+		if task.Status == "ready" {
+			ready = append(ready, task)
+		}
+	}
+	return map[string]any{
+		"summary":         fmt.Sprintf("Project summary from %d TaskPilot task(s).", len(tasks)),
+		"task_count":      len(tasks),
+		"status_counts":   statusCounts,
+		"priority_counts": priorityCounts,
+		"blocked_tasks":   limitTasks(blocked, 10),
+		"active_tasks":    limitTasks(inProgress, 10),
+		"ready_tasks":     limitTasks(ready, 10),
+	}, nil
+}
+
+func limitTasks(tasks []Task, limit int) []Task {
+	if len(tasks) <= limit {
+		return tasks
+	}
+	return tasks[:limit]
+}
+
+func mcpFindDecisions(args map[string]any) (map[string]any, error) {
+	details, err := mcpDetailsForSearch(args)
+	if err != nil {
+		return nil, err
+	}
+	query := mcpArg(args, "query")
+	limit := mcpIntArg(args, "limit", 20)
+	records := []map[string]any{}
+	for _, detail := range details {
+		for _, decision := range detail.Decisions {
+			text := strings.Join([]string{decision.Decision, decision.Reason, decision.Impact, strings.Join(decision.Alternatives, " ")}, " ")
+			if query == "" || mcpTextMatchesTerms(text, strings.Fields(strings.ToLower(query))) {
+				records = append(records, map[string]any{"task_id": detail.Task.ID, "task_title": detail.Task.Title, "decision": decision})
+				if limit > 0 && len(records) >= limit {
+					return map[string]any{"summary": fmt.Sprintf("Found %d matching decisions.", len(records)), "records": records}, nil
+				}
+			}
+		}
+	}
+	return map[string]any{"summary": fmt.Sprintf("Found %d matching decisions.", len(records)), "records": records}, nil
+}
+
+func mcpFindBlockers(args map[string]any) (map[string]any, error) {
+	details, err := mcpDetailsForSearch(args)
+	if err != nil {
+		return nil, err
+	}
+	query := mcpArg(args, "query")
+	terms := strings.Fields(strings.ToLower(query))
+	limit := mcpIntArg(args, "limit", 20)
+	records := []map[string]any{}
+	add := func(task Task, source, text string) bool {
+		if query != "" && !mcpTextMatchesTerms(text, terms) {
+			return false
+		}
+		records = append(records, map[string]any{"task_id": task.ID, "task_title": task.Title, "source": source, "text": text})
+		return limit > 0 && len(records) >= limit
+	}
+	for _, detail := range details {
+		for _, blocker := range detail.Task.Blockers {
+			if add(detail.Task, "task.blockers", blocker) {
+				return map[string]any{"summary": fmt.Sprintf("Found %d blockers.", len(records)), "records": records}, nil
+			}
+		}
+		for _, entry := range detail.Context {
+			if entry.Kind == "blocker" && add(detail.Task, "context", entry.Content) {
+				return map[string]any{"summary": fmt.Sprintf("Found %d blockers.", len(records)), "records": records}, nil
+			}
+		}
+		for _, dep := range detail.Dependencies {
+			label := dep.DependsOnID
+			if dep.DependsOnTask != nil {
+				label = dep.DependsOnTask.Title + " (" + dep.DependsOnTask.Status + ")"
+			}
+			if add(detail.Task, "dependency", label) {
+				return map[string]any{"summary": fmt.Sprintf("Found %d blockers.", len(records)), "records": records}, nil
+			}
+		}
+	}
+	return map[string]any{"summary": fmt.Sprintf("Found %d blockers.", len(records)), "records": records}, nil
+}
+
+func mcpFindOutputs(args map[string]any) (map[string]any, error) {
+	details, err := mcpDetailsForSearch(args)
+	if err != nil {
+		return nil, err
+	}
+	query := mcpArg(args, "query")
+	terms := strings.Fields(strings.ToLower(query))
+	limit := mcpIntArg(args, "limit", 20)
+	records := []map[string]any{}
+	add := func(record map[string]any, text string) bool {
+		if query != "" && !mcpTextMatchesTerms(text, terms) {
+			return false
+		}
+		records = append(records, record)
+		return limit > 0 && len(records) >= limit
+	}
+	for _, detail := range details {
+		for _, entry := range detail.Context {
+			if entry.Kind == "output_ref" {
+				if add(map[string]any{"type": "context_output", "task_id": detail.Task.ID, "task_title": detail.Task.Title, "content": entry.Content}, entry.Content) {
+					return map[string]any{"summary": fmt.Sprintf("Found %d outputs.", len(records)), "records": records}, nil
+				}
+			}
+		}
+		for _, artifact := range detail.Artifacts {
+			text := artifact.Kind + " " + artifact.Title + " " + artifact.URI + " " + artifact.Description
+			if add(map[string]any{"type": "artifact", "task_id": detail.Task.ID, "task_title": detail.Task.Title, "artifact": artifact}, text) {
+				return map[string]any{"summary": fmt.Sprintf("Found %d outputs.", len(records)), "records": records}, nil
+			}
+		}
+		for _, gitRef := range detail.GitRefs {
+			text := gitRef.Branch + " " + gitRef.CommitSHA + " " + gitRef.PRURL + " " + strings.Join(gitRef.ChangedFiles, " ") + " " + gitRef.Note
+			if add(map[string]any{"type": "git_ref", "task_id": detail.Task.ID, "task_title": detail.Task.Title, "git_ref": gitRef}, text) {
+				return map[string]any{"summary": fmt.Sprintf("Found %d outputs.", len(records)), "records": records}, nil
+			}
+		}
+	}
+	return map[string]any{"summary": fmt.Sprintf("Found %d outputs.", len(records)), "records": records}, nil
+}
+
+func mcpDetailsForSearch(args map[string]any) ([]TaskDetail, error) {
+	if taskID := mcpArg(args, "task_id"); taskID != "" {
+		detail, err := mcpReadTaskDetail(map[string]any{"task_id": taskID})
+		if err != nil {
+			return nil, err
+		}
+		return []TaskDetail{detail}, nil
+	}
+	tasks, err := mcpFilteredTasks(map[string]any{"project_id": mcpArg(args, "project_id"), "include_completed": mcpBoolArg(args, "include_completed"), "limit": mcpIntArg(args, "limit", 50)})
+	if err != nil {
+		return nil, err
+	}
+	details := []TaskDetail{}
+	for _, task := range tasks {
+		var detail TaskDetail
+		if err := request("GET", "/api/tasks/"+url.PathEscape(task.ID), nil, &detail); err != nil {
+			continue
+		}
+		details = append(details, detail)
+	}
+	return details, nil
 }
 
 func agentInstructions(taskID string) string {
