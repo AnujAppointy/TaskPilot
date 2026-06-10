@@ -1,0 +1,25 @@
+what about making a mcp of the taskpilot such that developer will ask anything from the taskpilot mcp and they will get the query answer also ?
+
+---
+
+so it means after building this any agent or ai like chatgpt can talk to taskpilot from the mcp also
+
+---
+
+made plan for building it
+
+---
+
+make scenario of a mcp usage of taskpilot such that i will understand that how it is working
+
+---
+
+ok implement the plan without breaking the existing functionality of the taskpilot
+
+---
+
+make scenario how to test it
+
+---
+
+after  deploying it how to connect the mcp to claude ai desktop , give guide step by step
