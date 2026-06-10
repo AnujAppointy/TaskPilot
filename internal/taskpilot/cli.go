@@ -1969,9 +1969,18 @@ func mcpTools() []map[string]any {
 		mcpTool("read_task_memory", "Read compact task memory: context, decisions, comments, artifacts, git refs, locks, handoffs, and checkpoints.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("task_context_bundle", "Read compact current-task context plus selected related TaskPilot context.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("ask_taskpilot", "Answer a natural-language TaskPilot question by retrieving matching records and returning concise evidence.", map[string]any{"query": mcpString("Question to ask TaskPilot"), "task_id": mcpString("Optional task ID to focus the question"), "project_id": mcpString("Optional project ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum evidence records to return"}}, []string{"query"}),
+		mcpTool("create_task", "Create a new TaskPilot task.", map[string]any{"title": mcpString("Task title"), "goal": mcpString("Task goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "parent_task_id": mcpString("Optional parent task ID"), "scope": mcpStringArray("Task scopes such as files, globs, artifacts, or semantic areas"), "requirements": mcpStringArray("Task requirements"), "completion_criteria": mcpStringArray("Completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers"), "privacy_level": mcpString("Privacy level, defaults to sanitized_context")}, []string{"title", "goal"}),
+		mcpTool("create_subtask", "Create a subtask under an existing TaskPilot task.", map[string]any{"parent_task_id": mcpString("Parent task ID"), "title": mcpString("Subtask title"), "goal": mcpString("Subtask goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "scope": mcpStringArray("Subtask scopes"), "requirements": mcpStringArray("Subtask requirements"), "completion_criteria": mcpStringArray("Subtask completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers")}, []string{"parent_task_id", "title", "goal"}),
+		mcpTool("add_dependency", "Add a dependency so one task is blocked by another task.", map[string]any{"task_id": mcpString("Task ID that is blocked"), "depends_on_id": mcpString("Task ID this task depends on")}, []string{"task_id", "depends_on_id"}),
+		mcpTool("update_task_status", "Update a TaskPilot task status.", map[string]any{"task_id": mcpString("Task ID"), "status": mcpString("New task status such as ready, claimed, in_progress, blocked, handoff_ready, in_review, completed, or cancelled")}, []string{"task_id", "status"}),
 		mcpTool("claim_task", "Claim a TaskPilot task.", map[string]any{"task_id": mcpString("Task ID"), "force": map[string]any{"type": "boolean"}, "reason": mcpString("Reason for force claim")}, []string{"task_id"}),
 		mcpTool("heartbeat_task", "Renew active task ownership heartbeat.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
+		mcpTool("release_task", "Release ownership of a TaskPilot task.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("append_context", "Append sanitized task context.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content")}, []string{"task_id", "content"}),
+		mcpTool("add_decision", "Add a first-class decision record to a task.", map[string]any{"task_id": mcpString("Task ID"), "decision": mcpString("Decision made"), "reason": mcpString("Reason for the decision"), "impact": mcpString("Impact of the decision"), "alternatives": mcpStringArray("Alternatives considered")}, []string{"task_id", "decision"}),
+		mcpTool("add_comment", "Add a comment to a task.", map[string]any{"task_id": mcpString("Task ID"), "body": mcpString("Comment body")}, []string{"task_id", "body"}),
+		mcpTool("add_artifact", "Attach an external artifact reference to a task.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("Artifact kind such as pr, doc, build, report, link"), "title": mcpString("Artifact title"), "uri": mcpString("Artifact URI"), "description": mcpString("Optional description"), "metadata": map[string]any{"type": "object", "description": "Optional metadata object"}}, []string{"task_id", "kind", "title", "uri"}),
+		mcpTool("add_git_ref", "Attach git branch, commit, PR, changed files, or note to a task.", map[string]any{"task_id": mcpString("Task ID"), "branch": mcpString("Branch name"), "commit_sha": mcpString("Commit SHA"), "pr_url": mcpString("Pull request URL"), "changed_files": mcpStringArray("Changed files"), "note": mcpString("Optional note")}, []string{"task_id"}),
 		mcpTool("acquire_lock", "Acquire a TaskPilot lock for a task scope.", map[string]any{"task_id": mcpString("Task ID"), "scope": mcpString("File, glob, artifact, task, or semantic scope"), "scope_type": mcpString("file, file_glob, artifact, task, or semantic")}, []string{"task_id", "scope"}),
 		mcpTool("prepare_handoff", "Prepare a TaskPilot handoff with summary and next steps.", map[string]any{"task_id": mcpString("Task ID"), "to_actor_id": mcpString("Optional target actor ID"), "summary": mcpString("Handoff summary"), "next_steps": map[string]any{"type": "array", "items": mcpString("Next step")}}, []string{"task_id", "summary"}),
 		mcpTool("checkpoint_handoff", "Save a handoff markdown checkpoint.", map[string]any{"task_id": mcpString("Task ID"), "packet_id": mcpString("Optional handoff packet ID"), "session_id": mcpString("Optional task session ID"), "markdown": mcpString("Sanitized handoff markdown")}, []string{"task_id", "markdown"}),
@@ -1981,6 +1990,10 @@ func mcpTools() []map[string]any {
 
 func mcpString(description string) map[string]any {
 	return map[string]any{"type": "string", "description": description}
+}
+
+func mcpStringArray(description string) map[string]any {
+	return map[string]any{"type": "array", "items": mcpString("Value"), "description": description}
 }
 
 func mcpTool(name, description string, properties map[string]any, required []string) map[string]any {
@@ -2077,6 +2090,58 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "create_task":
+		body, err := mcpTaskInput(args, false)
+		if err != nil {
+			return nil, err
+		}
+		var out Task
+		if err := request("POST", "/api/tasks", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "create_subtask":
+		parentID, err := mcpRequireArg(args, "parent_task_id")
+		if err != nil {
+			return nil, err
+		}
+		body, err := mcpTaskInput(args, true)
+		if err != nil {
+			return nil, err
+		}
+		var out Task
+		if err := request("POST", "/api/tasks/"+url.PathEscape(parentID)+"/subtasks", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "add_dependency":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		dependsOnID, err := mcpRequireArg(args, "depends_on_id")
+		if err != nil {
+			return nil, err
+		}
+		var out TaskDependency
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/dependencies", map[string]any{"depends_on_id": dependsOnID}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "update_task_status":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		status, err := mcpRequireArg(args, "status")
+		if err != nil {
+			return nil, err
+		}
+		var out Task
+		if err := request("PATCH", "/api/tasks/"+url.PathEscape(taskID), map[string]any{"status": status}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
 	case "claim_task":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2098,6 +2163,16 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
+	case "release_task":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		var out Task
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/release", map[string]any{}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
 	case "append_context":
 		taskID, err := mcpRequireArg(args, "task_id")
 		if err != nil {
@@ -2114,6 +2189,69 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		}
 		body := map[string]any{"kind": kind, "content": content}
 		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/context", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "add_decision":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		decision, err := mcpRequireArg(args, "decision")
+		if err != nil {
+			return nil, err
+		}
+		var out DecisionRecord
+		body := map[string]any{"decision": decision, "reason": mcpArg(args, "reason"), "impact": mcpArg(args, "impact"), "alternatives": mcpStringSliceArg(args, "alternatives")}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/decisions", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "add_comment":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		bodyText, err := mcpRequireArg(args, "body")
+		if err != nil {
+			return nil, err
+		}
+		var out Comment
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/comments", map[string]any{"body": bodyText}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "add_artifact":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		kind, err := mcpRequireArg(args, "kind")
+		if err != nil {
+			return nil, err
+		}
+		title, err := mcpRequireArg(args, "title")
+		if err != nil {
+			return nil, err
+		}
+		uri, err := mcpRequireArg(args, "uri")
+		if err != nil {
+			return nil, err
+		}
+		var out Artifact
+		body := map[string]any{"kind": kind, "title": title, "uri": uri, "description": mcpArg(args, "description"), "metadata": mcpMapArg(args, "metadata")}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/artifacts", body, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "add_git_ref":
+		taskID, err := mcpRequireArg(args, "task_id")
+		if err != nil {
+			return nil, err
+		}
+		var out GitRef
+		body := map[string]any{"branch": mcpArg(args, "branch"), "commit_sha": mcpArg(args, "commit_sha"), "pr_url": mcpArg(args, "pr_url"), "changed_files": mcpStringSliceArg(args, "changed_files"), "note": mcpArg(args, "note")}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/git", body, &out); err != nil {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
@@ -2248,9 +2386,56 @@ func mcpStringSliceArg(args map[string]any, key string) []string {
 	return out
 }
 
+func mcpMapArg(args map[string]any, key string) map[string]any {
+	if args == nil {
+		return nil
+	}
+	if v, ok := args[key].(map[string]any); ok {
+		return v
+	}
+	return nil
+}
+
 func mcpToolResult(v any) map[string]any {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": string(b)}}}
+}
+
+func mcpTaskInput(args map[string]any, subtask bool) (TaskInput, error) {
+	title, err := mcpRequireArg(args, "title")
+	if err != nil {
+		return TaskInput{}, err
+	}
+	goal, err := mcpRequireArg(args, "goal")
+	if err != nil {
+		return TaskInput{}, err
+	}
+	in := TaskInput{
+		ProjectID:          mcpArg(args, "project_id"),
+		RepoID:             mcpArg(args, "repo_id"),
+		WorkspaceID:        mcpArg(args, "workspace_id"),
+		ParentTaskID:       mcpArg(args, "parent_task_id"),
+		Title:              title,
+		Goal:               goal,
+		Type:               mcpArg(args, "type"),
+		Status:             mcpArg(args, "status"),
+		Priority:           mcpArg(args, "priority"),
+		Scope:              mcpStringSliceArg(args, "scope"),
+		Requirements:       mcpStringSliceArg(args, "requirements"),
+		CompletionCriteria: mcpStringSliceArg(args, "completion_criteria"),
+		Risks:              mcpStringSliceArg(args, "risks"),
+		Blockers:           mcpStringSliceArg(args, "blockers"),
+		PrivacyLevel:       mcpArg(args, "privacy_level"),
+	}
+	if subtask {
+		in.ProjectID = ""
+		in.RepoID = ""
+		in.WorkspaceID = ""
+		in.ParentTaskID = ""
+		in.Status = ""
+		in.PrivacyLevel = ""
+	}
+	return in, nil
 }
 
 func mcpReadTaskDetail(args map[string]any) (TaskDetail, error) {

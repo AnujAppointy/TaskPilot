@@ -488,9 +488,18 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		"read_task_memory",
 		"task_context_bundle",
 		"ask_taskpilot",
+		"create_task",
+		"create_subtask",
+		"add_dependency",
+		"update_task_status",
 		"claim_task",
 		"heartbeat_task",
+		"release_task",
 		"append_context",
+		"add_decision",
+		"add_comment",
+		"add_artifact",
+		"add_git_ref",
 		"acquire_lock",
 		"prepare_handoff",
 		"checkpoint_handoff",
@@ -499,6 +508,30 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("tools/list missing %s: %s", want, raw)
 		}
+	}
+}
+
+func TestMCPTaskInputAcceptsStructuredTaskFields(t *testing.T) {
+	in, err := mcpTaskInput(map[string]any{
+		"title":               "Fix invited-user signup",
+		"goal":                "Invited users can complete signup",
+		"type":                "debugging",
+		"priority":            "high",
+		"project_id":          "project_1",
+		"scope":               []any{"src/auth/*", "src/invites/*"},
+		"requirements":        []any{"Keep old invite links working"},
+		"completion_criteria": []any{"Regression tests pass"},
+		"risks":               []any{"Timezone edge cases"},
+		"blockers":            []any{"Need sample expired invite"},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Title != "Fix invited-user signup" || in.ProjectID != "project_1" || in.Type != "debugging" || in.Priority != "high" {
+		t.Fatalf("unexpected task input basics: %+v", in)
+	}
+	if len(in.Scope) != 2 || len(in.Requirements) != 1 || len(in.CompletionCriteria) != 1 || len(in.Risks) != 1 || len(in.Blockers) != 1 {
+		t.Fatalf("structured task fields were not preserved: %+v", in)
 	}
 }
 
