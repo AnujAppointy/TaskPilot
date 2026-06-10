@@ -478,9 +478,71 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ = json.Marshal(toolsResult)
-	for _, want := range []string{"read_task", "claim_task", "heartbeat_task", "append_context", "complete_task"} {
+	for _, want := range []string{
+		"search_tasks",
+		"list_my_tasks",
+		"list_blocked_tasks",
+		"list_active_locks",
+		"list_conflicts",
+		"read_task",
+		"read_task_memory",
+		"task_context_bundle",
+		"ask_taskpilot",
+		"claim_task",
+		"heartbeat_task",
+		"append_context",
+		"acquire_lock",
+		"prepare_handoff",
+		"checkpoint_handoff",
+		"complete_task",
+	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("tools/list missing %s: %s", want, raw)
+		}
+	}
+}
+
+func TestMCPFilterTasksMatchesQueryAndExcludesCompletedByDefault(t *testing.T) {
+	tasks := []Task{
+		{ID: "task_1", Title: "Fix invited-user signup", Goal: "Patch invite expiry comparison", Status: "ready", Priority: "high", Scope: []string{"src/auth/*"}, SearchText: "Decision: keep token format unchanged"},
+		{ID: "task_2", Title: "Completed invite cleanup", Goal: "Old work", Status: "completed", Priority: "low", SearchText: "invite expiry"},
+		{ID: "task_3", Title: "Billing report", Goal: "Export CSV", Status: "ready", Priority: "medium"},
+	}
+
+	got := filterMCPTasks(tasks, mcpTaskFilter{Query: "invite expiry", Limit: 10})
+	if len(got) != 1 || got[0].ID != "task_1" {
+		t.Fatalf("expected only active invite task, got %+v", got)
+	}
+
+	got = filterMCPTasks(tasks, mcpTaskFilter{Query: "invite expiry", IncludeCompleted: true, Limit: 10})
+	if len(got) != 2 {
+		t.Fatalf("expected active and completed invite tasks, got %+v", got)
+	}
+}
+
+func TestMCPEvidenceFromDetailFindsDecisionContextArtifactAndLock(t *testing.T) {
+	now := time.Date(2026, 6, 10, 8, 0, 0, 0, time.UTC)
+	detail := TaskDetail{
+		Task: Task{ID: "task_1", Title: "Fix invited-user signup", Goal: "Keep existing invite links working", Status: "in_progress"},
+		Context: []ContextEntry{
+			{ID: "ctx_1", TaskID: "task_1", Kind: "summary", Content: "Found invite expiry comparison bug", CreatedAt: now},
+		},
+		Decisions: []DecisionRecord{
+			{ID: "dec_1", TaskID: "task_1", Decision: "Keep invite token format unchanged", Reason: "Existing invite links must keep working", CreatedAt: now},
+		},
+		Artifacts: []Artifact{
+			{ID: "art_1", TaskID: "task_1", Kind: "pr", Title: "Invite signup fix", URI: "https://example.test/pr/1"},
+		},
+		Locks: []Lock{
+			{ID: "lock_1", TaskID: "task_1", Scope: "src/auth/invite.go", ScopeType: "file", Status: "active", OwnerID: "actor_1"},
+		},
+	}
+
+	evidence := mcpEvidenceFromDetail(detail, "invite", 10)
+	raw, _ := json.Marshal(evidence)
+	for _, want := range []string{"decision", "context", "artifact", "lock"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("expected evidence to include %s: %s", want, raw)
 		}
 	}
 }
