@@ -1,0 +1,50 @@
+this is claude edit config and i edit it like this "{
+  "preferences": {
+    "coworkScheduledTasksEnabled": false,
+    "ccdScheduledTasksEnabled": false,
+    "sidebarMode": "chat",
+    "coworkWebSearchEnabled": true,
+    "remoteToolsDeviceName": "appointys-macbook-air-2-local",
+    "epitaxyPrefs": {
+      "starred-local-code-sessions": [],
+      "starred-cowork-spaces": [],
+      "starred-session-groups": [],
+      "dframe-local-slice": {
+        "pinnedOrder": [],
+        "customGroupAssignments": {},
+        "customGroupOrder": {}
+      }
+    }
+  },
+  "mcpServers": {
+    "taskpilot": {
+      "command": "taskpilot",
+      "args": ["mcp", "serve"]
+    } 
+  }
+}" is it good to go ?
+
+---
+
+appointy@Appointys-MacBook-Air-2 New project 6 % which taskpilot
+/usr/local/bin/taskpilot
+
+---
+
+What TaskPilot tools do you have?
+
+17:02
+
+Searched available tools
+Searched available tools
+I have 5 TaskPilot tools available:
+
+read_task — Fetch full details of a task by ID.
+claim_task — Claim ownership of a task (with optional force claim and reason).
+heartbeat_task — Renew the heartbeat to keep active ownership of a task.
+complete_task — Mark a task as complete with an optional summary.
+append_context — Append context to a task, with a kind field for categorizing the note (e.g. summary, decision, note, risk, blocker, output_ref, next).
+
+---
+
+create task like tools also , such that it will give more power to the mcp and by natural language developer can do more work in ai destop or ai site
