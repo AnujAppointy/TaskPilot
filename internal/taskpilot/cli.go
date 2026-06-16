@@ -18,7 +18,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1012,12 +1011,7 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 		result.ManualFallback = a.ManualInstructions(repo)
 		return result
 	}
-	if _, err := os.Stat(filepath.Join(repo.GitRoot, a.hookRelForOS())); err != nil {
-		result.Status = "missing_hook_script"
-		result.Message = "TaskPilot hook script is missing; run `taskpilot enable` again"
-		return result
-	}
-	writeResult, err := mergeSessionStartHookJSON(detection.ConfigPath, a.jsonPath, SessionStartHook{Type: "command", Command: a.command()}, dryRun)
+	writeResult, err := mergeSessionStartHookJSON(detection.ConfigPath, a.jsonPath, SessionStartHook{Type: "command", Command: a.command()}, dryRun, a.legacyCommands()...)
 	if err != nil {
 		result.Status = "error"
 		result.Message = err.Error()
@@ -1050,14 +1044,19 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 
 func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 	detection := a.Detect(repo)
-	hookPath := filepath.Join(repo.GitRoot, a.hookRelForOS())
-	_, hookErr := os.Stat(hookPath)
 	registered := jsonConfigHasHookCommand(detection.ConfigPath, a.jsonPath, a.command())
+	legacyRegistered := false
+	for _, legacy := range a.legacyCommands() {
+		if jsonConfigHasHookCommand(detection.ConfigPath, a.jsonPath, legacy) {
+			legacyRegistered = true
+			break
+		}
+	}
 	status := "ok"
 	msg := ""
-	if hookErr != nil {
-		status = "missing_hook_script"
-		msg = "run `taskpilot enable` to recreate hook scripts"
+	if !registered && legacyRegistered {
+		status = "legacy_registered"
+		msg = "run `taskpilot agent configure " + a.name + "` to upgrade to the cross-platform hook command"
 	} else if !registered {
 		status = "not_registered"
 		msg = "run `taskpilot agent configure " + a.name + "`"
@@ -1065,7 +1064,7 @@ func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 		status = "agent_not_on_path"
 		msg = "hook is registered, but the agent binary was not found on PATH"
 	}
-	return AgentHealth{Name: a.name, Installed: detection.Installed, ConfigPath: detection.ConfigPath, HookScriptPath: hookPath, HookScriptExists: hookErr == nil, Registered: registered, Status: status, Message: msg}
+	return AgentHealth{Name: a.name, Installed: detection.Installed, ConfigPath: detection.ConfigPath, HookScriptPath: "", HookScriptExists: true, Registered: registered, Status: status, Message: msg}
 }
 
 func (a jsonHookAdapter) ManualInstructions(repo repoEnableConfig) string {
@@ -1073,17 +1072,20 @@ func (a jsonHookAdapter) ManualInstructions(repo repoEnableConfig) string {
 }
 
 func (a jsonHookAdapter) command() string {
-	return filepath.ToSlash(a.hookRelForOS())
+	format := strings.TrimSpace(a.format)
+	if format == "" {
+		format = "markdown"
+	}
+	return "taskpilot context render --repo . --format " + format
 }
 
-func (a jsonHookAdapter) hookRelForOS() string {
-	if strings.HasSuffix(a.hookRel, ".sh") || strings.HasSuffix(a.hookRel, ".cmd") {
-		return a.hookRel
+func (a jsonHookAdapter) legacyCommands() []string {
+	base := strings.TrimSuffix(strings.TrimSuffix(a.hookRel, ".sh"), ".cmd")
+	return []string{
+		filepath.ToSlash(base + ".sh"),
+		filepath.ToSlash(base + ".cmd"),
+		filepath.ToSlash(base),
 	}
-	if runtime.GOOS == "windows" {
-		return a.hookRel + ".cmd"
-	}
-	return a.hookRel + ".sh"
 }
 
 type unsupportedAgentAdapter struct {
@@ -1104,12 +1106,12 @@ func (a unsupportedAgentAdapter) ManualInstructions(repo repoEnableConfig) strin
 	return "No automatic adapter exists for " + a.name + ". Configure your agent to run `.taskpilot/hooks/session-start.sh` on session start."
 }
 
-func mergeSessionStartHookJSON(path, hookPath string, hook SessionStartHook, dryRun bool) (jsonHookWriteResult, error) {
+func mergeSessionStartHookJSON(path, hookPath string, hook SessionStartHook, dryRun bool, aliases ...string) (jsonHookWriteResult, error) {
 	original, existed, err := readJSONConfigOrEmpty(path)
 	if err != nil {
 		return jsonHookWriteResult{}, err
 	}
-	updated, changed, err := mergeSessionStartHookJSONBytes(original, hookPath, hook)
+	updated, changed, err := mergeSessionStartHookJSONBytes(original, hookPath, hook, aliases...)
 	if err != nil {
 		return jsonHookWriteResult{}, err
 	}
@@ -1133,7 +1135,7 @@ func mergeSessionStartHookJSON(path, hookPath string, hook SessionStartHook, dry
 	return result, nil
 }
 
-func mergeSessionStartHookJSONBytes(original []byte, hookPath string, hook SessionStartHook) ([]byte, bool, error) {
+func mergeSessionStartHookJSONBytes(original []byte, hookPath string, hook SessionStartHook, aliases ...string) ([]byte, bool, error) {
 	if len(bytes.TrimSpace(original)) == 0 {
 		original = []byte("{}")
 	}
@@ -1155,7 +1157,7 @@ func mergeSessionStartHookJSONBytes(original []byte, hookPath string, hook Sessi
 			continue
 		}
 		for j, child := range hooks.Array() {
-			if child.Get("command").String() != hook.Command {
+			if !commandMatchesHook(child.Get("command").String(), hook.Command, aliases) {
 				continue
 			}
 			out := original
@@ -1174,6 +1176,18 @@ func mergeSessionStartHookJSONBytes(original []byte, hookPath string, hook Sessi
 	entryBytes, _ := json.Marshal(map[string]any{"hooks": []SessionStartHook{hook}})
 	out, err := sjson.SetRawBytes(original, hookPath+".-1", entryBytes)
 	return out, err == nil && !bytes.Equal(out, original), err
+}
+
+func commandMatchesHook(command, desired string, aliases []string) bool {
+	if command == desired {
+		return true
+	}
+	for _, alias := range aliases {
+		if command == alias {
+			return true
+		}
+	}
+	return false
 }
 
 func jsonConfigHasHookCommand(path, hookPath, command string) bool {

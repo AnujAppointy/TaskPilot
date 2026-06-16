@@ -105,7 +105,7 @@ func TestMergeSessionStartHookJSONBytesAppendsAndPreservesExistingConfig(t *test
     ]
   }
 }`)
-	updated, changed, err := mergeSessionStartHookJSONBytes(original, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/claude-session-start.sh"})
+	updated, changed, err := mergeSessionStartHookJSONBytes(original, "hooks.SessionStart", SessionStartHook{Type: "command", Command: "taskpilot context render --repo . --format claude"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,14 +113,14 @@ func TestMergeSessionStartHookJSONBytesAppendsAndPreservesExistingConfig(t *test
 		t.Fatalf("expected hook append to change config")
 	}
 	text := string(updated)
-	if !strings.Contains(text, `"theme": "dark"`) || !strings.Contains(text, "echo existing") || !strings.Contains(text, ".taskpilot/hooks/claude-session-start.sh") {
+	if !strings.Contains(text, `"theme": "dark"`) || !strings.Contains(text, "echo existing") || !strings.Contains(text, "taskpilot context render --repo . --format claude") {
 		t.Fatalf("updated config lost existing content or hook:\n%s", text)
 	}
 }
 
 func TestMergeSessionStartHookJSONBytesIsIdempotentByCommand(t *testing.T) {
-	original := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":".taskpilot/hooks/codex-session-start.sh"}]}]}}`)
-	updated, changed, err := mergeSessionStartHookJSONBytes(original, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/codex-session-start.sh"})
+	original := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"taskpilot context render --repo . --format codex"}]}]}}`)
+	updated, changed, err := mergeSessionStartHookJSONBytes(original, "hooks.SessionStart", SessionStartHook{Type: "command", Command: "taskpilot context render --repo . --format codex"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,12 +130,36 @@ func TestMergeSessionStartHookJSONBytesIsIdempotentByCommand(t *testing.T) {
 }
 
 func TestMergeSessionStartHookJSONBytesCreatesMissingConfig(t *testing.T) {
-	updated, changed, err := mergeSessionStartHookJSONBytes([]byte(`{}`), "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/gemini-session-start.sh"})
+	updated, changed, err := mergeSessionStartHookJSONBytes([]byte(`{}`), "hooks.SessionStart", SessionStartHook{Type: "command", Command: "taskpilot context render --repo . --format gemini"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed || !strings.Contains(string(updated), ".taskpilot/hooks/gemini-session-start.sh") {
+	if !changed || !strings.Contains(string(updated), "taskpilot context render --repo . --format gemini") {
 		t.Fatalf("expected missing config to be created, changed=%v updated=%s", changed, updated)
+	}
+}
+
+func TestMergeSessionStartHookJSONBytesUpgradesLegacyScriptCommand(t *testing.T) {
+	original := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":".taskpilot/hooks/codex-session-start.sh"}]}]}}`)
+	updated, changed, err := mergeSessionStartHookJSONBytes(
+		original,
+		"hooks.SessionStart",
+		SessionStartHook{Type: "command", Command: "taskpilot context render --repo . --format codex"},
+		".taskpilot/hooks/codex-session-start.sh",
+		".taskpilot/hooks/codex-session-start.cmd",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatalf("expected legacy hook command to be upgraded")
+	}
+	text := string(updated)
+	if strings.Contains(text, ".taskpilot/hooks/codex-session-start.sh") || !strings.Contains(text, "taskpilot context render --repo . --format codex") {
+		t.Fatalf("legacy command was not upgraded in place:\n%s", text)
+	}
+	if strings.Count(text, "SessionStart") != 1 {
+		t.Fatalf("expected in-place upgrade, got:\n%s", text)
 	}
 }
 
@@ -152,7 +176,7 @@ func TestMergeSessionStartHookJSONCreatesBackupAndSkipsNoopWrite(t *testing.T) {
 	if err := os.WriteFile(path, original, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	first, err := mergeSessionStartHookJSON(path, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/claude-session-start.sh"}, false)
+	first, err := mergeSessionStartHookJSON(path, "hooks.SessionStart", SessionStartHook{Type: "command", Command: "taskpilot context render --repo . --format claude"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +191,7 @@ func TestMergeSessionStartHookJSONCreatesBackupAndSkipsNoopWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
-	second, err := mergeSessionStartHookJSON(path, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/claude-session-start.sh"}, false)
+	second, err := mergeSessionStartHookJSON(path, "hooks.SessionStart", SessionStartHook{Type: "command", Command: "taskpilot context render --repo . --format claude"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
