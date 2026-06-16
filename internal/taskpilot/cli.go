@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -347,7 +348,7 @@ func runEnable(args []string) error {
 		WorkspaceID:   workspace,
 		RepoName:      name,
 		ContextFiles:  contextFiles,
-		HookCommand:   fmt.Sprintf("taskpilot context render --repo %q --format markdown", root),
+		HookCommand:   "taskpilot context render --repo . --format markdown",
 		MCPCommand:    "taskpilot mcp serve",
 		EnabledAt:     time.Now().UTC(),
 	}
@@ -845,9 +846,8 @@ func loadRepoConfig(root string) (repoEnableConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
 	}
-	if cfg.GitRoot == "" {
-		cfg.GitRoot = root
-	}
+	cfg.GitRoot = root
+	cfg.HookCommand = "taskpilot context render --repo . --format markdown"
 	return cfg, nil
 }
 
@@ -912,12 +912,19 @@ func writeHookScripts(cfg repoEnableConfig) error {
 	if err := ensureDir(dir); err != nil {
 		return err
 	}
-	script := "#!/bin/sh\nexec taskpilot context render --repo " + shellQuote(cfg.GitRoot) + " --format markdown\n"
-	if err := os.WriteFile(filepath.Join(dir, "session-start.sh"), []byte(script), 0o755); err != nil {
+	shScript := "#!/bin/sh\nSCRIPT_DIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\nREPO_ROOT=$(CDPATH= cd -- \"$SCRIPT_DIR/../..\" && pwd)\nexec taskpilot context render --repo \"$REPO_ROOT\" --format markdown\n"
+	cmdScript := "@echo off\r\nset \"SCRIPT_DIR=%~dp0\"\r\nfor %%I in (\"%SCRIPT_DIR%..\\..\") do set \"REPO_ROOT=%%~fI\"\r\ntaskpilot context render --repo \"%REPO_ROOT%\" --format markdown\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "session-start.sh"), []byte(shScript), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "session-start.cmd"), []byte(cmdScript), 0o755); err != nil {
 		return err
 	}
 	for _, agent := range []string{"codex", "claude", "gemini"} {
-		if err := os.WriteFile(filepath.Join(dir, agent+"-session-start.sh"), []byte(script), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, agent+"-session-start.sh"), []byte(shScript), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, agent+"-session-start.cmd"), []byte(cmdScript), 0o755); err != nil {
 			return err
 		}
 	}
@@ -926,9 +933,9 @@ func writeHookScripts(cfg repoEnableConfig) error {
 
 func agentAdapters() []AgentAdapter {
 	return []AgentAdapter{
-		jsonHookAdapter{name: "claude", binary: "claude", configRel: ".claude/settings.json", hookRel: ".taskpilot/hooks/claude-session-start.sh", format: "claude", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
-		jsonHookAdapter{name: "codex", binary: "codex", configRel: ".codex/hooks.json", hookRel: ".taskpilot/hooks/codex-session-start.sh", format: "codex", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
-		jsonHookAdapter{name: "gemini", binary: "gemini", configRel: ".gemini/settings.json", hookRel: ".taskpilot/hooks/gemini-session-start.sh", format: "gemini", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Gemini hook output is limited to bounded TaskPilot context."},
+		jsonHookAdapter{name: "claude", binary: "claude", configRel: ".claude/settings.json", hookRel: ".taskpilot/hooks/claude-session-start", format: "claude", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
+		jsonHookAdapter{name: "codex", binary: "codex", configRel: ".codex/hooks.json", hookRel: ".taskpilot/hooks/codex-session-start", format: "codex", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
+		jsonHookAdapter{name: "gemini", binary: "gemini", configRel: ".gemini/settings.json", hookRel: ".taskpilot/hooks/gemini-session-start", format: "gemini", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Gemini hook output is limited to bounded TaskPilot context."},
 	}
 }
 
@@ -1005,7 +1012,7 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 		result.ManualFallback = a.ManualInstructions(repo)
 		return result
 	}
-	if _, err := os.Stat(filepath.Join(repo.GitRoot, a.hookRel)); err != nil {
+	if _, err := os.Stat(filepath.Join(repo.GitRoot, a.hookRelForOS())); err != nil {
 		result.Status = "missing_hook_script"
 		result.Message = "TaskPilot hook script is missing; run `taskpilot enable` again"
 		return result
@@ -1043,7 +1050,7 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 
 func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 	detection := a.Detect(repo)
-	hookPath := filepath.Join(repo.GitRoot, a.hookRel)
+	hookPath := filepath.Join(repo.GitRoot, a.hookRelForOS())
 	_, hookErr := os.Stat(hookPath)
 	registered := jsonConfigHasHookCommand(detection.ConfigPath, a.jsonPath, a.command())
 	status := "ok"
@@ -1066,7 +1073,17 @@ func (a jsonHookAdapter) ManualInstructions(repo repoEnableConfig) string {
 }
 
 func (a jsonHookAdapter) command() string {
-	return filepath.ToSlash(a.hookRel)
+	return filepath.ToSlash(a.hookRelForOS())
+}
+
+func (a jsonHookAdapter) hookRelForOS() string {
+	if strings.HasSuffix(a.hookRel, ".sh") || strings.HasSuffix(a.hookRel, ".cmd") {
+		return a.hookRel
+	}
+	if runtime.GOOS == "windows" {
+		return a.hookRel + ".cmd"
+	}
+	return a.hookRel + ".sh"
 }
 
 type unsupportedAgentAdapter struct {

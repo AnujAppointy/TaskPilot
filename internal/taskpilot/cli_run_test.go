@@ -224,6 +224,50 @@ func TestGitChangedFileSnapshotIgnoresTaskPilotMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadRepoConfigOverridesCommittedGitRoot(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGitTestCommand(t, root, "init")
+	if err := os.MkdirAll(filepath.Join(root, ".taskpilot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := repoEnableConfig{Version: 1, GitRoot: "/Users/appointy/Desktop/testing", HookCommand: `taskpilot context render --repo "/Users/appointy/Desktop/testing" --format markdown`}
+	data, _ := json.Marshal(stale)
+	if err := os.WriteFile(filepath.Join(root, ".taskpilot", "repo.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadRepoConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitRoot != root {
+		t.Fatalf("expected local git root %q, got %q", root, cfg.GitRoot)
+	}
+	if strings.Contains(cfg.HookCommand, "/Users/appointy") {
+		t.Fatalf("hook command should be portable, got %q", cfg.HookCommand)
+	}
+}
+
+func TestWriteHookScriptsAreRepoRelative(t *testing.T) {
+	root := t.TempDir()
+	cfg := repoEnableConfig{GitRoot: root}
+	if err := writeHookScripts(cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".taskpilot", "hooks", "codex-session-start.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), root) {
+		t.Fatalf("hook script should not hard-code local root:\n%s", data)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".taskpilot", "hooks", "codex-session-start.cmd")); err != nil {
+		t.Fatalf("expected Windows hook script too: %v", err)
+	}
+}
+
 func runGitTestCommand(t *testing.T, root string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
