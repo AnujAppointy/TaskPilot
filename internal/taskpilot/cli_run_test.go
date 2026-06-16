@@ -3,6 +3,7 @@ package taskpilot
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +75,160 @@ func TestRunSyncIntervalCapsLongProgressInterval(t *testing.T) {
 	}
 	if got := runSyncInterval(500 * time.Millisecond); got != 500*time.Millisecond {
 		t.Fatalf("runSyncInterval short duration = %v", got)
+	}
+}
+
+func TestTaskPilotLiveSectionIsReplacedNotAppended(t *testing.T) {
+	first := upsertTaskPilotLiveSection("# Repo\n", "first context")
+	second := upsertTaskPilotLiveSection(first, "second context")
+	if strings.Count(second, liveContextStart) != 1 || strings.Count(second, liveContextEnd) != 1 {
+		t.Fatalf("expected exactly one managed section, got:\n%s", second)
+	}
+	if strings.Contains(second, "first context") || !strings.Contains(second, "second context") {
+		t.Fatalf("managed section was not replaced correctly:\n%s", second)
+	}
+}
+
+func TestMergeSessionStartHookJSONBytesAppendsAndPreservesExistingConfig(t *testing.T) {
+	original := []byte(`{
+  "theme": "dark",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo existing"
+          }
+        ]
+      }
+    ]
+  }
+}`)
+	updated, changed, err := mergeSessionStartHookJSONBytes(original, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/claude-session-start.sh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatalf("expected hook append to change config")
+	}
+	text := string(updated)
+	if !strings.Contains(text, `"theme": "dark"`) || !strings.Contains(text, "echo existing") || !strings.Contains(text, ".taskpilot/hooks/claude-session-start.sh") {
+		t.Fatalf("updated config lost existing content or hook:\n%s", text)
+	}
+}
+
+func TestMergeSessionStartHookJSONBytesIsIdempotentByCommand(t *testing.T) {
+	original := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":".taskpilot/hooks/codex-session-start.sh"}]}]}}`)
+	updated, changed, err := mergeSessionStartHookJSONBytes(original, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/codex-session-start.sh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed || string(updated) != string(original) {
+		t.Fatalf("already registered hook should be no-op, changed=%v updated=%s", changed, updated)
+	}
+}
+
+func TestMergeSessionStartHookJSONBytesCreatesMissingConfig(t *testing.T) {
+	updated, changed, err := mergeSessionStartHookJSONBytes([]byte(`{}`), "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/gemini-session-start.sh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || !strings.Contains(string(updated), ".taskpilot/hooks/gemini-session-start.sh") {
+		t.Fatalf("expected missing config to be created, changed=%v updated=%s", changed, updated)
+	}
+}
+
+func TestMergeSessionStartHookJSONBytesRejectsMalformedJSON(t *testing.T) {
+	if _, _, err := mergeSessionStartHookJSONBytes([]byte(`{"hooks":`), "hooks.SessionStart", SessionStartHook{Type: "command", Command: "x"}); err == nil {
+		t.Fatalf("expected malformed JSON error")
+	}
+}
+
+func TestMergeSessionStartHookJSONCreatesBackupAndSkipsNoopWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	original := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"existing"}]}]}}`)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := mergeSessionStartHookJSON(path, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/claude-session-start.sh"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Changed || first.BackupPath == "" {
+		t.Fatalf("expected changed write with backup, got %+v", first)
+	}
+	if _, err := os.Stat(first.BackupPath); err != nil {
+		t.Fatalf("expected backup file: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	second, err := mergeSessionStartHookJSON(path, "hooks.SessionStart", SessionStartHook{Type: "command", Command: ".taskpilot/hooks/claude-session-start.sh"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Changed {
+		t.Fatalf("expected second merge to be no-op, got %+v", second)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("no-op merge should not rewrite file")
+	}
+}
+
+func TestBranchMatchesTaskUsesMeaningfulWords(t *testing.T) {
+	task := Task{Title: "Fix Stripe retry bug", Goal: "Resolve duplicate retry scheduling"}
+	if !branchMatchesTask("fix-stripe-retry", task) {
+		t.Fatalf("expected branch to match task title")
+	}
+	if branchMatchesTask("docs-readme", task) {
+		t.Fatalf("unrelated branch should not match task")
+	}
+}
+
+func TestGitChangedFileSnapshotIgnoresTaskPilotMetadata(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "app.go"), []byte("package app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "app.go")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.MkdirAll(filepath.Join(root, ".taskpilot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".taskpilot", "repo.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "app.go"), []byte("package app\n// changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := gitChangedFileSnapshotIn(root)
+	if _, ok := got[".taskpilot/repo.json"]; ok {
+		t.Fatalf("TaskPilot metadata should not be tracked as product work: %+v", got)
+	}
+	if _, ok := got["app.go"]; !ok {
+		t.Fatalf("expected product file to be detected: %+v", got)
+	}
+}
+
+func runGitTestCommand(t *testing.T, root string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 }
 
