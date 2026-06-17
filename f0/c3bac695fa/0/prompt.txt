@@ -1,0 +1,355 @@
+after the changes this coming in the window laptop now "PS D:\testrepo> taskpilot daemon install
+TaskPilot daemon started. Log: C:\Users\hp\.taskpilot\repo-daemon.log
+{
+  "method": "windows_startup_folder",
+  "service_name": "TaskPilotDaemon",
+  "binary_path": "C:\\Users\\hp\\.local\\bin\\taskpilot.exe",
+  "status": "installed",
+  "changed": true,
+  "started": true,
+  "config_path": "C:\\Users\\hp\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\TaskPilotDaemon.cmd",
+  "message": "daemon installed and running; it will start automatically on login; used Startup folder fallback because Scheduled Task failed: ERROR: Access is denied."
+}
+PS D:\testrepo> taskpilot daemon doctor
+{
+  "method": "windows_startup_folder",
+  "service_name": "TaskPilotDaemon",
+  "binary_path": "C:\\Users\\hp\\.local\\bin\\taskpilot.exe",
+  "installed": true,
+  "running": false,
+  "status": "installed",
+  "config_path": "C:\\Users\\hp\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\TaskPilotDaemon.cmd",
+  "log_path": "C:\\Users\\hp\\.taskpilot\\repo-daemon.log",
+  "message": "Startup folder launcher is installed; it will start TaskPilot at next login"
+}
+PS D:\testrepo> taskpilot agent doctor
+claude: agent_not_on_path - hook is registered, but the agent binary was not found on PATH
+codex: ok
+gemini: ok"
+
+---
+
+ok so on mac taskpilot is enable and daemon installed and in window i git pull it and did daemon install, now what are the next step in scenarios to test it
+
+---
+
+ok the repo feature is working well it is work and tested , now the context is going without any remember of the command 
+but there are some issue still we have to resolve now . as we make the working of the repo feature in taskpilot but it is only considered as the skeleton , it is still need to be polished 
+there are some area we have to focus on . 
+
+context:
+context is sharing now , agents are aware also but the quality of the context is so much degraded , the context doesnt telling about the work is done by the agenyt it  is mostly telling about the files and and taskpilot and as we know the agent should be more aware about the work done by them not about the taskpilot working. “appointy@Appointys-MacBook-Air-4 testrepo % taskpilot task show task_1781605203478533066
+task_1781605203478533066	in_progress	Inferred work on 6 changed files
+Project: project_default
+Repo: repo_1781605197917210398
+Workspace: workspace_1781605198875651938
+Parent: 
+Goal: Inferred by TaskPilot from live uncommitted work in testing. Review, rename, merge, or reassign if needed.
+Owner: actor_1780989928313449342
+Scope: .claude/, .codex/, .gemini/, AGENTS.md, CLAUDE.md, GEMINI.md, planning.md
+
+Git:
+- git_1781605210160959899 branch=main commit=177c75f pr= files=.claude/,.codex/,.gemini/,AGENTS.md,CLAUDE.md,GEMINI.md
+- git_1781605586362559853 branch=main commit=b61828e pr= files=AGENTS.md,CLAUDE.md,GEMINI.md
+- git_1781605955226841014 branch=main commit=b61828e pr= files=AGENTS.md,CLAUDE.md,GEMINI.md,planning.md
+- git_1781606075779886046 branch=main commit=b61828e pr= files=AGENTS.md,CLAUDE.md,GEMINI.md,planning.md
+- git_1781612438877530379 branch=main commit=7ac94d0 pr= files=planning.md
+- git_1781612606455507253 branch=main commit=7ac94d0 pr= files=AGENTS.md,CLAUDE.md,GEMINI.md,planning.md
+- git_1781677138749615235 branch=main commit=a971c93 pr= files=.claude/,.codex/,.gemini/,AGENTS.md,CLAUDE.md,GEMINI.md
+- git_1781677145556208794 branch=main commit=a971c93 pr= files=.claude/,.codex/,.gemini/,AGENTS.md,CLAUDE.md,GEMINI.md
+- git_1781677251947219725 branch=main commit=d912a86 pr= files=AGENTS.md,CLAUDE.md,GEMINI.md
+- git_1781677258395729235 branch=main commit=d912a86 pr= files=AGENTS.md,CLAUDE.md,GEMINI.md
+- git_1781679402087254346 branch=main commit=d912a86 pr= files=AGENTS.md,CLAUDE.md,GEMINI.md,planning.md
+- git_1781679402846566237 branch=main commit=d912a86 pr= files=AGENTS.md,CLAUDE.md,GEMINI.md,planning.md
+
+Context:
+- note: TaskPilot inferred this task from repo activity. Branch: main
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- .claude/
+- .codex/
+- .gemini/
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- planning.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- .claude/
+- .codex/
+- .gemini/
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- .claude/
+- .codex/
+- .gemini/
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+- summary: TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+
+Latest Handoff Memory (draft v1, generated_fallback):
+# Task Handoff
+
+## Objective
+Inferred by TaskPilot from live uncommitted work in testing. Review, rename, merge, or reassign if needed.
+
+## Original Requirements
+- Validate this inferred task before treating it as final planning truth.
+
+## Current Status
+in_progress
+
+## Current State
+TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+
+## Handoff Timeline
+None recorded.
+
+## Completed Work
+- TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- .claude/
+- .codex/
+- .gemini/
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- TaskPilot daemon captured live uncommitted repo activity.
+Branch: main
+Changed files:
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Rejected Approaches
+- None recorded.
+
+## Architecture Notes
+- None recorded.
+
+## Implementation Notes
+- TaskPilot inferred this task from repo activity. Branch: main
+
+## Files / Components Affected
+- Branch: main
+- .claude/
+- .codex/
+- .gemini/
+- AGENTS.md
+- CLAUDE.md
+- GEMINI.md
+- planning.md
+
+## Known Issues
+- None recorded.
+
+## Failed / Interrupted Sessions
+- None recorded.
+
+## Remaining Work
+- Verify the recorded work and decide whether to continue, send to review, publish a handoff, or mark complete.
+
+## Suggested Next Steps
+- Continue from the latest task context and verify completion criteria.
+
+## Assumptions
+- None recorded.
+
+## Risks
+- None recorded.
+
+## Dependencies
+- None recorded.
+
+## Handoff Message
+Continue from the recorded work on Branch: main, .claude/, .codex/. Review completed work, known issues, and suggested next steps before making changes.
+appointy@Appointys-MacBook-Air-4 testrepo % 
+“ as u see here this type of context is flowing between the agents right now , and as we see most of it is just the noise , most of the things are not helpful at all for the other agents . we should have to work on it such that the context should be insightful something like this “
+
+appointy@Appointys-MacBook-Air-4 testrepo % taskpilot task show task_1781004891371201176 
+task_1781004891371201176	completed	planning the game 
+Project: project_1781004779451499206
+Repo: 
+Workspace: 
+Parent: 
+Goal: make a brief planning.md file for a 2d snake game.
+Owner: actor_1780989928313449342
+Scope: 
+
+Decisions:
+- dec_1781005337009401517: ok it is working good
+
+Comments:
+- actor_1780989928313449342: comment 1
+
+Context:
+- summary: taskpilot run started agent command: codex
+- summary: Read TaskPilot prompt and authoritative task snapshot for task_1781004891371201176; current goal is to create a brief planning.md for a 2D Snake game.
+- output_ref: /var/folders/hg/w34gnlbd4g382wp410w486580000gn/T/taskpilot-task_1781004891371201176-prompt-745312455.txt, /var/folders/hg/w34gnlbd4g382wp410w486580000gn/T/taskpilot-task_1781004891371201176-task-536750610.json, /var/folders/hg/w34gnlbd4g382wp410w486580000gn/T/taskpilot-task_1781004891371201176-related-3777264076.json
+- summary: Created planning.md with a brief 2D Snake game plan covering goal, gameplay, features, technical structure, milestones, and risks.
+- output_ref: planning.md
+- note: Verification: Read planning.md after creation and confirmed it is 35 lines with the requested planning content.
+- next: No remaining implementation work for this planning task unless the user requests revisions.
+- note: Verification: TaskPilot handoff checkpoint succeeded after escalated retry; checkpoint id checkpoint_1781005262875379706.
+- output_ref: Files changed during this run:
+- planning.md
+- summary: Updated task files: planning.md
+- summary: Agent command completed successfully through taskpilot run.
+- note: the planning is good
+- summary: Planning for the 2D Snake game is complete. planning.md was created and verified with sections covering goal, core gameplay, main features, technical structure, milestones, and risks.
+
+Latest Handoff Memory (draft v2, agent_authored):
+# Task Handoff
+
+## Objective
+make a brief planning.md file for a 2d snake game.
+
+## Original Requirements
+- None recorded.
+
+## Current Status
+completed
+
+## Current State
+The requested brief `planning.md` for a 2D Snake game has been created at the workspace root and verified by reading it back.
+
+## Handoff Timeline
+Checkpoint 1 · actor_1780989928313449342 · 2026-06-09T11:41:02Z
+Completed work:
+- Created `planning.md` with concise sections for goal, core gameplay, main features, technical structure, milestones, and risks.
+- Verified `planning.md` contents after creation; file is 35 lines.
+Decisions:
+- No material decision made; work followed existing requirements.
+Current state / reasoning:
+- The requested brief `planning.md` for a 2D Snake game has been created at the workspace root and verified by reading it back.
+Pending next steps at this checkpoint:
+- No next step is required unless the user wants revisions or expansion of the Snake game plan.
+
+## Completed Work
+- Created `planning.md` with concise sections for goal, core gameplay, main features, technical structure, milestones, and risks.
+- Verified `planning.md` contents after creation; file is 35 lines.
+
+## Important Decisions
+- No material decision made; work followed existing requirements.
+
+## Rejected Approaches
+- None recorded.
+
+## Architecture Notes
+- None recorded.
+
+## Implementation Notes
+- None recorded.
+
+## Files / Components Affected
+- `planning.md`
+
+## Known Issues
+- None recorded.
+
+## Failed / Interrupted Sessions
+- None recorded.
+
+## Remaining Work
+- No known work remains for the current planning task.
+
+## Suggested Next Steps
+- No next step is required unless the user wants revisions or expansion of the Snake game plan.
+
+## Assumptions
+- None recorded.
+
+## Risks
+- None recorded.
+
+## Dependencies
+- None recorded.
+
+## Handoff Message
+Task is complete: `planning.md` exists at the workspace root with a brief 2D Snake game plan and has been verified. No known remaining work.”        as you see here the noise about the taskpilot is so less and also if any of the agent take as the initial awareness context it will be helpfull rather than the previous one.
+
+git repo:
+currently the tasks under the repo are assigning into any random project , instead of that assign them to that repo only and make a option in the ui in board page like toggle option between project repo and workspaces such that unnecessary project will not be created , the repo task will be assigned to repo only .                                                     so currently on this area we have to work , so make a plan which will solve this issue
+
+---
+
+ok plan direction is good , implement it

@@ -1,0 +1,54 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "f0c3bac695fa",
+  "session_id": "019ebbb9-f67c-7ff1-ab3d-c729b892cd5a",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-17T08:35:12.140026Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "internal/taskpilot/cli.go",
+    "internal/taskpilot/cli_run_test.go",
+    "internal/taskpilot/memory.go",
+    "internal/taskpilot/server.go",
+    "internal/taskpilot/static/app.js",
+    "internal/taskpilot/store.go",
+    "internal/taskpilot/store_test.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.5",
+  "turn_id": "a8209e4040c0",
+  "checkpoint_transcript_start": 1389,
+  "transcript_lines_at_start": 1389,
+  "token_usage": {
+    "input_tokens": 528599,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 5901824,
+    "output_tokens": 20384,
+    "api_call_count": 65
+  },
+  "session_metrics": {
+    "turn_count": 52
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-17T08:35:12.016935Z",
+    "agent_lines": 294,
+    "agent_removed": 57,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 294,
+    "total_lines_changed": 351,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
