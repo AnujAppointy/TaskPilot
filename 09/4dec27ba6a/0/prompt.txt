@@ -1,0 +1,51 @@
+is in mac new binary are installed ?
+
+---
+
+ok i also install the new binaries on the windows also , now make the scenario for mac and window laptop again
+
+---
+
+i have to ask about the command "taskpilot daemon start --once" did we have to run it in every terminal session
+
+---
+
+# Selected text:
+
+## Selection 1
+so it starts automatically on login.
+
+That future daemon install would be the most seamless version, because then developers do not even need to remember taskpilot daemon start after reboot.
+
+## My request for Codex:
+yes it is the thing im caring about bcz if dev again have to run command and remeber then it is a issue
+
+---
+
+yes make a plan for this
+
+---
+
+explain me by scenario what value this plan will give after it was implemented
+
+---
+
+ok direction is right , implement the plan
+
+---
+
+ok now make me understand the updates u do right now by its real working through the scenarios , such that i will understand in one go
+
+---
+
+# Selected text:
+
+## Selection 1
+launchd
+
+## My request for Codex:
+what is this ?
+
+---
+
+so we have to manually run this launchd?
