@@ -1,0 +1,120 @@
+ok now make a scenario by which i test the working of current version of taskpilot in mac and window laptop
+
+---
+
+# Selected text:
+
+## Selection 1
+cd C:\Users\hp\OneDrive\Desktop\testing-repo
+git pull
+taskpilot config show
+taskpilot daemon install
+taskpilot daemon doctor
+taskpilot agent doctor
+
+## My request for Codex:
+initially u says that in other laptop we just have to pull the repo and directly run the agent , then explain me the purpose of these command here now for the other laptops
+
+---
+
+PS D:\> git clone https://github.com/AnujAppointy/testrepo.git
+Cloning into 'testrepo'...
+remote: Enumerating objects: 20, done.
+remote: Counting objects: 100% (20/20), done.
+remote: Compressing objects: 100% (13/13), done.
+remote: Total 20 (delta 4), reused 20 (delta 4), pack-reused 0 (from 0)
+Receiving objects: 100% (20/20), 4.16 KiB | 426.00 KiB/s, done.
+Resolving deltas: 100% (4/4), done.
+PS D:\> ls
+
+
+    Directory: D:\
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        14-05-2026     11:48                Antigravity
+d-----        08-06-2026     16:36                cursor
+d-----        12-12-2025     14:22                harrypottergame
+d-----        29-08-2025     19:07                Kiro
+d-----        10-11-2024     17:13                lab applications
+d-----        18-02-2024     22:07                New folder
+d-----        12-07-2025     09:59                nodejs
+d-----        01-09-2022     01:26                PerfLogs
+d-r---        12-12-2025     14:19                Pictures
+d-----        06-04-2026     16:46                postgres
+d-r---        01-09-2022     00:58                Program Files
+d-r---        01-09-2022     00:59                Program Files (x86)
+d-----        22-02-2023     13:55                redmi note 8 pics
+d-----        06-09-2023     14:26                second year
+d-----        04-06-2026     17:35                SnakeGame
+d-----        12-06-2026     11:45                testing-win
+d-----        19-05-2026     15:35                testingproject
+d-----        17-06-2026     12:00                testrepo
+d-----        02-09-2025     02:39                Trae
+d-r---        01-09-2022     01:12                Users
+d-r---        21-09-2022     05:36                Videos
+d-----        05-12-2025     21:31                Web Development
+d-----        01-09-2022     00:33                Windows
+d-----        01-09-2022     00:48                Windows.old
+
+
+PS D:\> cd testrepo
+PS D:\testrepo> ls
+
+
+    Directory: D:\testrepo
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        17-06-2026     12:00                .claude
+d-----        17-06-2026     12:00                .codex
+d-----        17-06-2026     12:00                .gemini
+d-----        17-06-2026     12:00                .taskpilot
+-a----        17-06-2026     12:00           2855 AGENTS.md
+-a----        17-06-2026     12:00           1962 CLAUDE.md
+-a----        17-06-2026     12:00           1962 GEMINI.md
+-a----        17-06-2026     12:00           1132 planning.md
+-a----        17-06-2026     12:00           1078 tech-decision.md
+
+
+PS D:\testrepo> taskpilot config show
+{
+  "actor_id": "actor_1781243670831979177",
+  "auth": "actor_secret",
+  "email": "sahith.k@appointy.com",
+  "has_secret": true,
+  "server": "https://taskpilot-production-ca6b.up.railway.app"
+}
+PS D:\testrepo> taskpilot daemon install
+{
+  "method": "scheduled_task",
+  "service_name": "TaskPilotDaemon",
+  "binary_path": "C:\\Users\\hp\\.local\\bin\\taskpilot.exe",
+  "status": "error",
+  "changed": false,
+  "started": false,
+  "message": "could not create scheduled task: ERROR: Access is denied.",
+  "manual_command": "C:\\Users\\hp\\.local\\bin\\taskpilot.exe daemon start",
+  "error": "exit status 1"
+}
+PS D:\testrepo> taskpilot daemon doctor
+{
+  "method": "scheduled_task",
+  "service_name": "TaskPilotDaemon",
+  "installed": false,
+  "running": false,
+  "status": "not_installed",
+  "log_path": "C:\\Users\\hp\\.taskpilot\\repo-daemon.log",
+  "message": "run `taskpilot daemon install`"
+}
+PS D:\testrepo> taskpilot agent doctor
+claude: agent_not_on_path - hook is registered, but the agent binary was not found on PATH
+codex: ok
+gemini: ok
+PS D:\testrepo>.   "this happen in the windows laptop , check it and fix it what is the issue "
+
+---
+
+why this issue came in the windows
