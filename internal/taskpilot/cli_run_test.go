@@ -78,6 +78,32 @@ func TestRunSyncIntervalCapsLongProgressInterval(t *testing.T) {
 	}
 }
 
+func TestRenderMacLaunchAgentPlist(t *testing.T) {
+	got := renderMacLaunchAgentPlist("com.taskpilot.daemon", "/Users/me/bin/taskpilot", "/tmp/out.log", "/tmp/err.log")
+	for _, want := range []string{"<string>com.taskpilot.daemon</string>", "<string>/Users/me/bin/taskpilot</string>", "<string>daemon</string>", "<string>run</string>", "<key>RunAtLoad</key>", "<key>KeepAlive</key>", "<string>/tmp/out.log</string>", "<string>/tmp/err.log</string>"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plist missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderLinuxSystemdUnitQuotesBinary(t *testing.T) {
+	got := renderLinuxSystemdUnit("taskpilot-daemon", "/home/me/New project/bin/taskpilot")
+	if !strings.Contains(got, `ExecStart="/home/me/New project/bin/taskpilot" daemon run`) {
+		t.Fatalf("systemd unit did not quote binary path:\n%s", got)
+	}
+	if !strings.Contains(got, "Restart=always") || !strings.Contains(got, "WantedBy=default.target") {
+		t.Fatalf("systemd unit missing daemon lifecycle settings:\n%s", got)
+	}
+}
+
+func TestWindowsScheduledTaskCommandQuotesBinary(t *testing.T) {
+	got := windowsScheduledTaskCommand(`C:\Users\hp\.local\bin\taskpilot.exe`)
+	if got != `"C:\Users\hp\.local\bin\taskpilot.exe" daemon run` {
+		t.Fatalf("unexpected scheduled task command: %q", got)
+	}
+}
+
 func TestTaskPilotLiveSectionIsReplacedNotAppended(t *testing.T) {
 	first := upsertTaskPilotLiveSection("# Repo\n", "first context")
 	second := upsertTaskPilotLiveSection(first, "second context")

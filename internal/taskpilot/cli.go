@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -145,7 +146,9 @@ Config:
 
 Bootstrap:
   taskpilot enable
+  taskpilot daemon install
   taskpilot daemon start
+  taskpilot daemon doctor
   taskpilot status
   taskpilot project create --name "Appointy Backend"
   taskpilot repo create --project <project-id> --name appointy-api --path /path/to/repo
@@ -258,6 +261,42 @@ type AgentHealth struct {
 	Message          string `json:"message,omitempty"`
 }
 
+type DaemonInstallInfo struct {
+	Method       string    `json:"method"`
+	ServiceName  string    `json:"service_name"`
+	BinaryPath   string    `json:"binary_path"`
+	Command      []string  `json:"command"`
+	LogPath      string    `json:"log_path"`
+	ErrorLogPath string    `json:"error_log_path,omitempty"`
+	InstalledAt  time.Time `json:"installed_at"`
+}
+
+type DaemonInstallResult struct {
+	Method        string `json:"method"`
+	ServiceName   string `json:"service_name"`
+	BinaryPath    string `json:"binary_path"`
+	Status        string `json:"status"`
+	Changed       bool   `json:"changed"`
+	Started       bool   `json:"started"`
+	ConfigPath    string `json:"config_path,omitempty"`
+	Message       string `json:"message"`
+	ManualCommand string `json:"manual_command,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+type DaemonHealth struct {
+	Method       string   `json:"method"`
+	ServiceName  string   `json:"service_name"`
+	BinaryPath   string   `json:"binary_path,omitempty"`
+	Installed    bool     `json:"installed"`
+	Running      bool     `json:"running"`
+	Status       string   `json:"status"`
+	ConfigPath   string   `json:"config_path,omitempty"`
+	LogPath      string   `json:"log_path"`
+	EnabledRepos []string `json:"enabled_repos,omitempty"`
+	Message      string   `json:"message,omitempty"`
+}
+
 type AgentAdapter interface {
 	Name() string
 	Detect(repo repoEnableConfig) AgentDetection
@@ -298,6 +337,7 @@ func runEnable(args []string) error {
 	repoName := fs.String("repo-name", "", "repository display name")
 	workspaceID := fs.String("workspace", "", "TaskPilot workspace ID")
 	liveFiles := fs.Bool("live-files", true, "maintain bounded TaskPilot sections in repo instruction files")
+	noDaemonInstall := fs.Bool("no-daemon-install", false, "do not install/start the login daemon")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 	cfg, err := loadConfig()
@@ -367,8 +407,13 @@ func runEnable(args []string) error {
 		}
 	}
 	adapterResults := configureAgentAdapters(out, false, []string{"all"})
+	var daemonResult *DaemonInstallResult
+	if !*noDaemonInstall {
+		result := installDaemonAutoStart()
+		daemonResult = &result
+	}
 	if *jsonOut {
-		return print(map[string]any{"repo": out, "agent_adapters": adapterResults}, true)
+		return print(map[string]any{"repo": out, "agent_adapters": adapterResults, "daemon": daemonResult}, true)
 	}
 	fmt.Printf("TaskPilot enabled for Git repo %s\n", root)
 	fmt.Printf("Project: %s\nRepository: %s\nWorkspace: %s\n", out.ProjectID, out.RepoID, out.WorkspaceID)
@@ -378,15 +423,26 @@ func runEnable(args []string) error {
 			fmt.Printf("%s: %s\n", result.Name, result.Message)
 		}
 	}
-	fmt.Println("Run `taskpilot daemon start` to keep capture and live context active.")
+	if daemonResult != nil {
+		fmt.Printf("daemon: %s\n", daemonResult.Message)
+	}
 	return nil
 }
 
 func runDaemon(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot daemon start|run|stop|status")
+		return fmt.Errorf("usage: taskpilot daemon install|uninstall|doctor|start|run|stop|status")
 	}
 	switch args[0] {
+	case "install":
+		result := installDaemonAutoStart()
+		return print(result, has(args, "--json"))
+	case "uninstall":
+		result := uninstallDaemonAutoStart()
+		return print(result, has(args, "--json"))
+	case "doctor":
+		health := daemonDoctor()
+		return print(health, has(args, "--json"))
 	case "start":
 		fs := flag.NewFlagSet("daemon start", flag.ExitOnError)
 		foreground := fs.Bool("foreground", false, "run in the foreground")
@@ -901,9 +957,330 @@ func repoDaemonLogPath() string {
 	return filepath.Join(taskpilotHomeDir(), "repo-daemon.log")
 }
 
+func repoDaemonErrLogPath() string {
+	return filepath.Join(taskpilotHomeDir(), "repo-daemon.err.log")
+}
+
+func daemonInstallInfoPath() string {
+	return filepath.Join(taskpilotHomeDir(), "daemon-install.json")
+}
+
 func daemonStopRequested(started time.Time) bool {
 	info, err := os.Stat(repoDaemonStopPath())
 	return err == nil && info.ModTime().After(started)
+}
+
+func installDaemonAutoStart() DaemonInstallResult {
+	binary, err := currentExecutablePath()
+	if err != nil {
+		return daemonInstallFailure("unknown", "", "", "could not resolve current taskpilot binary", err)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return installDaemonLaunchd(binary)
+	case "windows":
+		return installDaemonWindowsTask(binary)
+	case "linux":
+		return installDaemonSystemd(binary)
+	default:
+		return DaemonInstallResult{Method: runtime.GOOS, BinaryPath: binary, Status: "unsupported", Message: "daemon auto-start is not supported on this platform", ManualCommand: binary + " daemon start"}
+	}
+}
+
+func uninstallDaemonAutoStart() DaemonInstallResult {
+	switch runtime.GOOS {
+	case "darwin":
+		return uninstallDaemonLaunchd()
+	case "windows":
+		return uninstallDaemonWindowsTask()
+	case "linux":
+		return uninstallDaemonSystemd()
+	default:
+		return DaemonInstallResult{Method: runtime.GOOS, Status: "unsupported", Message: "daemon auto-start uninstall is not supported on this platform"}
+	}
+}
+
+func daemonDoctor() DaemonHealth {
+	reg, _ := loadDaemonRegistry()
+	switch runtime.GOOS {
+	case "darwin":
+		return doctorDaemonLaunchd(reg.Repos)
+	case "windows":
+		return doctorDaemonWindowsTask(reg.Repos)
+	case "linux":
+		return doctorDaemonSystemd(reg.Repos)
+	default:
+		return DaemonHealth{Method: runtime.GOOS, ServiceName: daemonServiceName(), Installed: false, Running: false, Status: "unsupported", LogPath: repoDaemonLogPath(), EnabledRepos: reg.Repos, Message: "daemon auto-start is not supported on this platform"}
+	}
+}
+
+func currentExecutablePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(exe)
+}
+
+func daemonServiceName() string {
+	if runtime.GOOS == "darwin" {
+		return "com.taskpilot.daemon"
+	}
+	if runtime.GOOS == "windows" {
+		return "TaskPilotDaemon"
+	}
+	return "taskpilot-daemon"
+}
+
+func saveDaemonInstallInfo(info DaemonInstallInfo) error {
+	if err := ensureDir(filepath.Dir(daemonInstallInfoPath())); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(info, "", "  ")
+	return os.WriteFile(daemonInstallInfoPath(), data, 0o600)
+}
+
+func loadDaemonInstallInfo() (DaemonInstallInfo, error) {
+	var info DaemonInstallInfo
+	data, err := os.ReadFile(daemonInstallInfoPath())
+	if err != nil {
+		return info, err
+	}
+	return info, json.Unmarshal(data, &info)
+}
+
+func daemonInstallFailure(method, service, binary, message string, err error) DaemonInstallResult {
+	out := DaemonInstallResult{Method: method, ServiceName: service, BinaryPath: binary, Status: "error", Message: message}
+	if err != nil {
+		out.Error = err.Error()
+		if binary != "" {
+			out.ManualCommand = binary + " daemon start"
+		}
+	}
+	return out
+}
+
+func installDaemonLaunchd(binary string) DaemonInstallResult {
+	service := daemonServiceName()
+	path := macLaunchAgentPath()
+	content := renderMacLaunchAgentPlist(service, binary, repoDaemonLogPath(), repoDaemonErrLogPath())
+	if err := atomicWriteFile(path, []byte(content), 0o644); err != nil {
+		return daemonInstallFailure("launchd", service, binary, "could not write launch agent", err)
+	}
+	started := false
+	if uid := currentUserID(); uid != "" {
+		_ = exec.Command("launchctl", "bootout", "gui/"+uid, path).Run()
+		if err := exec.Command("launchctl", "bootstrap", "gui/"+uid, path).Run(); err == nil {
+			_ = exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+service).Run()
+			started = true
+		} else if err := exec.Command("launchctl", "load", "-w", path).Run(); err == nil {
+			started = true
+		}
+	}
+	info := DaemonInstallInfo{Method: "launchd", ServiceName: service, BinaryPath: binary, Command: []string{binary, "daemon", "run"}, LogPath: repoDaemonLogPath(), ErrorLogPath: repoDaemonErrLogPath(), InstalledAt: time.Now().UTC()}
+	_ = saveDaemonInstallInfo(info)
+	return DaemonInstallResult{Method: "launchd", ServiceName: service, BinaryPath: binary, Status: "installed", Changed: true, Started: started, ConfigPath: path, Message: daemonInstallMessage(started)}
+}
+
+func uninstallDaemonLaunchd() DaemonInstallResult {
+	service := daemonServiceName()
+	path := macLaunchAgentPath()
+	if uid := currentUserID(); uid != "" {
+		_ = exec.Command("launchctl", "bootout", "gui/"+uid, path).Run()
+		_ = exec.Command("launchctl", "remove", service).Run()
+	}
+	_ = os.Remove(path)
+	_ = os.Remove(daemonInstallInfoPath())
+	return DaemonInstallResult{Method: "launchd", ServiceName: service, Status: "uninstalled", ConfigPath: path, Message: "TaskPilot launch agent removed; enabled repo state was kept"}
+}
+
+func doctorDaemonLaunchd(repos []string) DaemonHealth {
+	service := daemonServiceName()
+	path := macLaunchAgentPath()
+	_, statErr := os.Stat(path)
+	running := false
+	if uid := currentUserID(); uid != "" {
+		if err := exec.Command("launchctl", "print", "gui/"+uid+"/"+service).Run(); err == nil {
+			running = true
+		}
+	}
+	info, _ := loadDaemonInstallInfo()
+	status := "ok"
+	msg := ""
+	if statErr != nil {
+		status = "not_installed"
+		msg = "run `taskpilot daemon install`"
+	} else if !running {
+		status = "installed_not_running"
+		msg = "run `taskpilot daemon install` or inspect launchctl logs"
+	}
+	return DaemonHealth{Method: "launchd", ServiceName: service, BinaryPath: info.BinaryPath, Installed: statErr == nil, Running: running, Status: status, ConfigPath: path, LogPath: repoDaemonLogPath(), EnabledRepos: repos, Message: msg}
+}
+
+func installDaemonWindowsTask(binary string) DaemonInstallResult {
+	service := daemonServiceName()
+	taskCommand := windowsScheduledTaskCommand(binary)
+	create := exec.Command("schtasks", "/Create", "/TN", service, "/TR", taskCommand, "/SC", "ONLOGON", "/RL", "LIMITED", "/F")
+	if out, err := create.CombinedOutput(); err != nil {
+		return daemonInstallFailure("scheduled_task", service, binary, "could not create scheduled task: "+strings.TrimSpace(string(out)), err)
+	}
+	started := exec.Command("schtasks", "/Run", "/TN", service).Run() == nil
+	info := DaemonInstallInfo{Method: "scheduled_task", ServiceName: service, BinaryPath: binary, Command: []string{binary, "daemon", "run"}, LogPath: repoDaemonLogPath(), InstalledAt: time.Now().UTC()}
+	_ = saveDaemonInstallInfo(info)
+	return DaemonInstallResult{Method: "scheduled_task", ServiceName: service, BinaryPath: binary, Status: "installed", Changed: true, Started: started, Message: daemonInstallMessage(started)}
+}
+
+func uninstallDaemonWindowsTask() DaemonInstallResult {
+	service := daemonServiceName()
+	_ = exec.Command("schtasks", "/End", "/TN", service).Run()
+	_ = exec.Command("schtasks", "/Delete", "/TN", service, "/F").Run()
+	_ = os.Remove(daemonInstallInfoPath())
+	return DaemonInstallResult{Method: "scheduled_task", ServiceName: service, Status: "uninstalled", Message: "TaskPilot scheduled task removed; enabled repo state was kept"}
+}
+
+func doctorDaemonWindowsTask(repos []string) DaemonHealth {
+	service := daemonServiceName()
+	query := exec.Command("schtasks", "/Query", "/TN", service, "/FO", "LIST", "/V")
+	out, err := query.CombinedOutput()
+	installed := err == nil
+	text := strings.ToLower(string(out))
+	running := installed && strings.Contains(text, "status:") && strings.Contains(text, "running")
+	info, _ := loadDaemonInstallInfo()
+	status := "ok"
+	msg := ""
+	if !installed {
+		status = "not_installed"
+		msg = "run `taskpilot daemon install`"
+	} else if !running {
+		status = "installed_not_running"
+		msg = "scheduled task is installed and will start at next login; run `taskpilot daemon install` to start it now"
+	}
+	return DaemonHealth{Method: "scheduled_task", ServiceName: service, BinaryPath: info.BinaryPath, Installed: installed, Running: running, Status: status, LogPath: repoDaemonLogPath(), EnabledRepos: repos, Message: msg}
+}
+
+func installDaemonSystemd(binary string) DaemonInstallResult {
+	service := daemonServiceName()
+	path := linuxSystemdUnitPath()
+	content := renderLinuxSystemdUnit(service, binary)
+	if err := atomicWriteFile(path, []byte(content), 0o644); err != nil {
+		return daemonInstallFailure("systemd_user", service, binary, "could not write user systemd unit", err)
+	}
+	if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
+		return daemonInstallFailure("systemd_user", service, binary, "could not reload user systemd: "+strings.TrimSpace(string(out)), err)
+	}
+	started := exec.Command("systemctl", "--user", "enable", "--now", service+".service").Run() == nil
+	info := DaemonInstallInfo{Method: "systemd_user", ServiceName: service, BinaryPath: binary, Command: []string{binary, "daemon", "run"}, LogPath: repoDaemonLogPath(), InstalledAt: time.Now().UTC()}
+	_ = saveDaemonInstallInfo(info)
+	return DaemonInstallResult{Method: "systemd_user", ServiceName: service, BinaryPath: binary, Status: "installed", Changed: true, Started: started, ConfigPath: path, Message: daemonInstallMessage(started)}
+}
+
+func uninstallDaemonSystemd() DaemonInstallResult {
+	service := daemonServiceName()
+	_ = exec.Command("systemctl", "--user", "disable", "--now", service+".service").Run()
+	_ = os.Remove(linuxSystemdUnitPath())
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	_ = os.Remove(daemonInstallInfoPath())
+	return DaemonInstallResult{Method: "systemd_user", ServiceName: service, Status: "uninstalled", ConfigPath: linuxSystemdUnitPath(), Message: "TaskPilot user service removed; enabled repo state was kept"}
+}
+
+func doctorDaemonSystemd(repos []string) DaemonHealth {
+	service := daemonServiceName()
+	_, statErr := os.Stat(linuxSystemdUnitPath())
+	running := exec.Command("systemctl", "--user", "is-active", "--quiet", service+".service").Run() == nil
+	info, _ := loadDaemonInstallInfo()
+	status := "ok"
+	msg := ""
+	if statErr != nil {
+		status = "not_installed"
+		msg = "run `taskpilot daemon install`"
+	} else if !running {
+		status = "installed_not_running"
+		msg = "run `systemctl --user start " + service + ".service`"
+	}
+	return DaemonHealth{Method: "systemd_user", ServiceName: service, BinaryPath: info.BinaryPath, Installed: statErr == nil, Running: running, Status: status, ConfigPath: linuxSystemdUnitPath(), LogPath: repoDaemonLogPath(), EnabledRepos: repos, Message: msg}
+}
+
+func daemonInstallMessage(started bool) string {
+	if started {
+		return "daemon installed and running; it will start automatically on login"
+	}
+	return "daemon installed for login auto-start, but could not be started immediately; run `taskpilot daemon doctor`"
+}
+
+func macLaunchAgentPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "LaunchAgents", daemonServiceName()+".plist")
+}
+
+func linuxSystemdUnitPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "systemd", "user", daemonServiceName()+".service")
+}
+
+func currentUserID() string {
+	out, err := exec.Command("id", "-u").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func renderMacLaunchAgentPlist(label, binary, logPath, errLogPath string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>` + xmlEscape(label) + `</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>` + xmlEscape(binary) + `</string>
+    <string>daemon</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>` + xmlEscape(logPath) + `</string>
+  <key>StandardErrorPath</key>
+  <string>` + xmlEscape(errLogPath) + `</string>
+</dict>
+</plist>
+`
+}
+
+func renderLinuxSystemdUnit(service, binary string) string {
+	return `[Unit]
+Description=TaskPilot repo daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=` + systemdEscape(binary) + ` daemon run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+`
+}
+
+func windowsScheduledTaskCommand(binary string) string {
+	return `"` + binary + `" daemon run`
+}
+
+func xmlEscape(value string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
+	return replacer.Replace(value)
+}
+
+func systemdEscape(value string) string {
+	if !strings.ContainsAny(value, " \t\n\"'\\") {
+		return value
+	}
+	return `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
 }
 
 func writeHookScripts(cfg repoEnableConfig) error {
