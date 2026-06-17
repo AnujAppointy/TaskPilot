@@ -104,6 +104,15 @@ func TestWindowsScheduledTaskCommandQuotesBinary(t *testing.T) {
 	}
 }
 
+func TestRenderWindowsStartupDaemonCmd(t *testing.T) {
+	got := renderWindowsStartupDaemonCmd(`C:\Users\hp\.local\bin\taskpilot.exe`, `C:\Users\hp\.taskpilot\repo-daemon.log`, `C:\Users\hp\.taskpilot\repo-daemon.err.log`)
+	for _, want := range []string{`start "TaskPilot Daemon" /min`, `C:\Users\hp\.local\bin\taskpilot.exe`, "daemon run", `C:\Users\hp\.taskpilot\repo-daemon.log`, `C:\Users\hp\.taskpilot\repo-daemon.err.log`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("startup cmd missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestTaskPilotLiveSectionIsReplacedNotAppended(t *testing.T) {
 	first := upsertTaskPilotLiveSection("# Repo\n", "first context")
 	second := upsertTaskPilotLiveSection(first, "second context")

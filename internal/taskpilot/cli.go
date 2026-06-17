@@ -1122,7 +1122,7 @@ func installDaemonWindowsTask(binary string) DaemonInstallResult {
 	taskCommand := windowsScheduledTaskCommand(binary)
 	create := exec.Command("schtasks", "/Create", "/TN", service, "/TR", taskCommand, "/SC", "ONLOGON", "/RL", "LIMITED", "/F")
 	if out, err := create.CombinedOutput(); err != nil {
-		return daemonInstallFailure("scheduled_task", service, binary, "could not create scheduled task: "+strings.TrimSpace(string(out)), err)
+		return installDaemonWindowsStartupFallback(binary, strings.TrimSpace(string(out)), err)
 	}
 	started := exec.Command("schtasks", "/Run", "/TN", service).Run() == nil
 	info := DaemonInstallInfo{Method: "scheduled_task", ServiceName: service, BinaryPath: binary, Command: []string{binary, "daemon", "run"}, LogPath: repoDaemonLogPath(), InstalledAt: time.Now().UTC()}
@@ -1130,12 +1130,35 @@ func installDaemonWindowsTask(binary string) DaemonInstallResult {
 	return DaemonInstallResult{Method: "scheduled_task", ServiceName: service, BinaryPath: binary, Status: "installed", Changed: true, Started: started, Message: daemonInstallMessage(started)}
 }
 
+func installDaemonWindowsStartupFallback(binary, schtasksOutput string, schtasksErr error) DaemonInstallResult {
+	service := daemonServiceName()
+	path := windowsStartupDaemonPath()
+	if path == "" {
+		return daemonInstallFailure("windows_startup_folder", service, binary, "could not locate Windows Startup folder after scheduled task failed: "+schtasksOutput, schtasksErr)
+	}
+	content := renderWindowsStartupDaemonCmd(binary, repoDaemonLogPath(), repoDaemonErrLogPath())
+	if err := atomicWriteFile(path, []byte(content), 0o644); err != nil {
+		return daemonInstallFailure("windows_startup_folder", service, binary, "could not write Startup folder launcher after scheduled task failed: "+schtasksOutput, err)
+	}
+	started := startRepoDaemonProcess(10*time.Second) == nil
+	info := DaemonInstallInfo{Method: "windows_startup_folder", ServiceName: service, BinaryPath: binary, Command: []string{binary, "daemon", "run"}, LogPath: repoDaemonLogPath(), ErrorLogPath: repoDaemonErrLogPath(), InstalledAt: time.Now().UTC()}
+	_ = saveDaemonInstallInfo(info)
+	msg := daemonInstallMessage(started) + "; used Startup folder fallback because Scheduled Task failed"
+	if schtasksOutput != "" {
+		msg += ": " + schtasksOutput
+	}
+	return DaemonInstallResult{Method: "windows_startup_folder", ServiceName: service, BinaryPath: binary, Status: "installed", Changed: true, Started: started, ConfigPath: path, Message: msg}
+}
+
 func uninstallDaemonWindowsTask() DaemonInstallResult {
 	service := daemonServiceName()
 	_ = exec.Command("schtasks", "/End", "/TN", service).Run()
 	_ = exec.Command("schtasks", "/Delete", "/TN", service, "/F").Run()
+	if path := windowsStartupDaemonPath(); path != "" {
+		_ = os.Remove(path)
+	}
 	_ = os.Remove(daemonInstallInfoPath())
-	return DaemonInstallResult{Method: "scheduled_task", ServiceName: service, Status: "uninstalled", Message: "TaskPilot scheduled task removed; enabled repo state was kept"}
+	return DaemonInstallResult{Method: "windows", ServiceName: service, Status: "uninstalled", Message: "TaskPilot auto-start entries removed; enabled repo state was kept"}
 }
 
 func doctorDaemonWindowsTask(repos []string) DaemonHealth {
@@ -1145,17 +1168,31 @@ func doctorDaemonWindowsTask(repos []string) DaemonHealth {
 	installed := err == nil
 	text := strings.ToLower(string(out))
 	running := installed && strings.Contains(text, "status:") && strings.Contains(text, "running")
+	method := "scheduled_task"
+	configPath := ""
+	if !installed {
+		if path := windowsStartupDaemonPath(); path != "" {
+			if _, statErr := os.Stat(path); statErr == nil {
+				installed = true
+				method = "windows_startup_folder"
+				configPath = path
+			}
+		}
+	}
 	info, _ := loadDaemonInstallInfo()
 	status := "ok"
 	msg := ""
 	if !installed {
 		status = "not_installed"
 		msg = "run `taskpilot daemon install`"
-	} else if !running {
+	} else if !running && method == "scheduled_task" {
 		status = "installed_not_running"
 		msg = "scheduled task is installed and will start at next login; run `taskpilot daemon install` to start it now"
+	} else if method == "windows_startup_folder" {
+		status = "installed"
+		msg = "Startup folder launcher is installed; it will start TaskPilot at next login"
 	}
-	return DaemonHealth{Method: "scheduled_task", ServiceName: service, BinaryPath: info.BinaryPath, Installed: installed, Running: running, Status: status, LogPath: repoDaemonLogPath(), EnabledRepos: repos, Message: msg}
+	return DaemonHealth{Method: method, ServiceName: service, BinaryPath: info.BinaryPath, Installed: installed, Running: running, Status: status, ConfigPath: configPath, LogPath: repoDaemonLogPath(), EnabledRepos: repos, Message: msg}
 }
 
 func installDaemonSystemd(binary string) DaemonInstallResult {
@@ -1269,6 +1306,23 @@ WantedBy=default.target
 
 func windowsScheduledTaskCommand(binary string) string {
 	return `"` + binary + `" daemon run`
+}
+
+func windowsStartupDaemonPath() string {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			return ""
+		}
+		appData = filepath.Join(home, "AppData", "Roaming")
+	}
+	return filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "TaskPilotDaemon.cmd")
+}
+
+func renderWindowsStartupDaemonCmd(binary, logPath, errLogPath string) string {
+	return "@echo off\r\n" +
+		"start \"TaskPilot Daemon\" /min \"" + binary + "\" daemon run >> \"" + logPath + "\" 2>> \"" + errLogPath + "\"\r\n"
 }
 
 func xmlEscape(value string) string {
