@@ -275,6 +275,20 @@ func TestProjectsRepositoriesWorkspacesAndTaskFiltering(t *testing.T) {
 	if len(filtered) != 1 || filtered[0].ID != task.ID {
 		t.Fatalf("expected filtered task, got %+v", filtered)
 	}
+	repoTasks, err := s.ListTasksFiltered(ctx, TaskListFilter{RepoID: repo.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repoTasks) != 1 || repoTasks[0].ID != task.ID {
+		t.Fatalf("expected repo filtered task, got %+v", repoTasks)
+	}
+	workspaceTasks, err := s.ListTasksFiltered(ctx, TaskListFilter{WorkspaceID: workspace.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workspaceTasks) != 1 || workspaceTasks[0].ID != task.ID {
+		t.Fatalf("expected workspace filtered task, got %+v", workspaceTasks)
+	}
 	defaultTasks, err := s.ListTasks(ctx, "project_default")
 	if err != nil {
 		t.Fatal(err)

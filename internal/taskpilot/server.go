@@ -428,7 +428,12 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.ListTasks(r.Context(), r.URL.Query().Get("project_id"))
+	q := r.URL.Query()
+	out, err := s.store.ListTasksFiltered(r.Context(), TaskListFilter{
+		ProjectID:   q.Get("project_id"),
+		RepoID:      q.Get("repo_id"),
+		WorkspaceID: q.Get("workspace_id"),
+	})
 	writeResult(w, out, err)
 }
 

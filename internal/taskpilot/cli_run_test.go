@@ -43,6 +43,43 @@ func TestParseRunContextLine(t *testing.T) {
 	}
 }
 
+func TestTaskPilotManagedRepoFilesAreIgnoredForInference(t *testing.T) {
+	managed := []string{
+		".taskpilot/repo.json",
+		".claude/settings.json",
+		".codex/hooks.json",
+		".gemini/settings.json",
+		"AGENTS.md",
+		"CLAUDE.md",
+		"GEMINI.md",
+	}
+	for _, path := range managed {
+		if !isTaskPilotManagedRepoFile(path) {
+			t.Fatalf("expected %s to be treated as TaskPilot-managed", path)
+		}
+	}
+	for _, path := range []string{"planning.md", "src/game.js", "docs/AGENTS.md"} {
+		if isTaskPilotManagedRepoFile(path) {
+			t.Fatalf("expected %s to remain product work", path)
+		}
+	}
+}
+
+func TestCompactContextEntriesDropsRepoDaemonNoise(t *testing.T) {
+	entries := []ContextEntry{
+		{Kind: "summary", Content: "TaskPilot daemon captured live uncommitted repo activity.\nBranch: main\nChanged files:\n- AGENTS.md"},
+		{Kind: "note", Content: "TaskPilot inferred this task from repo activity. Branch: main"},
+		{Kind: "summary", Content: "Created planning.md with a brief 2D Snake game plan."},
+	}
+	got := compactContextEntries(entries, 10)
+	if len(got) != 1 {
+		t.Fatalf("expected one useful context entry, got %+v", got)
+	}
+	if got[0].Content != "Created planning.md with a brief 2D Snake game plan." {
+		t.Fatalf("unexpected context entry: %+v", got[0])
+	}
+}
+
 func TestReadNewRunContextEntriesSurvivesRewrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "context.log")
 	seen := map[string]bool{}

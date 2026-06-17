@@ -10,6 +10,9 @@ const apiState = {
   repositories: [],
   workspaces: [],
   selectedProject: loadSetting("taskpilot.project", ""),
+  selectedScopeType: loadSetting("taskpilot.scopeType", "project"),
+  selectedRepo: loadSetting("taskpilot.repo", ""),
+  selectedWorkspace: loadSetting("taskpilot.workspace", ""),
   filters: {
     search: "",
     owner: "",
@@ -197,11 +200,11 @@ async function refreshNow() {
       return;
     }
     const calls = [
-      apiState.selectedProject ? api(`/api/tasks?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/tasks"),
+      api(taskListPath()),
       api("/api/actors"),
       api("/api/projects"),
-      apiState.selectedProject ? api(`/api/repositories?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/repositories"),
-      apiState.selectedProject ? api(`/api/workspaces?project_id=${encodeURIComponent(apiState.selectedProject)}`) : api("/api/workspaces"),
+      api("/api/repositories"),
+      api("/api/workspaces"),
       api("/api/handoffs"),
       api("/api/conflicts?status=open"),
       api("/api/conflicts/stale-claims"),
@@ -217,6 +220,14 @@ async function refreshNow() {
       apiState.selectedProject = "project_default";
       saveSetting("taskpilot.project", apiState.selectedProject);
     }
+    if (!apiState.selectedRepo && apiState.repositories.length) {
+      apiState.selectedRepo = apiState.repositories[0].id;
+      saveSetting("taskpilot.repo", apiState.selectedRepo);
+    }
+    if (!apiState.selectedWorkspace && apiState.workspaces.length) {
+      apiState.selectedWorkspace = apiState.workspaces[0].id;
+      saveSetting("taskpilot.workspace", apiState.selectedWorkspace);
+    }
     apiState.handoffs = Array.isArray(handoffs) ? handoffs : [];
     apiState.conflicts = Array.isArray(conflicts) ? conflicts : [];
     apiState.staleClaims = Array.isArray(staleClaims) ? staleClaims : [];
@@ -230,6 +241,20 @@ async function refreshNow() {
     stopEventStream();
   }
   renderWhenSafe();
+}
+
+function taskListPath() {
+  const scope = apiState.selectedScopeType || "project";
+  if (scope === "repo" && apiState.selectedRepo) {
+    return `/api/tasks?repo_id=${encodeURIComponent(apiState.selectedRepo)}`;
+  }
+  if (scope === "workspace" && apiState.selectedWorkspace) {
+    return `/api/tasks?workspace_id=${encodeURIComponent(apiState.selectedWorkspace)}`;
+  }
+  if (apiState.selectedProject) {
+    return `/api/tasks?project_id=${encodeURIComponent(apiState.selectedProject)}`;
+  }
+  return "/api/tasks";
 }
 
 function scheduleRefresh(delay = 200) {
@@ -340,17 +365,32 @@ function workspaceName(id) {
   return (workspace && workspace.name) || id || "None";
 }
 
-function projectFilter() {
-  const select = h("select", {}, [
+function boardScopeFilter() {
+  const scope = h("select", {}, [
+    h("option", { value: "project", selected: apiState.selectedScopeType === "project" }, "Projects"),
+    h("option", { value: "repo", selected: apiState.selectedScopeType === "repo" }, "Repositories"),
+    h("option", { value: "workspace", selected: apiState.selectedScopeType === "workspace" }, "Workspaces"),
+  ]);
+  const project = h("select", {}, [
     h("option", { value: "", selected: apiState.selectedProject === "" }, "All projects"),
     ...apiState.projects.map(p => h("option", { value: p.id, selected: apiState.selectedProject === p.id }, p.name)),
   ]);
+  const repo = h("select", {}, apiState.repositories.map(r => h("option", { value: r.id, selected: apiState.selectedRepo === r.id }, r.name)));
+  const workspace = h("select", {}, apiState.workspaces.map(w => h("option", { value: w.id, selected: apiState.selectedWorkspace === w.id }, w.name)));
+  const activePicker = apiState.selectedScopeType === "repo" ? repo : apiState.selectedScopeType === "workspace" ? workspace : project;
   return h("div", { class: "toolbar" },
-    h("label", {}, "Project"),
-    select,
+    h("label", {}, "Board scope"),
+    scope,
+    activePicker,
     h("button", { onclick: async () => {
-      apiState.selectedProject = select.value;
-      saveSetting("taskpilot.project", select.value);
+      apiState.selectedScopeType = scope.value;
+      apiState.selectedProject = project.value;
+      apiState.selectedRepo = repo.value;
+      apiState.selectedWorkspace = workspace.value;
+      saveSetting("taskpilot.scopeType", apiState.selectedScopeType);
+      saveSetting("taskpilot.project", apiState.selectedProject);
+      saveSetting("taskpilot.repo", apiState.selectedRepo);
+      saveSetting("taskpilot.workspace", apiState.selectedWorkspace);
       await refresh();
     }}, "Apply")
   );
@@ -452,7 +492,7 @@ function board() {
       ),
       canWrite() ? h("button", { class: "primary", onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, "+ New Task") : null
     ),
-    projectFilter(),
+    boardScopeFilter(),
     taskFilters(),
     stats(),
     h("div", { class: "board" }, statuses.map(status =>
@@ -469,8 +509,8 @@ function taskCard(t) {
     h("div", { class: "card-title" }, t.title),
     h("div", { class: "meta" },
       h("span", {}, `Owner: ${actorName(t.owner_id)}`),
-      h("span", {}, `Project: ${projectName(t.project_id)}`),
       t.repo_id ? h("span", {}, `Repo: ${repoName(t.repo_id)}`) : null,
+      apiState.selectedScopeType !== "repo" ? h("span", {}, `Project: ${projectName(t.project_id)}`) : null,
       h("span", {}, `Priority: ${t.priority}`),
       h("span", {}, `Updated: ${new Date(t.updated_at).toLocaleString()}`),
       h("span", { class: "pill" }, `${t.active_lock_count || 0} locks`),
@@ -497,8 +537,8 @@ function createTaskForm() {
   const goal = h("textarea", { placeholder: "Goal" });
   const scope = h("input", { placeholder: "Scope, comma separated" });
   const project = h("select", {}, apiState.projects.map(p => h("option", { value: p.id, selected: (apiState.selectedProject || "project_default") === p.id }, p.name)));
-  const repo = h("select", {}, [h("option", { value: "" }, "No repo")].concat(apiState.repositories.map(r => h("option", { value: r.id }, r.name))));
-  const workspace = h("select", {}, [h("option", { value: "" }, "No workspace")].concat(apiState.workspaces.map(w => h("option", { value: w.id }, w.name))));
+  const repo = h("select", {}, [h("option", { value: "" }, "No repo")].concat(apiState.repositories.map(r => h("option", { value: r.id, selected: apiState.selectedScopeType === "repo" && apiState.selectedRepo === r.id }, r.name))));
+  const workspace = h("select", {}, [h("option", { value: "" }, "No workspace")].concat(apiState.workspaces.map(w => h("option", { value: w.id, selected: apiState.selectedScopeType === "workspace" && apiState.selectedWorkspace === w.id }, w.name))));
   const parent = h("select", {}, [h("option", { value: "" }, "No parent task")].concat(apiState.tasks.map(t => h("option", { value: t.id }, `${t.title} · ${t.status}`))));
   const type = h("select", {}, ["planning","research","implementation","review","debugging","documentation","other"].map(v => h("option", { value: v }, v)));
   const priority = h("select", {}, ["normal","low","high","urgent"].map(v => h("option", { value: v }, v)));

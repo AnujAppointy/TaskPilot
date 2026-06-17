@@ -705,6 +705,13 @@ type TaskInput struct {
 	PrivacyLevel       string   `json:"privacy_level"`
 }
 
+type TaskListFilter struct {
+	ProjectID    string
+	RepoID       string
+	WorkspaceID  string
+	ParentTaskID string
+}
+
 func (s *Store) CreateTask(ctx context.Context, actorID string, in TaskInput) (Task, error) {
 	if strings.TrimSpace(in.Title) == "" || strings.TrimSpace(in.Goal) == "" {
 		return Task{}, userErr("validation", "title and goal are required")
@@ -766,24 +773,36 @@ func (s *Store) CreateTask(ctx context.Context, actorID string, in TaskInput) (T
 }
 
 func (s *Store) ListTasks(ctx context.Context, projectID string) ([]Task, error) {
-	return s.listTasks(ctx, projectID, "")
+	return s.ListTasksFiltered(ctx, TaskListFilter{ProjectID: projectID})
+}
+
+func (s *Store) ListTasksFiltered(ctx context.Context, filter TaskListFilter) ([]Task, error) {
+	return s.listTasks(ctx, filter)
 }
 
 func (s *Store) ListSubtasks(ctx context.Context, parentTaskID string) ([]Task, error) {
-	return s.listTasks(ctx, "", parentTaskID)
+	return s.listTasks(ctx, TaskListFilter{ParentTaskID: parentTaskID})
 }
 
-func (s *Store) listTasks(ctx context.Context, projectID, parentTaskID string) ([]Task, error) {
+func (s *Store) listTasks(ctx context.Context, filter TaskListFilter) ([]Task, error) {
 	query := `SELECT id,project_id,repo_id,workspace_id,parent_task_id,title,goal,type,status,priority,owner_id,created_by,created_at,updated_at,claim_expires_at,last_heartbeat_at,privacy_level,scope_json,requirements_json,completion_criteria_json,risks_json,blockers_json FROM tasks`
 	args := []any{}
 	clauses := []string{}
-	if projectID != "" {
+	if filter.ProjectID != "" {
 		clauses = append(clauses, `project_id=?`)
-		args = append(args, projectID)
+		args = append(args, filter.ProjectID)
 	}
-	if parentTaskID != "" {
+	if filter.RepoID != "" {
+		clauses = append(clauses, `repo_id=?`)
+		args = append(args, filter.RepoID)
+	}
+	if filter.WorkspaceID != "" {
+		clauses = append(clauses, `workspace_id=?`)
+		args = append(args, filter.WorkspaceID)
+	}
+	if filter.ParentTaskID != "" {
 		clauses = append(clauses, `parent_task_id=?`)
-		args = append(args, parentTaskID)
+		args = append(args, filter.ParentTaskID)
 	}
 	if len(clauses) > 0 {
 		query += ` WHERE ` + strings.Join(clauses, ` AND `)

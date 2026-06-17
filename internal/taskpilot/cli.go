@@ -601,10 +601,6 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 		_ = request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/locks", map[string]any{"scope": file, "scope_type": "file"}, &lock)
 	}
 	if signature != state.LastSignature {
-		summary := "TaskPilot daemon captured live uncommitted repo activity.\nBranch: " + activity.Branch + "\nChanged files:\n- " + strings.Join(activity.ChangedFiles, "\n- ")
-		_ = appendRunContext(task.ID, "summary", summary)
-		var gitRef GitRef
-		_ = request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/git", map[string]any{"branch": activity.Branch, "commit_sha": activity.Commit, "changed_files": activity.ChangedFiles, "note": "Live uncommitted work observed by TaskPilot daemon."}, &gitRef)
 		state.LastSignature = signature
 	}
 	return nil
@@ -612,10 +608,10 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 
 func ensureTaskForRepoActivity(activity repoActivity) (Task, error) {
 	if match, err := resolveRepoTask(activity); err == nil && match.Task.ID != "" && match.Score >= 80 {
-		mergedScope := appendUniqueStrings(match.Task.Scope, activity.ChangedFiles...)
-		if len(mergedScope) > len(match.Task.Scope) {
+		mergedScope := appendUniqueStrings(filterProductRepoFiles(match.Task.Scope), activity.ChangedFiles...)
+		if !sameStringSet(mergedScope, match.Task.Scope) {
 			var updated Task
-			_ = request("PATCH", "/api/tasks/"+url.PathEscape(match.Task.ID), map[string]any{"scope": mergedScope, "reason": "TaskPilot daemon observed changed repo files"}, &updated)
+			_ = request("PATCH", "/api/tasks/"+url.PathEscape(match.Task.ID), map[string]any{"scope": mergedScope, "reason": "Repo activity touched new product files"}, &updated)
 			if updated.ID != "" {
 				return updated, nil
 			}
@@ -628,24 +624,23 @@ func ensureTaskForRepoActivity(activity repoActivity) (Task, error) {
 		RepoID:       activity.Config.RepoID,
 		WorkspaceID:  activity.Config.WorkspaceID,
 		Title:        title,
-		Goal:         "Inferred by TaskPilot from live uncommitted work in " + activity.Config.RepoName + ". Review, rename, merge, or reassign if needed.",
+		Goal:         inferredTaskGoal(activity),
 		Type:         "implementation",
 		Priority:     "normal",
 		Status:       "ready",
 		Scope:        activity.ChangedFiles,
 		PrivacyLevel: "sanitized_context",
-		Requirements: []string{"Validate this inferred task before treating it as final planning truth."},
+		Requirements: []string{"Replace this inferred title or goal once the exact user intent is known."},
 	}
 	var created Task
 	if err := request("POST", "/api/tasks", body, &created); err != nil {
 		return Task{}, err
 	}
-	_ = appendRunContext(created.ID, "note", "TaskPilot inferred this task from repo activity. Branch: "+activity.Branch)
 	return created, nil
 }
 
 func resolveRepoTask(activity repoActivity) (repoTaskMatch, error) {
-	tasks, err := tasksForProject(activity.Config.ProjectID)
+	tasks, err := tasksForRepo(activity.Config.RepoID, activity.Config.ProjectID)
 	if err != nil {
 		return repoTaskMatch{}, err
 	}
@@ -699,6 +694,18 @@ func tasksForProject(projectID string) ([]Task, error) {
 	return tasks, err
 }
 
+func tasksForRepo(repoID, fallbackProjectID string) ([]Task, error) {
+	path := "/api/tasks"
+	if repoID != "" {
+		path += "?repo_id=" + url.QueryEscape(repoID)
+	} else if fallbackProjectID != "" {
+		path += "?project_id=" + url.QueryEscape(fallbackProjectID)
+	}
+	var tasks []Task
+	err := request("GET", path, nil, &tasks)
+	return tasks, err
+}
+
 func currentRepoActivity(repoPath string) (repoActivity, error) {
 	root, err := gitRoot(repoPath)
 	if err != nil {
@@ -718,15 +725,36 @@ func currentRepoActivity(repoPath string) (repoActivity, error) {
 
 func inferredTaskTitle(activity repoActivity) string {
 	if activity.Branch != "" && activity.Branch != "main" && activity.Branch != "master" {
-		return "Inferred work on " + strings.ReplaceAll(activity.Branch, "-", " ")
+		return "Work on " + humanizeBranchName(activity.Branch)
 	}
 	if len(activity.ChangedFiles) == 1 {
-		return "Inferred work on " + activity.ChangedFiles[0]
+		return "Update " + activity.ChangedFiles[0]
 	}
 	if len(activity.ChangedFiles) > 1 {
-		return fmt.Sprintf("Inferred work on %d changed files", len(activity.ChangedFiles))
+		return "Update " + strings.Join(limitStrings(activity.ChangedFiles, 3), ", ")
 	}
 	return "Inferred repo work"
+}
+
+func inferredTaskGoal(activity repoActivity) string {
+	scope := "the current repo work"
+	if len(activity.ChangedFiles) > 0 {
+		scope = strings.Join(limitStrings(activity.ChangedFiles, 5), ", ")
+	}
+	return fmt.Sprintf("Coordinate live work in %s around %s.", activity.Config.RepoName, scope)
+}
+
+func humanizeBranchName(branch string) string {
+	branch = strings.TrimSpace(branch)
+	branch = taskIDPattern.ReplaceAllString(branch, "")
+	branch = strings.Trim(branch, "-_/ ")
+	branch = strings.ReplaceAll(branch, "-", " ")
+	branch = strings.ReplaceAll(branch, "_", " ")
+	branch = strings.Join(strings.Fields(branch), " ")
+	if branch == "" {
+		return "repo branch"
+	}
+	return branch
 }
 
 func branchMatchesTask(branch string, task Task) bool {
@@ -875,7 +903,7 @@ func gitChangedFileSnapshotIn(root string) map[string]gitFileState {
 		if path == "" {
 			continue
 		}
-		if strings.HasPrefix(filepath.ToSlash(path), ".taskpilot/") {
+		if isTaskPilotManagedRepoFile(path) {
 			continue
 		}
 		state := gitFileState{Status: status}
@@ -886,6 +914,31 @@ func gitChangedFileSnapshotIn(root string) map[string]gitFileState {
 		out[filepath.ToSlash(path)] = state
 	}
 	return out
+}
+
+func isTaskPilotManagedRepoFile(path string) bool {
+	path = strings.TrimPrefix(filepath.ToSlash(filepath.Clean(path)), "./")
+	switch path {
+	case "AGENTS.md", "CLAUDE.md", "GEMINI.md":
+		return true
+	}
+	for _, prefix := range []string{".taskpilot/", ".claude/", ".codex/", ".gemini/"} {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterProductRepoFiles(files []string) []string {
+	out := []string{}
+	for _, file := range files {
+		if strings.TrimSpace(file) == "" || isTaskPilotManagedRepoFile(file) {
+			continue
+		}
+		out = append(out, file)
+	}
+	return uniqueStrings(out)
 }
 
 func repoConfigPath(root string) string {
@@ -1752,7 +1805,7 @@ func renderRepoContext(root, format string) (string, error) {
 		payload.MatchScore = match.Score
 		payload.MatchReasons = match.Reasons
 	}
-	tasks, err := tasksForProject(activity.Config.ProjectID)
+	tasks, err := tasksForRepo(activity.Config.RepoID, activity.Config.ProjectID)
 	if err != nil {
 		payload.Warnings = append(payload.Warnings, "Could not load tasks: "+err.Error())
 	} else {
@@ -1783,18 +1836,19 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		"## TaskPilot Live Repo Context",
 		"",
 		"Use this shared context before planning or editing. Do not upload raw source files, prompts, logs, secrets, screenshots, or customer data.",
+		"After meaningful work, record a concise sanitized summary, decision, blocker, risk, or next step with TaskPilot so the next agent sees what changed, not just which files changed.",
 		"",
 		fmt.Sprintf("- Repo: %s", ctx.Repo.RepoName),
 		fmt.Sprintf("- Branch: %s", fallbackText(ctx.Branch, "unknown")),
 		fmt.Sprintf("- Commit: %s", fallbackText(ctx.Commit, "unknown")),
 	}
 	if len(ctx.ChangedFiles) > 0 {
-		lines = append(lines, fmt.Sprintf("- Local uncommitted files detected: %d", len(ctx.ChangedFiles)))
+		lines = append(lines, fmt.Sprintf("- Product files currently changed: %d", len(ctx.ChangedFiles)))
 		for _, file := range limitStrings(ctx.ChangedFiles, 8) {
 			lines = append(lines, "  - "+file)
 		}
 	} else {
-		lines = append(lines, "- Local uncommitted files detected: none")
+		lines = append(lines, "- Product files currently changed: none")
 	}
 	if ctx.LikelyTask != nil {
 		lines = append(lines, "", "### Likely Current Task")
@@ -1803,7 +1857,7 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 			lines = append(lines, "- Owner: "+ctx.LikelyTask.OwnerID)
 		}
 		if len(ctx.MatchReasons) > 0 {
-			lines = append(lines, "- Match: "+strings.Join(ctx.MatchReasons, ", "))
+			lines = append(lines, "- Why this task: "+strings.Join(ctx.MatchReasons, ", "))
 		}
 	}
 	if len(ctx.ActiveOverlaps) > 0 {
@@ -1814,8 +1868,9 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 				owner = "unowned"
 			}
 			lines = append(lines, fmt.Sprintf("- %s %s owner=%s: %s", task.ID, task.Status, owner, task.Title))
-			if len(task.Scope) > 0 {
-				lines = append(lines, "  scope: "+strings.Join(limitStrings(task.Scope, 5), ", "))
+			scope := filterProductRepoFiles(task.Scope)
+			if len(scope) > 0 {
+				lines = append(lines, "  scope: "+strings.Join(limitStrings(scope, 5), ", "))
 			}
 		}
 	}
@@ -1826,7 +1881,7 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		}
 	}
 	if len(ctx.RecentDecisions) > 0 || len(ctx.RecentContext) > 0 {
-		lines = append(lines, "", "### Recent Shared Memory")
+		lines = append(lines, "", "### Recent Useful Memory")
 		for _, decision := range repoLimitDecisions(ctx.RecentDecisions, 4) {
 			lines = append(lines, "- decision: "+decision.Decision)
 		}
@@ -3385,8 +3440,48 @@ func compactContextEntries(entries []ContextEntry, max int) []ContextEntry {
 	return out
 }
 
+func usefulGitRefs(refs []GitRef) []GitRef {
+	out := []GitRef{}
+	seen := map[string]bool{}
+	for _, ref := range refs {
+		if isNoisyRunContext(ref.Note) {
+			continue
+		}
+		files := []string{}
+		for _, file := range ref.ChangedFiles {
+			if !isTaskPilotManagedRepoFile(file) {
+				files = append(files, file)
+			}
+		}
+		if len(files) == 0 && strings.TrimSpace(ref.PRURL) == "" && strings.TrimSpace(ref.CommitSHA) == "" {
+			continue
+		}
+		ref.ChangedFiles = files
+		key := ref.Branch + "\x00" + ref.CommitSHA + "\x00" + strings.Join(ref.ChangedFiles, "\x00") + "\x00" + ref.PRURL
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ref)
+	}
+	return out
+}
+
 func isNoisyRunContext(content string) bool {
-	return strings.Contains(strings.ToLower(content), "taskpilot run is still active; heartbeat renewed")
+	normalized := strings.ToLower(strings.TrimSpace(content))
+	noisy := []string{
+		"taskpilot run is still active; heartbeat renewed",
+		"taskpilot daemon captured live uncommitted repo activity",
+		"taskpilot inferred this task from repo activity",
+		"live uncommitted work observed by taskpilot daemon",
+		"inferred by taskpilot from live uncommitted work",
+	}
+	for _, phrase := range noisy {
+		if strings.Contains(normalized, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func uniqueStrings(values []string) []string {
@@ -3852,9 +3947,9 @@ func mcpTools() []map[string]any {
 		mcpTool("create_workspace", "Create a TaskPilot workspace.", map[string]any{"project_id": mcpString("Project ID"), "name": mcpString("Workspace name"), "actor_id": mcpString("Optional actor ID"), "machine_name": mcpString("Optional machine name"), "kind": mcpString("Workspace kind, defaults to local")}, []string{"project_id", "name"}),
 		mcpTool("list_workspaces", "List TaskPilot workspaces.", map[string]any{"project_id": mcpString("Optional project ID")}, []string{}),
 		mcpTool("list_actors", "List TaskPilot actors.", map[string]any{}, []string{}),
-		mcpTool("search_tasks", "Search TaskPilot tasks by query, project, status, owner, priority, and completion state.", map[string]any{"query": mcpString("Text to search in title, goal, scope, blockers, risks, and task memory"), "project_id": mcpString("Optional project ID"), "status": mcpString("Optional task status"), "owner_id": mcpString("Optional owner actor ID"), "priority": mcpString("Optional priority"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
-		mcpTool("list_my_tasks", "List tasks owned by the configured TaskPilot actor.", map[string]any{"project_id": mcpString("Optional project ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
-		mcpTool("list_blocked_tasks", "List blocked tasks or tasks with blockers/dependencies.", map[string]any{"project_id": mcpString("Optional project ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
+		mcpTool("search_tasks", "Search TaskPilot tasks by query, project, repo, workspace, status, owner, priority, and completion state.", map[string]any{"query": mcpString("Text to search in title, goal, scope, blockers, risks, and task memory"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "status": mcpString("Optional task status"), "owner_id": mcpString("Optional owner actor ID"), "priority": mcpString("Optional priority"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
+		mcpTool("list_my_tasks", "List tasks owned by the configured TaskPilot actor.", map[string]any{"project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
+		mcpTool("list_blocked_tasks", "List blocked tasks or tasks with blockers/dependencies.", map[string]any{"project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "include_completed": map[string]any{"type": "boolean"}, "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
 		mcpTool("list_active_locks", "List active or stale TaskPilot locks, optionally filtered by scope.", map[string]any{"project_id": mcpString("Optional project ID"), "scope": mcpString("Optional file, glob, artifact, or semantic scope"), "limit": map[string]any{"type": "integer", "description": "Maximum records to return"}}, []string{}),
 		mcpTool("list_conflicts", "List current TaskPilot conflicts.", map[string]any{"status": mcpString("Optional conflict status, defaults to open")}, []string{}),
 		mcpTool("read_task", "Read full TaskPilot task detail.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
@@ -4118,7 +4213,7 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		tasks, err := tasksForProject(activity.Config.ProjectID)
+		tasks, err := tasksForRepo(activity.Config.RepoID, activity.Config.ProjectID)
 		if err != nil {
 			return nil, err
 		}
@@ -4841,10 +4936,19 @@ func mcpReadTaskDetail(args map[string]any) (TaskDetail, error) {
 }
 
 func mcpFilteredTasks(args map[string]any) ([]Task, error) {
-	projectID := mcpArg(args, "project_id")
 	path := "/api/tasks"
-	if projectID != "" {
-		path += "?project_id=" + url.QueryEscape(projectID)
+	query := url.Values{}
+	if projectID := mcpArg(args, "project_id"); projectID != "" {
+		query.Set("project_id", projectID)
+	}
+	if repoID := mcpArg(args, "repo_id"); repoID != "" {
+		query.Set("repo_id", repoID)
+	}
+	if workspaceID := mcpArg(args, "workspace_id"); workspaceID != "" {
+		query.Set("workspace_id", workspaceID)
+	}
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 	var tasks []Task
 	if err := request("GET", path, nil, &tasks); err != nil {
@@ -5650,11 +5754,23 @@ func runTask(args []string) error {
 	case "list":
 		fs := flag.NewFlagSet("task list", flag.ExitOnError)
 		project := fs.String("project", "", "project id")
+		repo := fs.String("repo", "", "repository id")
+		workspace := fs.String("workspace", "", "workspace id")
 		jsonOut := fs.Bool("json", false, "print JSON")
 		_ = fs.Parse(args[1:])
 		path := "/api/tasks"
+		query := url.Values{}
 		if *project != "" {
-			path += "?project_id=" + *project
+			query.Set("project_id", *project)
+		}
+		if *repo != "" {
+			query.Set("repo_id", *repo)
+		}
+		if *workspace != "" {
+			query.Set("workspace_id", *workspace)
+		}
+		if encoded := query.Encode(); encoded != "" {
+			path += "?" + encoded
 		}
 		var out []Task
 		if err := request("GET", path, nil, &out); err != nil {
@@ -6300,7 +6416,7 @@ func print(v any, jsonOut bool) error {
 			fmt.Printf("%s\t%s\t%s\tactive=%t\n", u.ID, u.Email, u.Name, u.Active)
 		}
 	case TaskDetail:
-		fmt.Printf("%s\t%s\t%s\nProject: %s\nRepo: %s\nWorkspace: %s\nParent: %s\nGoal: %s\nOwner: %s\nScope: %s\n", x.Task.ID, x.Task.Status, x.Task.Title, x.Task.ProjectID, x.Task.RepoID, x.Task.WorkspaceID, x.Task.ParentTaskID, x.Task.Goal, x.Task.OwnerID, strings.Join(x.Task.Scope, ", "))
+		fmt.Printf("%s\t%s\t%s\nProject: %s\nRepo: %s\nWorkspace: %s\nParent: %s\nGoal: %s\nOwner: %s\nScope: %s\n", x.Task.ID, x.Task.Status, x.Task.Title, x.Task.ProjectID, x.Task.RepoID, x.Task.WorkspaceID, x.Task.ParentTaskID, x.Task.Goal, x.Task.OwnerID, strings.Join(filterProductRepoFiles(x.Task.Scope), ", "))
 		if len(x.Subtasks) > 0 {
 			fmt.Println("\nSubtasks:")
 			for _, t := range x.Subtasks {
@@ -6338,15 +6454,17 @@ func print(v any, jsonOut bool) error {
 				fmt.Printf("- %s %s: %s (%s)\n", a.ID, a.Kind, a.Title, a.URI)
 			}
 		}
-		if len(x.GitRefs) > 0 {
+		gitRefs := usefulGitRefs(x.GitRefs)
+		if len(gitRefs) > 0 {
 			fmt.Println("\nGit:")
-			for _, g := range x.GitRefs {
+			for _, g := range gitRefs {
 				fmt.Printf("- %s branch=%s commit=%s pr=%s files=%s\n", g.ID, g.Branch, g.CommitSHA, g.PRURL, strings.Join(g.ChangedFiles, ","))
 			}
 		}
-		if len(x.Context) > 0 {
+		contextEntries := compactContextEntries(x.Context, 80)
+		if len(contextEntries) > 0 {
 			fmt.Println("\nContext:")
-			for _, c := range x.Context {
+			for _, c := range contextEntries {
 				fmt.Printf("- %s: %s\n", c.Kind, c.Content)
 			}
 		}
