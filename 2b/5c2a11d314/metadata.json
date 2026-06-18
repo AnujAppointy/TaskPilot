@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "2b5c2a11d314",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "internal/taskpilot/cli.go",
+    "internal/taskpilot/cli_handoff_outbox_test.go",
+    "internal/taskpilot/cli_run_test.go",
+    "internal/taskpilot/store.go",
+    "internal/taskpilot/store_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/2b/5c2a11d314/0/metadata.json",
+      "transcript": "/2b/5c2a11d314/0/full.jsonl",
+      "content_hash": "/2b/5c2a11d314/0/content_hash.txt",
+      "prompt": "/2b/5c2a11d314/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 477741,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 19704192,
+    "output_tokens": 37352,
+    "api_call_count": 105
+  }
+}
