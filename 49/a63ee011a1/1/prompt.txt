@@ -1,0 +1,47 @@
+Use the codebase-memory MCP to inspect the current repository.
+
+Do not modify files.
+
+First:
+1. identify the indexed project corresponding to this workspace;
+2. show the main application entry points;
+3. identify the most important modules;
+4. trace one meaningful call path;
+5. tell me which Codebase Memory MCP tools you used.
+
+Do not rely only on filesystem search.
+
+---
+
+i want that codex will use this codebase mcp for the exploration in the codebase , instead of going file by file wasting the token use codebase mcp by quering , use something like this "# Codebase exploration rules
+
+This repository is indexed using Codebase Memory MCP.
+
+Before broad repository exploration:
+
+1. Use the `codebase-memory` MCP to locate relevant modules, symbols,
+   callers, callees, routes, and dependency paths.
+2. Use graph results to narrow down which files need to be inspected.
+3. Read the actual source files before editing them.
+4. Treat source code, tests, and runtime behaviour as authoritative.
+5. Use Codebase Memory for impact analysis before modifying important
+   functions.
+6. After structural changes, confirm that new or modified symbols are
+   visible in the graph.
+7. Run relevant tests after all changes.
+
+Use Codebase Memory especially for:
+
+- understanding unfamiliar architecture;
+- tracing feature flows;
+- finding callers and dependencies;
+- identifying affected modules;
+- checking the blast radius of a change;
+- locating related routes and tests.
+
+Do not use it as a replacement for:
+
+- reading exact implementation details;
+- running tests;
+- checking runtime errors;
+- reviewing Git changes." such that codex will remember the codebase mcp for this project
