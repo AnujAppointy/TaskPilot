@@ -605,7 +605,9 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 		_ = request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/locks", map[string]any{"scope": file, "scope_type": "file"}, &lock)
 	}
 	if signature != state.LastSignature {
-		_, _ = checkpointRepoContext(activity.Config.GitRoot, "daemon", "file_change")
+		if _, err := checkpointRepoContext(activity.Config.GitRoot, "daemon", "file_change"); err != nil {
+			return err
+		}
 		state.LastSignature = signature
 	}
 	return nil
@@ -782,7 +784,21 @@ func branchMatchesTask(branch string, task Task) bool {
 }
 
 func repoActivitySignature(activity repoActivity) string {
-	return activity.Branch + "\n" + activity.Commit + "\n" + strings.Join(activity.ChangedFiles, "\n")
+	states := gitChangedFileSnapshotIn(activity.Config.GitRoot)
+	lines := []string{activity.Branch, activity.Commit}
+	files := filterProductRepoFiles(activity.ChangedFiles)
+	sort.Strings(files)
+	for _, file := range files {
+		state := states[file]
+		lines = append(lines, strings.Join([]string{
+			file,
+			state.Status,
+			strconv.FormatInt(state.Size, 10),
+			strconv.FormatInt(state.ModTime, 10),
+			state.Hash,
+		}, "\x00"))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func ensureRemoteRepository(projectID, name, root, branch string) (Repository, error) {
@@ -915,10 +931,26 @@ func gitChangedFileSnapshotIn(root string) map[string]gitFileState {
 		if info, err := os.Stat(filepath.Join(root, filepath.FromSlash(path))); err == nil {
 			state.ModTime = info.ModTime().UnixNano()
 			state.Size = info.Size()
+			if !info.IsDir() {
+				state.Hash = localFileSHA256(filepath.Join(root, filepath.FromSlash(path)))
+			}
 		}
 		out[filepath.ToSlash(path)] = state
 	}
 	return out
+}
+
+func localFileSHA256(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func isTaskPilotManagedRepoFile(path string) bool {
@@ -3490,7 +3522,7 @@ func summarizeRelatedTask(detail TaskDetail, relations, reasons []string) agentR
 }
 
 func relatedHandoffSummary(detail TaskDetail) string {
-	if detail.HandoffPacket != nil && detail.HandoffPacket.Packet.HandoffMessage != "" {
+	if shouldShowHandoffPacket(detail.HandoffPacket) && detail.HandoffPacket.Packet.HandoffMessage != "" {
 		return detail.HandoffPacket.Packet.HandoffMessage
 	}
 	if len(detail.Handoffs) > 0 {
@@ -3504,10 +3536,53 @@ func relatedHandoffMarkdown(detail TaskDetail) (string, string) {
 		checkpoint := detail.HandoffCheckpoints[len(detail.HandoffCheckpoints)-1]
 		return limitRelatedHandoffMarkdown(checkpoint.Markdown), "handoff_checkpoint:" + checkpoint.ID
 	}
-	if detail.HandoffPacket != nil && strings.TrimSpace(detail.HandoffPacket.Markdown) != "" {
+	if shouldShowHandoffPacket(detail.HandoffPacket) && strings.TrimSpace(detail.HandoffPacket.Markdown) != "" {
 		return limitRelatedHandoffMarkdown(detail.HandoffPacket.Markdown), "handoff_packet:" + detail.HandoffPacket.ID
 	}
 	return "", ""
+}
+
+func shouldShowHandoffPacket(packet *HandoffPacket) bool {
+	if packet == nil || strings.TrimSpace(packet.Markdown) == "" {
+		return false
+	}
+	if packet.Source != "generated_fallback" {
+		return true
+	}
+	useful := 0
+	for _, value := range []string{
+		packet.Packet.CurrentState,
+		packet.Packet.HandoffMessage,
+		strings.Join(packet.Packet.CompletedWork, "\n"),
+		strings.Join(packet.Packet.ImportantDecisions, "\n"),
+		strings.Join(packet.Packet.ImplementationNotes, "\n"),
+		strings.Join(packet.Packet.RemainingWork, "\n"),
+		strings.Join(packet.Packet.SuggestedNextSteps, "\n"),
+	} {
+		value = strings.TrimSpace(value)
+		if value != "" && !isNoisyRunContext(value) && !isGeneratedFallbackPlaceholder(value) {
+			useful++
+		}
+	}
+	return useful > 0
+}
+
+func isGeneratedFallbackPlaceholder(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	placeholders := []string{
+		"no material decision made",
+		"none recorded",
+		"verify the recorded work",
+		"continue from the recorded work",
+		"continue from the latest task context",
+		"replace this inferred title or goal",
+	}
+	for _, phrase := range placeholders {
+		if strings.Contains(value, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func limitRelatedHandoffMarkdown(markdown string) string {
@@ -3767,6 +3842,7 @@ type gitFileState struct {
 	Status  string
 	ModTime int64
 	Size    int64
+	Hash    string
 }
 
 func gitChangedFileSnapshot() map[string]gitFileState {
@@ -6997,7 +7073,7 @@ func print(v any, jsonOut bool) error {
 				fmt.Printf("- %s: %s\n", c.Kind, c.Content)
 			}
 		}
-		if x.HandoffPacket != nil && strings.TrimSpace(x.HandoffPacket.Markdown) != "" {
+		if shouldShowHandoffPacket(x.HandoffPacket) {
 			fmt.Printf("\nLatest Handoff Memory (%s v%d, %s):\n%s\n", x.HandoffPacket.Status, x.HandoffPacket.Version, x.HandoffPacket.Source, strings.TrimSpace(x.HandoffPacket.Markdown))
 		}
 		if len(x.Handoffs) > 0 {

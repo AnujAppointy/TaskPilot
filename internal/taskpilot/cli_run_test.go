@@ -124,6 +124,32 @@ func TestSemanticMemoryContentIncludesStructuredFields(t *testing.T) {
 	}
 }
 
+func TestShouldHideNoisyGeneratedFallbackHandoffPacket(t *testing.T) {
+	packet := &HandoffPacket{
+		Source:   "generated_fallback",
+		Markdown: "# Task Handoff\n\nTaskPilot daemon captured live uncommitted repo activity.",
+		Packet: HandoffPacketContent{
+			CurrentState:       "TaskPilot daemon captured live uncommitted repo activity.\nChanged files:\n- tech.md",
+			CompletedWork:      []string{"TaskPilot daemon captured live uncommitted repo activity.\nChanged files:\n- tech.md"},
+			ImportantDecisions: []string{"No material decision made; work followed existing requirements."},
+			RemainingWork:      []string{"Verify the recorded work and decide whether to continue."},
+			HandoffMessage:     "Continue from the recorded work on Branch: main.",
+		},
+	}
+	if shouldShowHandoffPacket(packet) {
+		t.Fatalf("expected noisy generated fallback handoff to be hidden")
+	}
+	packet.Packet.CompletedWork = []string{"Updated tech.md with two more reasons for using browser-native Canvas."}
+	if !shouldShowHandoffPacket(packet) {
+		t.Fatalf("expected useful generated fallback handoff to be shown")
+	}
+	packet.Source = "agent_authored"
+	packet.Packet.CompletedWork = nil
+	if !shouldShowHandoffPacket(packet) {
+		t.Fatalf("expected non-fallback handoff to be shown")
+	}
+}
+
 func TestReadNewRunContextEntriesSurvivesRewrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "context.log")
 	seen := map[string]bool{}
@@ -361,6 +387,33 @@ func TestGitChangedFileSnapshotIgnoresTaskPilotMetadata(t *testing.T) {
 	}
 	if _, ok := got["app.go"]; !ok {
 		t.Fatalf("expected product file to be detected: %+v", got)
+	}
+}
+
+func TestRepoActivitySignatureChangesWhenSameFileContentChanges(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n\n## Reason\nInitial.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "tech.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	activity := repoActivity{Config: repoEnableConfig{GitRoot: root, RepoID: "repo_1", WorkspaceID: "workspace_1"}, Branch: "main", Commit: "abc123", ChangedFiles: []string{"tech.md"}}
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n\n## Reason\nInitial.\nOne more reason.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := repoActivitySignature(activity)
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n\n## Reason\nInitial.\nA different reason.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second := repoActivitySignature(activity)
+	if first == second {
+		t.Fatalf("signature should change when content changes for the same dirty file")
 	}
 }
 

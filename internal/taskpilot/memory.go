@@ -1059,6 +1059,10 @@ func isNoisyContext(content string) bool {
 		"taskpilot run started agent command",
 		"agent command completed successfully through taskpilot run",
 		"direction: taskpilot run started agent command",
+		"taskpilot daemon captured live uncommitted repo activity",
+		"taskpilot inferred this task from repo activity",
+		"live uncommitted work observed by taskpilot daemon",
+		"inferred by taskpilot from live uncommitted work",
 	}
 	for _, item := range noisy {
 		if strings.Contains(content, item) {
