@@ -330,11 +330,12 @@ func TestAppendContextWithLifecycleSupersedesWeakerMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Added futurescope.md with headings.", "daemon", "file_change", "metadata_inferred", []string{"futurescope.md"}, "repo\x00task\x00futurescope.md", "working")
+	key := "repo:test-futurescope"
+	first, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Added futurescope.md with headings.", "daemon", "file_change", "metadata_inferred", []string{"futurescope.md"}, key, "working")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Completed: Added futurescope.md. Why: separate future scope. Verification: read it back. Remaining: none.", "mcp", "semantic_memory", "agent_authored", []string{"futurescope.md"}, "repo\x00task\x00futurescope.md", "final")
+	second, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Completed: Added futurescope.md. Why: separate future scope. Verification: read it back. Remaining: none.", "mcp", "semantic_memory", "agent_authored", []string{"futurescope.md"}, key, "final")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +365,7 @@ func TestAppendContextWithLifecycleRejectsWeakerReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := "repo\x00task\x00planning.md"
+	key := "repo:test-planning"
 	strong, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Completed: Created planning.md. Verification: read it back.", "mcp", "semantic_memory", "agent_authored", []string{"planning.md"}, key, "final")
 	if err != nil {
 		t.Fatal(err)
@@ -382,6 +383,20 @@ func TestAppendContextWithLifecycleRejectsWeakerReplacement(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Stage != "final" {
 		t.Fatalf("weaker replacement should not append or supersede: %+v", entries)
+	}
+}
+
+func TestAppendContextWithLifecycleRejectsNULMemoryKey(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Memory", Goal: "Reject invalid memory keys"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Updated planning.md", "daemon", "file_change", "metadata_inferred", []string{"planning.md"}, "repo\x00bad", "working")
+	if err == nil {
+		t.Fatalf("expected NUL memory key to be rejected")
 	}
 }
 

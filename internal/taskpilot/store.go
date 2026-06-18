@@ -1400,6 +1400,9 @@ func (s *Store) AppendContextWithLifecycle(ctx context.Context, actorID, taskID,
 	}
 	files = cleanStrings(files)
 	memoryKey = strings.TrimSpace(memoryKey)
+	if strings.ContainsRune(memoryKey, 0) {
+		return ContextEntry{}, userErr("validation", "context memory key cannot contain NUL bytes")
+	}
 	stage = strings.TrimSpace(stage)
 	if stage == "" {
 		if memoryKey != "" {

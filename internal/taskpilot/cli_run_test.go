@@ -82,8 +82,8 @@ func TestCompactContextEntriesDropsRepoDaemonNoise(t *testing.T) {
 
 func TestCompactContextEntriesHidesSupersededMemory(t *testing.T) {
 	entries := []ContextEntry{
-		{Kind: "summary", Content: "Added futurescope.md with headings.", MemoryKey: "repo\x00task\x00futurescope.md", Stage: "superseded", SupersededBy: "ctx_2"},
-		{ID: "ctx_2", Kind: "summary", Content: "Completed: Added futurescope.md. Verification: read it back.", MemoryKey: "repo\x00task\x00futurescope.md", Stage: "final", Confidence: "agent_authored"},
+		{Kind: "summary", Content: "Added futurescope.md with headings.", MemoryKey: "repo:test-futurescope", Stage: "superseded", SupersededBy: "ctx_2"},
+		{ID: "ctx_2", Kind: "summary", Content: "Completed: Added futurescope.md. Verification: read it back.", MemoryKey: "repo:test-futurescope", Stage: "final", Confidence: "agent_authored"},
 	}
 	got := compactContextEntries(entries, 10)
 	if len(got) != 1 {
@@ -110,8 +110,35 @@ func TestRepoMemoryKeyNormalizesFileOrder(t *testing.T) {
 	if a != b {
 		t.Fatalf("expected stable memory key across file order, got %q and %q", a, b)
 	}
+	if strings.ContainsRune(a, 0) {
+		t.Fatalf("memory key must be safe for Postgres text, got NUL in %q", a)
+	}
+	if !strings.HasPrefix(a, "repo:") {
+		t.Fatalf("expected repo memory key prefix, got %q", a)
+	}
 	if strings.Contains(a, "AGENTS.md") {
 		t.Fatalf("managed files should not be part of memory key: %q", a)
+	}
+}
+
+func TestEnsureTomlTableKeyAddsTaskPilotSemanticTool(t *testing.T) {
+	original := `[mcp_servers.taskpilot]
+command = "taskpilot"
+args = ["mcp", "serve"]
+
+[mcp_servers.other]
+command = "other"
+`
+	updated, changed := ensureTomlTableKey(original, "mcp_servers.taskpilot.tools.record_repo_semantic_memory", "approval_mode", `"approve"`)
+	if !changed {
+		t.Fatalf("expected semantic memory tool table to be added")
+	}
+	if !strings.Contains(updated, "[mcp_servers.taskpilot.tools.record_repo_semantic_memory]") {
+		t.Fatalf("missing semantic tool table:\n%s", updated)
+	}
+	again, changed := ensureTomlTableKey(updated, "mcp_servers.taskpilot.tools.record_repo_semantic_memory", "approval_mode", `"approve"`)
+	if changed || again != updated {
+		t.Fatalf("expected second merge to be idempotent")
 	}
 }
 

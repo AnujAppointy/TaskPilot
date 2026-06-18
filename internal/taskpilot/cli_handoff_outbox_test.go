@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,6 +49,134 @@ func TestSendOrQueueHandoffCheckpointQueuesRetriableFailure(t *testing.T) {
 	}
 	if !strings.Contains(queued.LastError, "cannot reach TaskPilot server") {
 		t.Fatalf("queued checkpoint should preserve delivery error, got %q", queued.LastError)
+	}
+}
+
+func TestFlushQueuedRepoCheckpointsSendsAndDeletesOutboxItem(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "tech.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n\n## Reason\nUse Canvas.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	contextPosted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode([]Task{})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode(Task{ID: "task_1", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Update tech.md", Goal: "Coordinate tech.md", Status: "in_progress"})
+		case r.Method == "GET" && r.URL.Path == "/api/tasks/task_1":
+			_ = json.NewEncoder(w).Encode(TaskDetail{Task: Task{ID: "task_1", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Update tech.md", Goal: "Coordinate tech.md", Status: "in_progress"}})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks/task_1/context":
+			contextPosted = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if key, _ := body["memory_key"].(string); key == "" || strings.ContainsRune(key, 0) {
+				t.Fatalf("expected safe memory key, got %#v", body["memory_key"])
+			}
+			_ = json.NewEncoder(w).Encode(ContextEntry{ID: "ctx_1", TaskID: "task_1", Kind: "summary"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queueRepoCheckpoint(root, "agent-hook", "manual", errors.New("previous network failure")); err != nil {
+		t.Fatal(err)
+	}
+	flushed, failed, err := flushQueuedRepoCheckpoints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flushed != 1 || failed != 0 || !contextPosted {
+		t.Fatalf("expected queued repo checkpoint to flush, flushed=%d failed=%d posted=%v", flushed, failed, contextPosted)
+	}
+	paths, err := queuedRepoCheckpointPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("expected repo checkpoint outbox to be empty, got %v", paths)
+	}
+}
+
+func TestFlushQueuedRepoSemanticMemorySendsAgentAuthoredContext(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "tech.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n\n## Reason\nUse Canvas.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode([]Task{})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode(Task{ID: "task_1", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Update tech.md", Goal: "Coordinate tech.md", Status: "in_progress"})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks/task_1/context":
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(ContextEntry{ID: "ctx_1", TaskID: "task_1", Kind: "summary"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queueRepoSemanticMemory(root, "Added two reason bullets to tech.md", "document stack rationale", "read tech.md after edit", "none", []string{"tech.md"}, "working", errors.New("previous network failure")); err != nil {
+		t.Fatal(err)
+	}
+	flushed, failed, err := flushQueuedRepoSemanticMemories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flushed != 1 || failed != 0 {
+		t.Fatalf("expected queued semantic memory to flush, flushed=%d failed=%d", flushed, failed)
+	}
+	if gotBody["confidence"] != "agent_authored" || gotBody["reason"] != "semantic_memory" {
+		t.Fatalf("expected agent-authored semantic body, got %+v", gotBody)
+	}
+	if content, _ := gotBody["content"].(string); !strings.Contains(content, "Added two reason bullets") || !strings.Contains(content, "Verification: read tech.md") {
+		t.Fatalf("semantic content not preserved: %+v", gotBody)
 	}
 }
 

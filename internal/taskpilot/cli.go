@@ -56,6 +56,36 @@ type queuedHandoffCheckpoint struct {
 	LastError     string    `json:"last_error,omitempty"`
 }
 
+type queuedRepoCheckpoint struct {
+	ID            string    `json:"id"`
+	Server        string    `json:"server"`
+	ActorID       string    `json:"actor_id"`
+	RepoPath      string    `json:"repo_path"`
+	Source        string    `json:"source"`
+	Reason        string    `json:"reason"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastAttemptAt time.Time `json:"last_attempt_at,omitempty"`
+	Attempts      int       `json:"attempts"`
+	LastError     string    `json:"last_error,omitempty"`
+}
+
+type queuedRepoSemanticMemory struct {
+	ID            string    `json:"id"`
+	Server        string    `json:"server"`
+	ActorID       string    `json:"actor_id"`
+	RepoPath      string    `json:"repo_path"`
+	CompletedWork string    `json:"completed_work"`
+	Why           string    `json:"why,omitempty"`
+	Verification  string    `json:"verification,omitempty"`
+	RemainingWork string    `json:"remaining_work,omitempty"`
+	Files         []string  `json:"files,omitempty"`
+	Stage         string    `json:"stage,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastAttemptAt time.Time `json:"last_attempt_at,omitempty"`
+	Attempts      int       `json:"attempts"`
+	LastError     string    `json:"last_error,omitempty"`
+}
+
 type handoffSyncOptions struct {
 	Watch       bool
 	Interval    time.Duration
@@ -245,6 +275,7 @@ type AgentConfigureResult struct {
 	Name           string `json:"name"`
 	ConfigPath     string `json:"config_path"`
 	HookCommand    string `json:"hook_command"`
+	MCPConfigPath  string `json:"mcp_config_path,omitempty"`
 	Status         string `json:"status"`
 	Changed        bool   `json:"changed"`
 	DryRun         bool   `json:"dry_run,omitempty"`
@@ -260,6 +291,8 @@ type AgentHealth struct {
 	HookScriptPath   string `json:"hook_script_path"`
 	HookScriptExists bool   `json:"hook_script_exists"`
 	Registered       bool   `json:"registered"`
+	MCPRegistered    bool   `json:"mcp_registered,omitempty"`
+	MCPConfigPath    string `json:"mcp_config_path,omitempty"`
 	Status           string `json:"status"`
 	Message          string `json:"message,omitempty"`
 }
@@ -550,6 +583,8 @@ func runDaemonLoop(interval time.Duration, once bool) error {
 		if err != nil {
 			return err
 		}
+		_, _, _ = flushQueuedRepoSemanticMemories()
+		_, _, _ = flushQueuedRepoCheckpoints()
 		for _, repo := range reg.Repos {
 			repo = strings.TrimSpace(repo)
 			if repo == "" {
@@ -1581,6 +1616,19 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 		}
 	}
 	writeResult.Changed = writeResult.Changed || finalChanged
+	mcpChanged := false
+	if a.name == "codex" {
+		mcpResult, err := ensureCodexTaskPilotMCPConfig(dryRun)
+		result.MCPConfigPath = mcpResult.ConfigPath
+		if err != nil {
+			result.Status = "error"
+			result.Message = err.Error()
+			result.ManualFallback = a.ManualInstructions(repo)
+			return result
+		}
+		mcpChanged = mcpResult.Changed
+	}
+	writeResult.Changed = writeResult.Changed || mcpChanged
 	result.Changed = writeResult.Changed
 	if result.BackupPath == "" {
 		result.BackupPath = writeResult.BackupPath
@@ -1597,6 +1645,9 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 	if writeResult.Changed {
 		result.Status = "configured"
 		result.Message = fmt.Sprintf("registered %s session hooks in %s", a.name, a.configRel)
+		if a.name == "codex" {
+			result.Message += "; registered TaskPilot MCP semantic-memory tools in Codex config"
+		}
 		if a.extraNote != "" {
 			result.Message += "; " + a.extraNote
 		}
@@ -1604,6 +1655,9 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 	}
 	result.Status = "already_configured"
 	result.Message = fmt.Sprintf("%s session hooks already registered in %s", a.name, a.configRel)
+	if a.name == "codex" {
+		result.Message += "; TaskPilot MCP semantic-memory tools already registered in Codex config"
+	}
 	return result
 }
 
@@ -1639,11 +1693,201 @@ func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 		status = "agent_not_on_path"
 		msg = "hook is registered, but the agent binary was not found on PATH"
 	}
-	return AgentHealth{Name: a.name, Installed: detection.Installed, ConfigPath: detection.ConfigPath, HookScriptPath: "", HookScriptExists: true, Registered: registered, Status: status, Message: msg}
+	health := AgentHealth{Name: a.name, Installed: detection.Installed, ConfigPath: detection.ConfigPath, HookScriptPath: "", HookScriptExists: true, Registered: registered, Status: status, Message: msg}
+	if a.name == "codex" {
+		mcpHealth := codexTaskPilotMCPHealth()
+		health.MCPRegistered = mcpHealth.OK
+		health.MCPConfigPath = mcpHealth.ConfigPath
+		if !mcpHealth.OK {
+			health.Status = "partial"
+			if health.Message != "" {
+				health.Message += "; "
+			}
+			health.Message += mcpHealth.Message
+		}
+	}
+	return health
 }
 
 func (a jsonHookAdapter) ManualInstructions(repo repoEnableConfig) string {
+	if a.name == "codex" {
+		return fmt.Sprintf("Manual setup for %s: add a session-start command hook to %s that runs %s, a session-end hook that runs %s, and register Codex MCP server `taskpilot` with command `taskpilot mcp serve` including tool `record_repo_semantic_memory`.", a.name, filepath.Join(repo.GitRoot, a.configRel), a.command(), a.finalCommand())
+	}
 	return fmt.Sprintf("Manual setup for %s: add a session-start command hook to %s that runs %s, and a session-end hook that runs %s.", a.name, filepath.Join(repo.GitRoot, a.configRel), a.command(), a.finalCommand())
+}
+
+type codexMCPConfigResult struct {
+	ConfigPath string
+	Changed    bool
+}
+
+type codexMCPHealthResult struct {
+	ConfigPath string
+	OK         bool
+	Message    string
+}
+
+var requiredCodexTaskPilotMCPTools = []string{
+	"get_current_repo_context",
+	"ensure_task_for_repo_session",
+	"record_repo_session_context",
+	"record_repo_semantic_memory",
+}
+
+func ensureCodexTaskPilotMCPConfig(dryRun bool) (codexMCPConfigResult, error) {
+	path := codexConfigPath()
+	original, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		original = nil
+	} else if err != nil {
+		return codexMCPConfigResult{ConfigPath: path}, err
+	}
+	updated := string(original)
+	command := codexTaskPilotCommand()
+	changed := false
+	updated, changed = ensureTomlTableKey(updated, "mcp_servers.taskpilot", "command", strconv.Quote(command))
+	changedAny := changed
+	updated, changed = ensureTomlTableKey(updated, "mcp_servers.taskpilot", "args", `["mcp", "serve"]`)
+	changedAny = changedAny || changed
+	for _, tool := range requiredCodexTaskPilotMCPTools {
+		updated, changed = ensureTomlTableKey(updated, "mcp_servers.taskpilot.tools."+tool, "approval_mode", `"approve"`)
+		changedAny = changedAny || changed
+	}
+	if !changedAny || dryRun {
+		return codexMCPConfigResult{ConfigPath: path, Changed: changedAny}, nil
+	}
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return codexMCPConfigResult{ConfigPath: path}, err
+	}
+	if len(original) > 0 {
+		backup := path + ".taskpilot.bak"
+		if _, err := os.Stat(backup); os.IsNotExist(err) {
+			_ = os.WriteFile(backup, original, 0o600)
+		}
+	}
+	return codexMCPConfigResult{ConfigPath: path, Changed: true}, atomicWriteFile(path, []byte(updated), 0o600)
+}
+
+func codexTaskPilotMCPHealth() codexMCPHealthResult {
+	path := codexConfigPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return codexMCPHealthResult{ConfigPath: path, OK: false, Message: "TaskPilot MCP is not configured for Codex; run `taskpilot agent configure codex`"}
+	}
+	text := string(data)
+	if !tomlTableExists(text, "mcp_servers.taskpilot") {
+		return codexMCPHealthResult{ConfigPath: path, OK: false, Message: "TaskPilot MCP server is missing from Codex config; run `taskpilot agent configure codex`"}
+	}
+	missing := []string{}
+	for _, tool := range requiredCodexTaskPilotMCPTools {
+		if !tomlTableExists(text, "mcp_servers.taskpilot.tools."+tool) {
+			missing = append(missing, tool)
+		}
+	}
+	if len(missing) > 0 {
+		return codexMCPHealthResult{ConfigPath: path, OK: false, Message: "TaskPilot MCP semantic-memory tools missing from Codex config: " + strings.Join(missing, ", ") + "; run `taskpilot agent configure codex`"}
+	}
+	return codexMCPHealthResult{ConfigPath: path, OK: true}
+}
+
+func codexConfigPath() string {
+	home := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if home == "" {
+		userHome, _ := os.UserHomeDir()
+		home = filepath.Join(userHome, ".codex")
+	}
+	return filepath.Join(home, "config.toml")
+}
+
+func codexTaskPilotCommand() string {
+	if path, err := exec.LookPath("taskpilot"); err == nil && strings.TrimSpace(path) != "" {
+		if abs, absErr := filepath.Abs(path); absErr == nil {
+			return abs
+		}
+		return path
+	}
+	if path, err := currentExecutablePath(); err == nil {
+		return path
+	}
+	return "taskpilot"
+}
+
+func tomlTableExists(text, table string) bool {
+	_, _, ok := tomlTableRange(text, table)
+	return ok
+}
+
+func ensureTomlTableKey(text, table, key, value string) (string, bool) {
+	start, end, ok := tomlTableRange(text, table)
+	if !ok {
+		text = strings.TrimRight(text, "\n")
+		if text != "" {
+			text += "\n\n"
+		}
+		text += "[" + table + "]\n" + key + " = " + value + "\n"
+		return text, true
+	}
+	block := text[start:end]
+	lines := strings.SplitAfter(block, "\n")
+	offset := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, key+" ") || strings.HasPrefix(trimmed, key+"=") {
+			newLine := key + " = " + value
+			if strings.HasSuffix(line, "\n") {
+				newLine += "\n"
+			}
+			if line == newLine {
+				return text, false
+			}
+			return text[:start+offset] + newLine + text[start+offset+len(line):], true
+		}
+		offset += len(line)
+	}
+	insert := key + " = " + value + "\n"
+	if !strings.HasSuffix(block, "\n") {
+		insert = "\n" + insert
+	}
+	return text[:end] + insert + text[end:], true
+}
+
+func tomlTableRange(text, table string) (int, int, bool) {
+	offset := 0
+	start := -1
+	for _, line := range splitLinesKeepingEnd(text) {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			name := strings.Trim(trimmed, "[]")
+			if start >= 0 {
+				return start, offset, true
+			}
+			if name == table {
+				start = offset
+			}
+		}
+		offset += len(line)
+	}
+	if start >= 0 {
+		return start, len(text), true
+	}
+	return 0, 0, false
+}
+
+func splitLinesKeepingEnd(text string) []string {
+	if text == "" {
+		return nil
+	}
+	out := []string{}
+	for len(text) > 0 {
+		idx := strings.IndexByte(text, '\n')
+		if idx < 0 {
+			out = append(out, text)
+			break
+		}
+		out = append(out, text[:idx+1])
+		text = text[idx+1:]
+	}
+	return out
 }
 
 func (a jsonHookAdapter) command() string {
@@ -1931,7 +2175,7 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		"## TaskPilot Live Repo Context",
 		"",
 		"Use this shared context before planning or editing. Do not upload raw source files, prompts, logs, secrets, screenshots, or customer data.",
-		"After meaningful work, prefer structured memory via MCP `record_repo_semantic_memory` with completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context checkpoint --repo . --source agent-hook --reason manual`.",
+		"After meaningful work, record agent-authored memory before your final response. First use TaskPilot MCP `record_repo_semantic_memory` with completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context record-semantic --repo . --completed-work \"...\" --why \"...\" --verification \"...\" --remaining-work \"...\" --files path1,path2`.",
 		"",
 		fmt.Sprintf("- Repo: %s", ctx.Repo.RepoName),
 		fmt.Sprintf("- Branch: %s", fallbackText(ctx.Branch, "unknown")),
@@ -4458,28 +4702,11 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		activity, err := currentRepoActivity(repo)
+		out, err := recordRepoSemanticMemory(repo, completed, mcpArg(args, "why"), mcpArg(args, "verification"), mcpArg(args, "remaining_work"), mcpStringSliceArg(args, "files"), mcpArg(args, "stage"), true)
 		if err != nil {
 			return nil, err
 		}
-		task, err := ensureTaskForRepoActivity(activity)
-		if err != nil {
-			return nil, err
-		}
-		files := filterProductRepoFiles(mcpStringSliceArg(args, "files"))
-		if len(files) == 0 {
-			files = filterProductRepoFiles(activity.ChangedFiles)
-		}
-		stage := strings.TrimSpace(mcpArg(args, "stage"))
-		if stage == "" {
-			stage = "working"
-		}
-		content := semanticMemoryContent(completed, mcpArg(args, "why"), mcpArg(args, "verification"), mcpArg(args, "remaining_work"))
-		var out ContextEntry
-		if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": "summary", "content": content, "source": "mcp", "reason": "semantic_memory", "confidence": "agent_authored", "files": files, "memory_key": repoMemoryKey(activity, task.ID, files), "stage": stage}, &out); err != nil {
-			return nil, err
-		}
-		return mcpToolResult(map[string]any{"summary": "Recorded structured semantic repo memory.", "task": task, "context": out}), nil
+		return mcpToolResult(out), nil
 	case "create_task":
 		body, err := mcpTaskInput(args, false)
 		if err != nil {
@@ -6164,7 +6391,7 @@ func runTask(args []string) error {
 
 func runContext(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: taskpilot context append|render|checkpoint|draft-summary")
+		return fmt.Errorf("usage: taskpilot context append|render|checkpoint|draft-summary|record-semantic")
 	}
 	switch args[0] {
 	case "render":
@@ -6212,6 +6439,22 @@ func runContext(args []string) error {
 		}
 		fmt.Println(draft.Summary)
 		return nil
+	case "record-semantic":
+		fs := flag.NewFlagSet("context record-semantic", flag.ExitOnError)
+		repoPath := fs.String("repo", ".", "repo path")
+		completed := fs.String("completed-work", "", "what changed or was completed")
+		why := fs.String("why", "", "why it changed or important reasoning")
+		verification := fs.String("verification", "", "verification performed")
+		remaining := fs.String("remaining-work", "", "remaining work or next step")
+		files := fs.String("files", "", "comma-separated related product files")
+		stage := fs.String("stage", "working", "working or final")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		out, err := recordRepoSemanticMemory(*repoPath, *completed, *why, *verification, *remaining, splitCSV(*files), *stage, true)
+		if err != nil {
+			return err
+		}
+		return print(out, *jsonOut)
 	}
 	if args[0] != "append" || len(args) < 2 {
 		return fmt.Errorf("usage: taskpilot context append <task-id> --kind decision --content text")
@@ -6236,6 +6479,46 @@ func runContext(args []string) error {
 }
 
 func checkpointRepoContext(repoPath, source, reason string) (map[string]any, error) {
+	return checkpointRepoContextWithQueue(repoPath, source, reason, true)
+}
+
+func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining string, files []string, stage string, queueOnRetriable bool) (map[string]any, error) {
+	completed = strings.TrimSpace(completed)
+	if completed == "" {
+		return nil, fmt.Errorf("completed work is required")
+	}
+	activity, err := currentRepoActivity(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	task, err := ensureTaskForRepoActivity(activity)
+	if err != nil {
+		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, err, queueOnRetriable); ok {
+			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; semantic memory queued locally for daemon retry", "queued_memory": queued}, queueErr
+		}
+		return nil, err
+	}
+	files = filterProductRepoFiles(files)
+	if len(files) == 0 {
+		files = filterProductRepoFiles(activity.ChangedFiles)
+	}
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		stage = "working"
+	}
+	content := semanticMemoryContent(completed, why, verification, remaining)
+	var entry ContextEntry
+	body := map[string]any{"kind": "summary", "content": content, "source": "mcp", "reason": "semantic_memory", "confidence": "agent_authored", "files": files, "memory_key": repoMemoryKey(activity, task.ID, files), "stage": stage}
+	if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", body, &entry); err != nil {
+		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, err, queueOnRetriable); ok {
+			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; semantic memory queued locally for daemon retry", "queued_memory": queued, "task": task}, queueErr
+		}
+		return nil, err
+	}
+	return map[string]any{"status": "recorded", "summary": "Recorded structured semantic repo memory.", "task": task, "context": entry}, nil
+}
+
+func checkpointRepoContextWithQueue(repoPath, source, reason string, queueOnRetriable bool) (map[string]any, error) {
 	activity, err := currentRepoActivity(repoPath)
 	if err != nil {
 		return nil, err
@@ -6246,6 +6529,9 @@ func checkpointRepoContext(repoPath, source, reason string) (map[string]any, err
 	}
 	task, err := ensureTaskForRepoActivity(activity)
 	if err != nil {
+		if queued, ok, queueErr := queueRepoCheckpointOnRetriable(repoPath, source, reason, err, queueOnRetriable); ok {
+			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; repo checkpoint queued locally for daemon retry", "queued_checkpoint": queued, "changed_files": files}, queueErr
+		}
 		return nil, err
 	}
 	source = strings.TrimSpace(source)
@@ -6276,9 +6562,295 @@ func checkpointRepoContext(repoPath, source, reason string) (map[string]any, err
 	}
 	var entry ContextEntry
 	if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": "summary", "content": summary, "source": source, "reason": reason, "confidence": confidence, "files": files, "memory_key": memoryKey, "stage": stage}, &entry); err != nil {
+		if queued, ok, queueErr := queueRepoCheckpointOnRetriable(repoPath, source, reason, err, queueOnRetriable); ok {
+			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; repo checkpoint queued locally for daemon retry", "queued_checkpoint": queued, "changed_files": files, "confidence": confidence, "memory_key": memoryKey, "stage": stage}, queueErr
+		}
 		return nil, err
 	}
 	return map[string]any{"status": "recorded", "task": task, "context": entry, "changed_files": files, "confidence": confidence, "memory_key": memoryKey, "stage": stage}, nil
+}
+
+func queueRepoCheckpointOnRetriable(repoPath, source, reason string, cause error, enabled bool) (queuedRepoCheckpoint, bool, error) {
+	if !enabled || !isRetriableRequestError(cause) {
+		return queuedRepoCheckpoint{}, false, nil
+	}
+	queued, err := queueRepoCheckpoint(repoPath, source, reason, cause)
+	if err != nil {
+		return queuedRepoCheckpoint{}, true, fmt.Errorf("%w; additionally failed to queue repo checkpoint locally: %v", cause, err)
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: repo checkpoint queued locally as %s and will retry from the daemon.\n", queued.ID)
+	return queued, true, nil
+}
+
+func queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining string, files []string, stage string, cause error, enabled bool) (queuedRepoSemanticMemory, bool, error) {
+	if !enabled || !isRetriableRequestError(cause) {
+		return queuedRepoSemanticMemory{}, false, nil
+	}
+	queued, err := queueRepoSemanticMemory(repoPath, completed, why, verification, remaining, files, stage, cause)
+	if err != nil {
+		return queuedRepoSemanticMemory{}, true, fmt.Errorf("%w; additionally failed to queue semantic memory locally: %v", cause, err)
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "TaskPilot: semantic memory queued locally as %s and will retry from the daemon.\n", queued.ID)
+	return queued, true, nil
+}
+
+func queueRepoSemanticMemory(repoPath, completed, why, verification, remaining string, files []string, stage string, cause error) (queuedRepoSemanticMemory, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return queuedRepoSemanticMemory{}, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	root, err := gitRoot(repoPath)
+	if err == nil {
+		repoPath = root
+	}
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		stage = "working"
+	}
+	files = filterProductRepoFiles(files)
+	now := time.Now().UTC()
+	sum := sha256.Sum256([]byte(strings.Join(append([]string{cfg.Server, cfg.ActorID, filepath.Clean(repoPath), completed, why, verification, remaining, stage}, files...), "\n")))
+	id := fmt.Sprintf("repo_semantic_%x", sum[:8])
+	queued := queuedRepoSemanticMemory{
+		ID:            id,
+		Server:        cfg.Server,
+		ActorID:       cfg.ActorID,
+		RepoPath:      filepath.Clean(repoPath),
+		CompletedWork: completed,
+		Why:           why,
+		Verification:  verification,
+		RemainingWork: remaining,
+		Files:         files,
+		Stage:         stage,
+		CreatedAt:     now,
+		LastAttemptAt: now,
+		Attempts:      1,
+		LastError:     cause.Error(),
+	}
+	path := queuedRepoSemanticMemoryPath(id)
+	if existing, err := readQueuedRepoSemanticMemory(path); err == nil {
+		queued.CreatedAt = existing.CreatedAt
+		queued.Attempts = existing.Attempts + 1
+	}
+	if err := writeQueuedRepoSemanticMemory(path, queued); err != nil {
+		return queuedRepoSemanticMemory{}, err
+	}
+	return queued, nil
+}
+
+func flushQueuedRepoSemanticMemories() (int, int, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return 0, 0, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	paths, err := queuedRepoSemanticMemoryPaths()
+	if err != nil {
+		return 0, 0, err
+	}
+	flushed := 0
+	failed := 0
+	for _, path := range paths {
+		queued, err := readQueuedRepoSemanticMemory(path)
+		if err != nil {
+			failed++
+			continue
+		}
+		if queued.Server != cfg.Server || queued.ActorID != cfg.ActorID {
+			continue
+		}
+		_, err = recordRepoSemanticMemory(queued.RepoPath, queued.CompletedWork, queued.Why, queued.Verification, queued.RemainingWork, queued.Files, queued.Stage, false)
+		if err == nil {
+			_ = os.Remove(path)
+			flushed++
+			continue
+		}
+		failed++
+		queued.Attempts++
+		queued.LastAttemptAt = time.Now().UTC()
+		queued.LastError = err.Error()
+		_ = writeQueuedRepoSemanticMemory(path, queued)
+	}
+	return flushed, failed, nil
+}
+
+func queuedRepoSemanticMemoryPaths() ([]string, error) {
+	dir := repoSemanticMemoryOutboxDir()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func queuedRepoSemanticMemoryPath(id string) string {
+	return filepath.Join(repoSemanticMemoryOutboxDir(), id+".json")
+}
+
+func readQueuedRepoSemanticMemory(path string) (queuedRepoSemanticMemory, error) {
+	var queued queuedRepoSemanticMemory
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return queued, err
+	}
+	return queued, json.Unmarshal(data, &queued)
+}
+
+func writeQueuedRepoSemanticMemory(path string, queued queuedRepoSemanticMemory) error {
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(queued, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func repoSemanticMemoryOutboxDir() string {
+	return filepath.Join(taskpilotHomeDir(), "outbox", "repo-semantic-memory")
+}
+
+func queueRepoCheckpoint(repoPath, source, reason string, cause error) (queuedRepoCheckpoint, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return queuedRepoCheckpoint{}, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	root, err := gitRoot(repoPath)
+	if err == nil {
+		repoPath = root
+	}
+	now := time.Now().UTC()
+	sum := sha256.Sum256([]byte(strings.Join([]string{cfg.Server, cfg.ActorID, filepath.Clean(repoPath), source, reason}, "\n")))
+	id := fmt.Sprintf("repo_checkpoint_%x", sum[:8])
+	queued := queuedRepoCheckpoint{
+		ID:            id,
+		Server:        cfg.Server,
+		ActorID:       cfg.ActorID,
+		RepoPath:      filepath.Clean(repoPath),
+		Source:        source,
+		Reason:        reason,
+		CreatedAt:     now,
+		LastAttemptAt: now,
+		Attempts:      1,
+		LastError:     cause.Error(),
+	}
+	path := queuedRepoCheckpointPath(id)
+	if existing, err := readQueuedRepoCheckpoint(path); err == nil {
+		queued.CreatedAt = existing.CreatedAt
+		queued.Attempts = existing.Attempts + 1
+	}
+	if err := writeQueuedRepoCheckpoint(path, queued); err != nil {
+		return queuedRepoCheckpoint{}, err
+	}
+	return queued, nil
+}
+
+func flushQueuedRepoCheckpoints() (int, int, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return 0, 0, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	paths, err := queuedRepoCheckpointPaths()
+	if err != nil {
+		return 0, 0, err
+	}
+	flushed := 0
+	failed := 0
+	for _, path := range paths {
+		queued, err := readQueuedRepoCheckpoint(path)
+		if err != nil {
+			failed++
+			continue
+		}
+		if queued.Server != cfg.Server || queued.ActorID != cfg.ActorID {
+			continue
+		}
+		_, err = checkpointRepoContextWithQueue(queued.RepoPath, queued.Source, queued.Reason, false)
+		if err == nil {
+			_ = os.Remove(path)
+			flushed++
+			continue
+		}
+		failed++
+		queued.Attempts++
+		queued.LastAttemptAt = time.Now().UTC()
+		queued.LastError = err.Error()
+		_ = writeQueuedRepoCheckpoint(path, queued)
+	}
+	return flushed, failed, nil
+}
+
+func queuedRepoCheckpointPaths() ([]string, error) {
+	dir := repoCheckpointOutboxDir()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func queuedRepoCheckpointPath(id string) string {
+	return filepath.Join(repoCheckpointOutboxDir(), id+".json")
+}
+
+func readQueuedRepoCheckpoint(path string) (queuedRepoCheckpoint, error) {
+	var queued queuedRepoCheckpoint
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return queued, err
+	}
+	return queued, json.Unmarshal(data, &queued)
+}
+
+func writeQueuedRepoCheckpoint(path string, queued queuedRepoCheckpoint) error {
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(queued, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func repoCheckpointOutboxDir() string {
+	return filepath.Join(taskpilotHomeDir(), "outbox", "repo-checkpoints")
 }
 
 type repoSemanticDraft struct {
@@ -6465,11 +7037,9 @@ func repoMemoryKey(activity repoActivity, taskID string, files []string) string 
 	if scope == "" {
 		scope = activity.Config.GitRoot
 	}
-	workspace := activity.Config.WorkspaceID
-	if workspace == "" {
-		workspace = "workspace"
-	}
-	return strings.Join([]string{"repo", scope, workspace, taskID, strings.Join(normalized, "|")}, "\x00")
+	raw := strings.Join([]string{"repo", scope, taskID, strings.Join(normalized, "\n")}, "\n")
+	sum := sha256.Sum256([]byte(raw))
+	return fmt.Sprintf("repo:%x", sum)
 }
 
 func normalizedMemoryFiles(files []string) []string {
