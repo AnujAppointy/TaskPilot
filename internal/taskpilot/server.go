@@ -553,13 +553,19 @@ func (s *Server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAppendContext(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Kind    string `json:"kind"`
-		Content string `json:"content"`
+		Kind       string   `json:"kind"`
+		Content    string   `json:"content"`
+		Source     string   `json:"source"`
+		Reason     string   `json:"reason"`
+		Confidence string   `json:"confidence"`
+		Files      []string `json:"files"`
+		MemoryKey  string   `json:"memory_key"`
+		Stage      string   `json:"stage"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	out, err := s.store.AppendContext(r.Context(), actorID(r), r.PathValue("id"), in.Kind, in.Content)
+	out, err := s.store.AppendContextWithLifecycle(r.Context(), actorID(r), r.PathValue("id"), in.Kind, in.Content, in.Source, in.Reason, in.Confidence, in.Files, in.MemoryKey, in.Stage)
 	writeResult(w, out, err)
 }
 

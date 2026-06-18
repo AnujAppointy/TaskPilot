@@ -80,6 +80,50 @@ func TestCompactContextEntriesDropsRepoDaemonNoise(t *testing.T) {
 	}
 }
 
+func TestCompactContextEntriesHidesSupersededMemory(t *testing.T) {
+	entries := []ContextEntry{
+		{Kind: "summary", Content: "Added futurescope.md with headings.", MemoryKey: "repo\x00task\x00futurescope.md", Stage: "superseded", SupersededBy: "ctx_2"},
+		{ID: "ctx_2", Kind: "summary", Content: "Completed: Added futurescope.md. Verification: read it back.", MemoryKey: "repo\x00task\x00futurescope.md", Stage: "final", Confidence: "agent_authored"},
+	}
+	got := compactContextEntries(entries, 10)
+	if len(got) != 1 {
+		t.Fatalf("expected one active compacted entry, got %+v", got)
+	}
+	if got[0].ID != "ctx_2" {
+		t.Fatalf("expected final active memory, got %+v", got[0])
+	}
+}
+
+func TestRepoCheckpointAlreadyRecordedAllowsMemoryUpgradeForSameFiles(t *testing.T) {
+	entries := []ContextEntry{
+		{Kind: "summary", Content: "Added futurescope.md with a brief future scope outline.", Source: "agent-hook", Reason: "session_end", Files: []string{"futurescope.md"}},
+	}
+	if repoCheckpointAlreadyRecorded(entries, []string{"futurescope.md"}, "Added futurescope.md and recorded the repo work checkpoint.", "file_change") {
+		t.Fatalf("same files with different content should pass through so lifecycle ranking can decide")
+	}
+}
+
+func TestRepoMemoryKeyNormalizesFileOrder(t *testing.T) {
+	activity := repoActivity{Config: repoEnableConfig{RepoID: "repo_1", WorkspaceID: "workspace_1"}}
+	a := repoMemoryKey(activity, "task_1", []string{"b.md", "a.md", "AGENTS.md"})
+	b := repoMemoryKey(activity, "task_1", []string{"a.md", "b.md"})
+	if a != b {
+		t.Fatalf("expected stable memory key across file order, got %q and %q", a, b)
+	}
+	if strings.Contains(a, "AGENTS.md") {
+		t.Fatalf("managed files should not be part of memory key: %q", a)
+	}
+}
+
+func TestSemanticMemoryContentIncludesStructuredFields(t *testing.T) {
+	got := semanticMemoryContent("Added futurescope.md", "separate future scope from core plan", "read file after writing", "none")
+	for _, want := range []string{"Completed: Added futurescope.md", "Why: separate future scope", "Verification: read file", "Remaining: none"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("semantic memory missing %q in %q", want, got)
+		}
+	}
+}
+
 func TestReadNewRunContextEntriesSurvivesRewrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "context.log")
 	seen := map[string]bool{}
@@ -317,6 +361,68 @@ func TestGitChangedFileSnapshotIgnoresTaskPilotMetadata(t *testing.T) {
 	}
 	if _, ok := got["app.go"]; !ok {
 		t.Fatalf("expected product file to be detected: %+v", got)
+	}
+}
+
+func TestDraftRepoSemanticSummaryUsesMarkdownHeadings(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# Readme\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "README.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.MkdirAll(filepath.Join(root, ".taskpilot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".taskpilot", "repo.json"), []byte(`{"repo_name":"testrepo"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := "# Future Scope\n\n## Goal\nExtend the game later.\n\n## Possible Next Steps\n- Add pause support.\n\n## Notes\nKeep changes small.\n"
+	if err := os.WriteFile(filepath.Join(root, "futurescope.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	draft, err := draftRepoSemanticSummary(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft.Status != "ok" || draft.Confidence != "metadata_inferred" {
+		t.Fatalf("unexpected draft state: %+v", draft)
+	}
+	if !strings.Contains(draft.Summary, "futurescope.md") || !strings.Contains(draft.Summary, "Future Scope") || !strings.Contains(draft.Summary, "Possible Next Steps") {
+		t.Fatalf("draft summary did not use markdown headings: %+v", draft)
+	}
+	if strings.Contains(draft.Summary, "Add pause support") {
+		t.Fatalf("draft summary leaked raw list content instead of headings only: %q", draft.Summary)
+	}
+}
+
+func TestDraftRepoSemanticSummaryNoopsForTaskPilotManagedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGitTestCommand(t, root, "init")
+	if err := os.MkdirAll(filepath.Join(root, ".taskpilot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".taskpilot", "repo.json"), []byte(`{"repo_name":"testrepo"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("# Agent Rules\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	draft, err := draftRepoSemanticSummary(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft.Status != "noop" {
+		t.Fatalf("expected noop for managed-only changes, got %+v", draft)
 	}
 }
 

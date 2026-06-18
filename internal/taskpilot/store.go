@@ -211,7 +211,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS context_entries (
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, author_id TEXT NOT NULL, kind TEXT NOT NULL,
-			content TEXT NOT NULL, created_at TEXT NOT NULL
+			content TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual', reason TEXT NOT NULL DEFAULT '',
+			confidence TEXT NOT NULL DEFAULT '', files_json TEXT NOT NULL DEFAULT '[]',
+			memory_key TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL DEFAULT 'active',
+			superseded_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS decision_records (
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, author_id TEXT NOT NULL,
@@ -316,6 +319,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN source TEXT NOT NULL DEFAULT 'generated_fallback'`)
 	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN validation_errors_json TEXT NOT NULL DEFAULT '[]'`)
 	_, _ = s.exec(ctx, `ALTER TABLE handoff_packets ADD COLUMN supporting_evidence_json TEXT NOT NULL DEFAULT '[]'`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN reason TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN confidence TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN files_json TEXT NOT NULL DEFAULT '[]'`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN memory_key TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN stage TEXT NOT NULL DEFAULT 'active'`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN superseded_by TEXT NOT NULL DEFAULT ''`)
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='published' WHERE status='ready' AND handoff_id IS NOT NULL AND handoff_id<>''`)
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='draft' WHERE status='ready' AND (handoff_id IS NULL OR handoff_id='')`)
 	if err := s.ensureDefaultProject(ctx); err != nil {
@@ -1352,6 +1362,18 @@ func (s *Store) listTaskDependencyRows(ctx context.Context, where, id string) ([
 }
 
 func (s *Store) AppendContext(ctx context.Context, actorID, taskID, kind, content string) (ContextEntry, error) {
+	return s.AppendContextWithMeta(ctx, actorID, taskID, kind, content, "", "", nil)
+}
+
+func (s *Store) AppendContextWithMeta(ctx context.Context, actorID, taskID, kind, content, source, reason string, files []string) (ContextEntry, error) {
+	return s.AppendContextWithConfidence(ctx, actorID, taskID, kind, content, source, reason, "", files)
+}
+
+func (s *Store) AppendContextWithConfidence(ctx context.Context, actorID, taskID, kind, content, source, reason, confidence string, files []string) (ContextEntry, error) {
+	return s.AppendContextWithLifecycle(ctx, actorID, taskID, kind, content, source, reason, confidence, files, "", "")
+}
+
+func (s *Store) AppendContextWithLifecycle(ctx context.Context, actorID, taskID, kind, content, source, reason, confidence string, files []string, memoryKey, stage string) (ContextEntry, error) {
 	if content == "" {
 		return ContextEntry{}, userErr("validation", "context content is required")
 	}
@@ -1364,30 +1386,129 @@ func (s *Store) AppendContext(ctx context.Context, actorID, taskID, kind, conten
 	if _, err := s.GetTask(ctx, taskID); err != nil {
 		return ContextEntry{}, err
 	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "manual"
+	}
+	if !oneOf(source, "manual", "taskpilot-run", "agent-hook", "daemon", "mcp", "ui") {
+		return ContextEntry{}, userErr("validation", "invalid context source")
+	}
+	reason = strings.TrimSpace(reason)
+	confidence = strings.TrimSpace(confidence)
+	if confidence != "" && !oneOf(confidence, "agent_authored", "metadata_inferred", "file_checkpoint") {
+		return ContextEntry{}, userErr("validation", "invalid context confidence")
+	}
+	files = cleanStrings(files)
+	memoryKey = strings.TrimSpace(memoryKey)
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		if memoryKey != "" {
+			stage = "working"
+		} else {
+			stage = "active"
+		}
+	}
+	if !oneOf(stage, "active", "working", "final", "superseded") {
+		return ContextEntry{}, userErr("validation", "invalid context stage")
+	}
+	if memoryKey == "" && stage == "superseded" {
+		return ContextEntry{}, userErr("validation", "superseded context requires a memory key")
+	}
+	if memoryKey != "" && stage != "superseded" {
+		if existing, ok, err := s.activeContextForMemoryKey(ctx, taskID, memoryKey); err != nil {
+			return ContextEntry{}, err
+		} else if ok {
+			newRank := contextMemoryRank(ContextEntry{Confidence: confidence, Stage: stage, Source: source})
+			oldRank := contextMemoryRank(existing)
+			if newRank > oldRank {
+				return existing, nil
+			}
+		}
+	}
 	now := time.Now().UTC()
-	c := ContextEntry{ID: newID("ctx"), TaskID: taskID, AuthorID: actorID, Kind: kind, Content: content, CreatedAt: now}
-	_, err := s.exec(ctx, `INSERT INTO context_entries (id,task_id,author_id,kind,content,created_at) VALUES (?,?,?,?,?,?)`,
-		c.ID, c.TaskID, c.AuthorID, c.Kind, c.Content, ts(c.CreatedAt))
+	c := ContextEntry{ID: newID("ctx"), TaskID: taskID, AuthorID: actorID, Kind: kind, Content: content, Source: source, Reason: reason, Confidence: confidence, Files: files, MemoryKey: memoryKey, Stage: stage, CreatedAt: now}
+	_, err := s.exec(ctx, `INSERT INTO context_entries (id,task_id,author_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.TaskID, c.AuthorID, c.Kind, c.Content, c.Source, c.Reason, c.Confidence, js(c.Files), c.MemoryKey, c.Stage, c.SupersededBy, ts(c.CreatedAt))
 	if err != nil {
 		return ContextEntry{}, err
+	}
+	if c.MemoryKey != "" && c.Stage != "superseded" {
+		if _, err := s.exec(ctx, `UPDATE context_entries SET stage='superseded', superseded_by=? WHERE task_id=? AND memory_key=? AND id<>? AND stage<>'superseded'`,
+			c.ID, c.TaskID, c.MemoryKey, c.ID); err != nil {
+			return ContextEntry{}, err
+		}
 	}
 	return c, s.addEvent(ctx, taskID, actorID, "context.appended", c)
 }
 
+func (s *Store) activeContextForMemoryKey(ctx context.Context, taskID, memoryKey string) (ContextEntry, bool, error) {
+	rows, err := s.query(ctx, `SELECT id,task_id,author_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at FROM context_entries WHERE task_id=? AND memory_key=? AND stage<>'superseded' ORDER BY created_at DESC LIMIT 1`, taskID, memoryKey)
+	if err != nil {
+		return ContextEntry{}, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return ContextEntry{}, false, rows.Err()
+	}
+	entry, err := scanContextEntry(rows)
+	if err != nil {
+		return ContextEntry{}, false, err
+	}
+	return entry, true, rows.Err()
+}
+
+type contextEntryScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanContextEntry(scanner contextEntryScanner) (ContextEntry, error) {
+	var c ContextEntry
+	var created, files string
+	if err := scanner.Scan(&c.ID, &c.TaskID, &c.AuthorID, &c.Kind, &c.Content, &c.Source, &c.Reason, &c.Confidence, &files, &c.MemoryKey, &c.Stage, &c.SupersededBy, &created); err != nil {
+		return ContextEntry{}, err
+	}
+	if c.Source == "" {
+		c.Source = "manual"
+	}
+	if c.Stage == "" {
+		c.Stage = "active"
+	}
+	fromJS(files, &c.Files)
+	c.CreatedAt = parseTS(created)
+	return c, nil
+}
+
+func contextMemoryRank(entry ContextEntry) int {
+	if entry.Confidence == "agent_authored" && entry.Stage == "final" {
+		return 0
+	}
+	if entry.Confidence == "agent_authored" {
+		return 1
+	}
+	if entry.Confidence == "metadata_inferred" {
+		return 2
+	}
+	if entry.Confidence == "file_checkpoint" {
+		return 3
+	}
+	if oneOf(entry.Source, "mcp", "agent-hook", "taskpilot-run", "ui", "manual") {
+		return 1
+	}
+	return 4
+}
+
 func (s *Store) ListContext(ctx context.Context, taskID string) ([]ContextEntry, error) {
-	rows, err := s.query(ctx, `SELECT id,task_id,author_id,kind,content,created_at FROM context_entries WHERE task_id=? ORDER BY created_at ASC`, taskID)
+	rows, err := s.query(ctx, `SELECT id,task_id,author_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at FROM context_entries WHERE task_id=? ORDER BY created_at ASC`, taskID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []ContextEntry{}
 	for rows.Next() {
-		var c ContextEntry
-		var created string
-		if err := rows.Scan(&c.ID, &c.TaskID, &c.AuthorID, &c.Kind, &c.Content, &created); err != nil {
+		c, err := scanContextEntry(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.CreatedAt = parseTS(created)
 		out = append(out, c)
 	}
 	return out, rows.Err()

@@ -110,12 +110,19 @@ type TaskDependency struct {
 }
 
 type ContextEntry struct {
-	ID        string    `json:"id"`
-	TaskID    string    `json:"task_id"`
-	AuthorID  string    `json:"author_id"`
-	Kind      string    `json:"kind"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	TaskID       string    `json:"task_id"`
+	AuthorID     string    `json:"author_id"`
+	Kind         string    `json:"kind"`
+	Content      string    `json:"content"`
+	Source       string    `json:"source,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+	Confidence   string    `json:"confidence,omitempty"`
+	Files        []string  `json:"files,omitempty"`
+	MemoryKey    string    `json:"memory_key,omitempty"`
+	Stage        string    `json:"stage,omitempty"`
+	SupersededBy string    `json:"superseded_by,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type DecisionRecord struct {

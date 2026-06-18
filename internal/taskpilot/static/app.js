@@ -584,6 +584,7 @@ function detailView() {
   const snapshots = Array.isArray(apiState.detail.snapshots) ? apiState.detail.snapshots : [];
   const latestSnapshot = apiState.detail.latest_snapshot;
   const handoffPacket = apiState.detail.handoff_packet;
+  const contextEntries = Array.isArray(apiState.detail.context) ? apiState.detail.context : [];
   const events = visibleTimelineEvents(Array.isArray(apiState.detail.events) ? apiState.detail.events : []);
   const subtasks = Array.isArray(apiState.detail.subtasks) ? apiState.detail.subtasks : [];
   const dependencies = Array.isArray(apiState.detail.dependencies) ? apiState.detail.dependencies : [];
@@ -603,7 +604,7 @@ function detailView() {
         parent ? h("span", { class: "linkish", onclick: () => selectTask(parent.id) }, `Parent: ${parent.title}`) : null,
         h("span", {}, `Scope: ${(task.scope || []).join(", ") || "none"}`)
       ),
-      taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots),
+      taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots, contextEntries),
       section("Subtasks", subtasks.map(subtaskItem)),
       section("Blocked By", dependencies.map(dependencyItem)),
       section("Blocking", dependents.map(dependentItem)),
@@ -640,7 +641,7 @@ function lockItem(l) {
   );
 }
 
-function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
+function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots, contextEntries) {
   const packetTimeline = handoffPacket && handoffPacket.packet && Array.isArray(handoffPacket.packet.handoff_timeline) ? handoffPacket.packet.handoff_timeline : [];
   const packetIsWeak = handoffPacket && Array.isArray(handoffPacket.validation_errors) && handoffPacket.validation_errors.length && !packetTimeline.length;
   const snapshotIsNewer = handoffPacket && latestSnapshot && new Date(latestSnapshot.updated_at || latestSnapshot.created_at) > new Date(handoffPacket.updated_at || handoffPacket.created_at);
@@ -668,6 +669,12 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
       render();
     }
   };
+  const addMemory = async () => {
+    const content = prompt("Add a concise sanitized memory entry for this task:");
+    if (!content) return;
+    await api(`/api/tasks/${task.id}/context`, { method: "POST", body: JSON.stringify({ kind: "summary", content, source: "ui", reason: "manual" }) });
+    await refresh();
+  };
   const saveMarkdown = async () => {
     apiState.memoryError = "";
     try {
@@ -687,12 +694,14 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
     h("strong", {}, `${s.snapshot_type} · ${s.status_at_time}`),
     h("p", { class: "meta" }, `${new Date(s.created_at).toLocaleString()} · ${s.source_context_ids ? s.source_context_ids.length : 0} context items`)
   ));
+  const recentContextItems = usefulRecentContextEntries(contextEntries).slice(0, 8).map(contextItem);
   const validationItems = handoffPacket && Array.isArray(handoffPacket.validation_errors) ? handoffPacket.validation_errors : [];
   const evidenceItems = handoffPacket && Array.isArray(handoffPacket.supporting_evidence) ? handoffPacket.supporting_evidence : [];
   return h("div", { class: "section task-memory" },
     h("div", { class: "item-head" },
       h("div", {}, h("h3", {}, "Task Memory"), h("p", { class: "meta" }, source)),
       canWrite() ? h("div", { class: "button-row" },
+        h("button", { onclick: addMemory }, "Add Memory"),
         h("button", { onclick: async () => { apiState.memoryMode = "snapshot"; await api(`/api/tasks/${task.id}/snapshots`, { method: "POST", body: JSON.stringify({ snapshot_type: "manual" }) }); await refresh(); } }, "Generate Snapshot"),
         h("button", { onclick: showRecentHandoff }, "Show Recent Handoff"),
         apiState.memoryMode !== "auto" ? h("button", { onclick: () => { apiState.memoryMode = "auto"; apiState.memoryError = ""; render(); } }, "Show Best Memory") : null,
@@ -705,6 +714,10 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
         } }, "Delete Memory")
       ) : null
     ),
+    recentContextItems.length ? h("div", { class: "recent-memory" },
+      h("h4", {}, "Recent Memory"),
+      recentContextItems
+    ) : null,
     h("pre", { class: "markdown-doc" }, markdown),
     validationItems.length ? h("div", { class: "error-box" },
       h("strong", {}, "Handoff needs stronger content before publish:"),
@@ -724,6 +737,34 @@ function taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots) {
     ) : null,
     snapshotItems.length ? h("details", {}, h("summary", {}, "Recent snapshots"), h("div", { class: "snapshot-list" }, snapshotItems)) : null
   );
+}
+
+function usefulRecentContextEntries(entries) {
+  return (entries || [])
+    .filter(e => e && e.content && e.stage !== "superseded" && !/taskpilot daemon captured live uncommitted repo activity|taskpilot inferred this task from repo activity/i.test(e.content))
+    .slice()
+    .sort((a, b) => contextConfidenceRank(a) - contextConfidenceRank(b) || new Date(b.created_at) - new Date(a.created_at));
+}
+
+function contextItem(entry) {
+  const source = entry.source || "manual";
+  const confidence = entry.confidence ? ` · ${entry.confidence.replaceAll("_", " ")}` : "";
+  const stage = entry.stage && entry.stage !== "active" ? ` · ${entry.stage}` : "";
+  const files = Array.isArray(entry.files) && entry.files.length ? ` · ${entry.files.slice(0, 4).join(", ")}` : "";
+  const reason = entry.reason ? ` · ${entry.reason}` : "";
+  return h("div", { class: "mini-card" },
+    h("strong", {}, `${entry.kind || "note"} · ${source}${confidence}${stage}${reason}`),
+    h("p", {}, entry.content),
+    h("p", { class: "meta" }, `${new Date(entry.created_at).toLocaleString()}${files}`)
+  );
+}
+
+function contextConfidenceRank(entry) {
+  if (entry.confidence === "agent_authored" && entry.stage === "final") return 0;
+  if (entry.confidence === "agent_authored") return 1;
+  if (entry.confidence === "metadata_inferred") return 2;
+  if (entry.confidence === "file_checkpoint") return 3;
+  return ["mcp", "agent-hook", "taskpilot-run", "ui", "manual"].includes(entry.source || "") ? 1 : 4;
 }
 
 function handoffPacketShouldRefreshFromMemory(packet, latestSnapshot) {
@@ -888,7 +929,7 @@ function section(title, content) {
 }
 
 function visibleTimelineEvents(events) {
-  const hidden = new Set(["context.appended", "task.heartbeat"]);
+  const hidden = new Set(["task.heartbeat"]);
   return events.filter(e => !hidden.has(e.event_type)).slice(-80);
 }
 

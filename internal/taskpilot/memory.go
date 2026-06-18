@@ -145,6 +145,9 @@ func buildHandoffPacketContent(detail TaskDetail, snapshots []ContextSnapshot) (
 	latestHandoff := latestHandoffForTimeline(detail.Handoffs)
 	nextFromContext := []string{}
 	for _, entry := range detail.Context {
+		if entry.Stage == "superseded" {
+			continue
+		}
 		if isNoisyContext(entry.Content) {
 			continue
 		}
@@ -922,6 +925,9 @@ func inferHandoffCurrentState(detail TaskDetail) string {
 	}
 	for i := len(detail.Context) - 1; i >= 0; i-- {
 		entry := detail.Context[i]
+		if entry.Stage == "superseded" {
+			continue
+		}
 		if entry.Kind == "summary" && !isNoisyContext(entry.Content) {
 			return strings.TrimSpace(entry.Content)
 		}
@@ -1397,6 +1403,9 @@ type timeFloor struct {
 func entriesBetween(entries []ContextEntry, start timeFloor, end time.Time) []ContextEntry {
 	out := []ContextEntry{}
 	for _, entry := range entries {
+		if entry.Stage == "superseded" {
+			continue
+		}
 		if start.ok && !entry.CreatedAt.After(start.t) {
 			continue
 		}

@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -152,6 +153,7 @@ Bootstrap:
   taskpilot status
   taskpilot project create --name "Appointy Backend"
   taskpilot repo create --project <project-id> --name appointy-api --path /path/to/repo
+  taskpilot repo repair --repo . --dry-run
   taskpilot workspace create --project <project-id> --name "Anuj Mac" --actor <actor-id>
 
 Agent CLI:
@@ -163,6 +165,7 @@ Agent CLI:
   taskpilot task claim <task-id>
   taskpilot lock acquire <task-id> --scope "src/auth/*"
   taskpilot context append <task-id> --kind decision --content "Keep response shape stable"
+  taskpilot context checkpoint --repo . --source agent-hook --reason manual
   taskpilot decision add <task-id> --decision "Keep response shape stable" --reason "Existing clients depend on it"
   taskpilot comment add <task-id> --body "Please review edge cases before merge"
   taskpilot context render --repo . --format codex
@@ -312,6 +315,7 @@ type jsonHookAdapter struct {
 	hookRel    string
 	format     string
 	jsonPath   string
+	finalPaths []string
 	extraNote  string
 	supported  bool
 	entryLabel string
@@ -601,6 +605,7 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 		_ = request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/locks", map[string]any{"scope": file, "scope_type": "file"}, &lock)
 	}
 	if signature != state.LastSignature {
+		_, _ = checkpointRepoContext(activity.Config.GitRoot, "daemon", "file_change")
 		state.LastSignature = signature
 	}
 	return nil
@@ -919,7 +924,7 @@ func gitChangedFileSnapshotIn(root string) map[string]gitFileState {
 func isTaskPilotManagedRepoFile(path string) bool {
 	path = strings.TrimPrefix(filepath.ToSlash(filepath.Clean(path)), "./")
 	switch path {
-	case "AGENTS.md", "CLAUDE.md", "GEMINI.md":
+	case "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".taskpilot", ".claude", ".codex", ".gemini":
 		return true
 	}
 	for _, prefix := range []string{".taskpilot/", ".claude/", ".codex/", ".gemini/"} {
@@ -1055,16 +1060,43 @@ func uninstallDaemonAutoStart() DaemonInstallResult {
 
 func daemonDoctor() DaemonHealth {
 	reg, _ := loadDaemonRegistry()
+	var health DaemonHealth
 	switch runtime.GOOS {
 	case "darwin":
-		return doctorDaemonLaunchd(reg.Repos)
+		health = doctorDaemonLaunchd(reg.Repos)
 	case "windows":
-		return doctorDaemonWindowsTask(reg.Repos)
+		health = doctorDaemonWindowsTask(reg.Repos)
 	case "linux":
-		return doctorDaemonSystemd(reg.Repos)
+		health = doctorDaemonSystemd(reg.Repos)
 	default:
-		return DaemonHealth{Method: runtime.GOOS, ServiceName: daemonServiceName(), Installed: false, Running: false, Status: "unsupported", LogPath: repoDaemonLogPath(), EnabledRepos: reg.Repos, Message: "daemon auto-start is not supported on this platform"}
+		health = DaemonHealth{Method: runtime.GOOS, ServiceName: daemonServiceName(), Installed: false, Running: false, Status: "unsupported", LogPath: repoDaemonLogPath(), EnabledRepos: reg.Repos, Message: "daemon auto-start is not supported on this platform"}
 	}
+	if msg := gitRepoDoctorMessage(reg.Repos); msg != "" {
+		if health.Message != "" {
+			health.Message += "; " + msg
+		} else {
+			health.Message = msg
+		}
+	}
+	return health
+}
+
+func gitRepoDoctorMessage(repos []string) string {
+	for _, repo := range repos {
+		repo = strings.TrimSpace(repo)
+		if repo == "" {
+			continue
+		}
+		out, err := exec.Command("git", "-C", repo, "status", "--porcelain").CombinedOutput()
+		if err == nil {
+			continue
+		}
+		text := strings.ToLower(string(out) + " " + err.Error())
+		if strings.Contains(text, "dubious ownership") || strings.Contains(text, "safe.directory") {
+			return "Git safe.directory is blocking repo capture for " + repo + "; run `git config --global --add safe.directory " + repo + "`"
+		}
+	}
+	return ""
 }
 
 func currentExecutablePath() (string, error) {
@@ -1416,9 +1448,9 @@ func writeHookScripts(cfg repoEnableConfig) error {
 
 func agentAdapters() []AgentAdapter {
 	return []AgentAdapter{
-		jsonHookAdapter{name: "claude", binary: "claude", configRel: ".claude/settings.json", hookRel: ".taskpilot/hooks/claude-session-start", format: "claude", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
-		jsonHookAdapter{name: "codex", binary: "codex", configRel: ".codex/hooks.json", hookRel: ".taskpilot/hooks/codex-session-start", format: "codex", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
-		jsonHookAdapter{name: "gemini", binary: "gemini", configRel: ".gemini/settings.json", hookRel: ".taskpilot/hooks/gemini-session-start", format: "gemini", jsonPath: "hooks.SessionStart", supported: true, extraNote: "Gemini hook output is limited to bounded TaskPilot context."},
+		jsonHookAdapter{name: "claude", binary: "claude", configRel: ".claude/settings.json", hookRel: ".taskpilot/hooks/claude-session-start", format: "claude", jsonPath: "hooks.SessionStart", finalPaths: []string{"hooks.SessionEnd"}, supported: true, extraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
+		jsonHookAdapter{name: "codex", binary: "codex", configRel: ".codex/hooks.json", hookRel: ".taskpilot/hooks/codex-session-start", format: "codex", jsonPath: "hooks.SessionStart", finalPaths: []string{"hooks.SessionEnd"}, supported: true, extraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
+		jsonHookAdapter{name: "gemini", binary: "gemini", configRel: ".gemini/settings.json", hookRel: ".taskpilot/hooks/gemini-session-start", format: "gemini", jsonPath: "hooks.SessionStart", finalPaths: []string{"hooks.SessionEnd"}, supported: true, extraNote: "Gemini hook output is limited to bounded TaskPilot context."},
 	}
 }
 
@@ -1502,33 +1534,57 @@ func (a jsonHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConf
 		result.ManualFallback = a.ManualInstructions(repo)
 		return result
 	}
+	finalChanged := false
+	for _, path := range a.finalPaths {
+		finalResult, err := mergeSessionStartHookJSON(detection.ConfigPath, path, SessionStartHook{Type: "command", Command: a.finalCommand()}, dryRun)
+		if err != nil {
+			result.Status = "error"
+			result.Message = err.Error()
+			result.ManualFallback = a.ManualInstructions(repo)
+			return result
+		}
+		finalChanged = finalChanged || finalResult.Changed
+		if result.BackupPath == "" {
+			result.BackupPath = finalResult.BackupPath
+		}
+	}
+	writeResult.Changed = writeResult.Changed || finalChanged
 	result.Changed = writeResult.Changed
-	result.BackupPath = writeResult.BackupPath
+	if result.BackupPath == "" {
+		result.BackupPath = writeResult.BackupPath
+	}
 	if dryRun {
 		result.Status = "dry_run"
 		if writeResult.Changed {
-			result.Message = fmt.Sprintf("would register %s session-start hook in %s", a.name, a.configRel)
+			result.Message = fmt.Sprintf("would register %s session hooks in %s", a.name, a.configRel)
 		} else {
-			result.Message = fmt.Sprintf("%s session-start hook already registered in %s", a.name, a.configRel)
+			result.Message = fmt.Sprintf("%s session hooks already registered in %s", a.name, a.configRel)
 		}
 		return result
 	}
 	if writeResult.Changed {
 		result.Status = "configured"
-		result.Message = fmt.Sprintf("registered %s session-start hook in %s", a.name, a.configRel)
+		result.Message = fmt.Sprintf("registered %s session hooks in %s", a.name, a.configRel)
 		if a.extraNote != "" {
 			result.Message += "; " + a.extraNote
 		}
 		return result
 	}
 	result.Status = "already_configured"
-	result.Message = fmt.Sprintf("%s session-start hook already registered in %s", a.name, a.configRel)
+	result.Message = fmt.Sprintf("%s session hooks already registered in %s", a.name, a.configRel)
 	return result
 }
 
 func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 	detection := a.Detect(repo)
 	registered := jsonConfigHasHookCommand(detection.ConfigPath, a.jsonPath, a.command())
+	finalRegistered := len(a.finalPaths) == 0
+	for _, path := range a.finalPaths {
+		if jsonConfigHasHookCommand(detection.ConfigPath, path, a.finalCommand()) {
+			finalRegistered = true
+			break
+		}
+	}
 	legacyRegistered := false
 	for _, legacy := range a.legacyCommands() {
 		if jsonConfigHasHookCommand(detection.ConfigPath, a.jsonPath, legacy) {
@@ -1544,6 +1600,9 @@ func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 	} else if !registered {
 		status = "not_registered"
 		msg = "run `taskpilot agent configure " + a.name + "`"
+	} else if !finalRegistered {
+		status = "partial"
+		msg = "session-start hook is registered, but memory checkpoint hook is missing; run `taskpilot agent configure " + a.name + "`"
 	} else if !detection.Installed {
 		status = "agent_not_on_path"
 		msg = "hook is registered, but the agent binary was not found on PATH"
@@ -1552,7 +1611,7 @@ func (a jsonHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
 }
 
 func (a jsonHookAdapter) ManualInstructions(repo repoEnableConfig) string {
-	return fmt.Sprintf("Manual setup for %s: add a session-start command hook to %s that runs %s.", a.name, filepath.Join(repo.GitRoot, a.configRel), a.command())
+	return fmt.Sprintf("Manual setup for %s: add a session-start command hook to %s that runs %s, and a session-end hook that runs %s.", a.name, filepath.Join(repo.GitRoot, a.configRel), a.command(), a.finalCommand())
 }
 
 func (a jsonHookAdapter) command() string {
@@ -1561,6 +1620,10 @@ func (a jsonHookAdapter) command() string {
 		format = "markdown"
 	}
 	return "taskpilot context render --repo . --format " + format
+}
+
+func (a jsonHookAdapter) finalCommand() string {
+	return "taskpilot context checkpoint --repo . --source agent-hook --reason session_end"
 }
 
 func (a jsonHookAdapter) legacyCommands() []string {
@@ -1836,7 +1899,7 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		"## TaskPilot Live Repo Context",
 		"",
 		"Use this shared context before planning or editing. Do not upload raw source files, prompts, logs, secrets, screenshots, or customer data.",
-		"After meaningful work, record a concise sanitized summary, decision, blocker, risk, or next step with TaskPilot so the next agent sees what changed, not just which files changed.",
+		"After meaningful work, prefer structured memory via MCP `record_repo_semantic_memory` with completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context checkpoint --repo . --source agent-hook --reason manual`.",
 		"",
 		fmt.Sprintf("- Repo: %s", ctx.Repo.RepoName),
 		fmt.Sprintf("- Branch: %s", fallbackText(ctx.Branch, "unknown")),
@@ -1957,9 +2020,34 @@ func recentRepoMemory(tasks []Task) ([]ContextEntry, []DecisionRecord) {
 			break
 		}
 	}
-	sort.Slice(contextEntries, func(i, j int) bool { return contextEntries[i].CreatedAt.After(contextEntries[j].CreatedAt) })
+	sort.Slice(contextEntries, func(i, j int) bool {
+		ri, rj := contextConfidenceRank(contextEntries[i]), contextConfidenceRank(contextEntries[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return contextEntries[i].CreatedAt.After(contextEntries[j].CreatedAt)
+	})
 	sort.Slice(decisions, func(i, j int) bool { return decisions[i].CreatedAt.After(decisions[j].CreatedAt) })
 	return contextEntries, decisions
+}
+
+func contextConfidenceRank(entry ContextEntry) int {
+	if entry.Confidence == "agent_authored" && entry.Stage == "final" {
+		return 0
+	}
+	switch entry.Confidence {
+	case "agent_authored":
+		return 1
+	case "metadata_inferred":
+		return 2
+	case "file_checkpoint":
+		return 3
+	default:
+		if oneOf(entry.Source, "mcp", "agent-hook", "taskpilot-run", "ui", "manual") {
+			return 1
+		}
+		return 4
+	}
 }
 
 func updateLiveContextFiles(cfg repoEnableConfig, rendered string) error {
@@ -2241,8 +2329,22 @@ func runAgentCommand(args []string) error {
 }
 
 func appendRunContext(taskID, kind, content string) error {
+	return appendContextWithMeta(taskID, kind, content, "taskpilot-run", "", nil)
+}
+
+func appendContextWithMeta(taskID, kind, content, source, reason string, files []string) error {
 	var out ContextEntry
-	return request("POST", "/api/tasks/"+taskID+"/context", map[string]any{"kind": kind, "content": content}, &out)
+	body := map[string]any{"kind": kind, "content": content}
+	if strings.TrimSpace(source) != "" {
+		body["source"] = source
+	}
+	if strings.TrimSpace(reason) != "" {
+		body["reason"] = reason
+	}
+	if len(files) > 0 {
+		body["files"] = files
+	}
+	return request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/context", body, &out)
 }
 
 func prepareRunHandoff(taskID, to, errText, changed string, imported int) (Handoff, error) {
@@ -3421,10 +3523,16 @@ func compactContextEntries(entries []ContextEntry, max int) []ContextEntry {
 	seen := map[string]bool{}
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
+		if entry.Stage == "superseded" {
+			continue
+		}
 		if isNoisyRunContext(entry.Content) {
 			continue
 		}
 		key := entry.Kind + "\x00" + strings.TrimSpace(entry.Content)
+		if entry.MemoryKey != "" {
+			key = "memory\x00" + entry.MemoryKey
+		}
 		if seen[key] {
 			continue
 		}
@@ -3959,7 +4067,8 @@ func mcpTools() []map[string]any {
 		mcpTool("get_current_repo_context", "Render current TaskPilot context for an enabled Git repo.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "format": mcpString("markdown or json, defaults to markdown")}, []string{}),
 		mcpTool("get_active_overlaps", "Return active or overlapping TaskPilot work for an enabled Git repo.", map[string]any{"repo": mcpString("Repo path, defaults to current directory")}, []string{}),
 		mcpTool("ensure_task_for_repo_session", "Find or create the TaskPilot task for current live repo activity.", map[string]any{"repo": mcpString("Repo path, defaults to current directory")}, []string{}),
-		mcpTool("record_repo_session_context", "Append sanitized context to the resolved current repo task.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content")}, []string{"content"}),
+		mcpTool("record_repo_session_context", "Append sanitized context to the resolved current repo task.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content"), "files": mcpStringArray("Related product files")}, []string{"content"}),
+		mcpTool("record_repo_semantic_memory", "Append structured semantic memory to the resolved current repo task.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "completed_work": mcpString("What changed or was completed"), "why": mcpString("Why it changed or important reasoning"), "verification": mcpString("Verification performed"), "remaining_work": mcpString("Remaining work or next step"), "files": mcpStringArray("Related product files"), "stage": mcpString("working or final, defaults to working")}, []string{"completed_work"}),
 		mcpTool("create_task", "Create a new TaskPilot task.", map[string]any{"title": mcpString("Task title"), "goal": mcpString("Task goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "parent_task_id": mcpString("Optional parent task ID"), "scope": mcpStringArray("Task scopes such as files, globs, artifacts, or semantic areas"), "requirements": mcpStringArray("Task requirements"), "completion_criteria": mcpStringArray("Completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers"), "privacy_level": mcpString("Privacy level, defaults to sanitized_context")}, []string{"title", "goal"}),
 		mcpTool("create_subtask", "Create a subtask under an existing TaskPilot task.", map[string]any{"parent_task_id": mcpString("Parent task ID"), "title": mcpString("Subtask title"), "goal": mcpString("Subtask goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "scope": mcpStringArray("Subtask scopes"), "requirements": mcpStringArray("Subtask requirements"), "completion_criteria": mcpStringArray("Subtask completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers")}, []string{"parent_task_id", "title", "goal"}),
 		mcpTool("add_dependency", "Add a dependency so one task is blocked by another task.", map[string]any{"task_id": mcpString("Task ID that is blocked"), "depends_on_id": mcpString("Task ID this task depends on")}, []string{"task_id", "depends_on_id"}),
@@ -3973,7 +4082,7 @@ func mcpTools() []map[string]any {
 		mcpTool("release_task", "Release ownership of a TaskPilot task.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("start_task_session", "Start a TaskPilot task session.", map[string]any{"task_id": mcpString("Task ID")}, []string{"task_id"}),
 		mcpTool("finish_task_session", "Finish a TaskPilot task session.", map[string]any{"task_id": mcpString("Task ID"), "session_id": mcpString("Session ID"), "exit_status": mcpString("Exit status such as success or failed"), "finish_reason": mcpString("Finish reason")}, []string{"task_id", "session_id"}),
-		mcpTool("append_context", "Append sanitized task context.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content")}, []string{"task_id", "content"}),
+		mcpTool("append_context", "Append sanitized task context.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content"), "files": mcpStringArray("Related product files")}, []string{"task_id", "content"}),
 		mcpTool("add_decision", "Add a first-class decision record to a task.", map[string]any{"task_id": mcpString("Task ID"), "decision": mcpString("Decision made"), "reason": mcpString("Reason for the decision"), "impact": mcpString("Impact of the decision"), "alternatives": mcpStringArray("Alternatives considered")}, []string{"task_id", "decision"}),
 		mcpTool("add_comment", "Add a comment to a task.", map[string]any{"task_id": mcpString("Task ID"), "body": mcpString("Comment body")}, []string{"task_id", "body"}),
 		mcpTool("add_artifact", "Attach an external artifact reference to a task.", map[string]any{"task_id": mcpString("Task ID"), "kind": mcpString("Artifact kind such as pr, doc, build, report, link"), "title": mcpString("Artifact title"), "uri": mcpString("Artifact URI"), "description": mcpString("Optional description"), "metadata": map[string]any{"type": "object", "description": "Optional metadata object"}}, []string{"task_id", "kind", "title", "uri"}),
@@ -4256,10 +4365,45 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			kind = "note"
 		}
 		var out ContextEntry
-		if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": kind, "content": content}, &out); err != nil {
+		files := mcpStringSliceArg(args, "files")
+		if len(files) == 0 {
+			files = activity.ChangedFiles
+		}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": kind, "content": content, "source": "mcp", "reason": "repo_session", "confidence": "agent_authored", "files": filterProductRepoFiles(files)}, &out); err != nil {
 			return nil, err
 		}
 		return mcpToolResult(map[string]any{"summary": "Recorded sanitized repo session context.", "task": task, "context": out}), nil
+	case "record_repo_semantic_memory":
+		repo := mcpArg(args, "repo")
+		if repo == "" {
+			repo = "."
+		}
+		completed, err := mcpRequireArg(args, "completed_work")
+		if err != nil {
+			return nil, err
+		}
+		activity, err := currentRepoActivity(repo)
+		if err != nil {
+			return nil, err
+		}
+		task, err := ensureTaskForRepoActivity(activity)
+		if err != nil {
+			return nil, err
+		}
+		files := filterProductRepoFiles(mcpStringSliceArg(args, "files"))
+		if len(files) == 0 {
+			files = filterProductRepoFiles(activity.ChangedFiles)
+		}
+		stage := strings.TrimSpace(mcpArg(args, "stage"))
+		if stage == "" {
+			stage = "working"
+		}
+		content := semanticMemoryContent(completed, mcpArg(args, "why"), mcpArg(args, "verification"), mcpArg(args, "remaining_work"))
+		var out ContextEntry
+		if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": "summary", "content": content, "source": "mcp", "reason": "semantic_memory", "confidence": "agent_authored", "files": files, "memory_key": repoMemoryKey(activity, task.ID, files), "stage": stage}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(map[string]any{"summary": "Recorded structured semantic repo memory.", "task": task, "context": out}), nil
 	case "create_task":
 		body, err := mcpTaskInput(args, false)
 		if err != nil {
@@ -4421,7 +4565,7 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if kind == "" {
 			kind = "note"
 		}
-		body := map[string]any{"kind": kind, "content": content}
+		body := map[string]any{"kind": kind, "content": content, "source": "mcp", "confidence": "agent_authored", "files": filterProductRepoFiles(mcpStringSliceArg(args, "files"))}
 		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/context", body, &out); err != nil {
 			return nil, err
 		}
@@ -5336,6 +5480,9 @@ func mcpFindBlockers(args map[string]any) (map[string]any, error) {
 			}
 		}
 		for _, entry := range detail.Context {
+			if entry.Stage == "superseded" {
+				continue
+			}
 			if entry.Kind == "blocker" && add(detail.Task, "context", entry.Content) {
 				return map[string]any{"summary": fmt.Sprintf("Found %d blockers.", len(records)), "records": records}, nil
 			}
@@ -5371,6 +5518,9 @@ func mcpFindOutputs(args map[string]any) (map[string]any, error) {
 	}
 	for _, detail := range details {
 		for _, entry := range detail.Context {
+			if entry.Stage == "superseded" {
+				continue
+			}
 			if entry.Kind == "output_ref" {
 				if add(map[string]any{"type": "context_output", "task_id": detail.Task.ID, "task_title": detail.Task.Title, "content": entry.Content}, entry.Content) {
 					return map[string]any{"summary": fmt.Sprintf("Found %d outputs.", len(records)), "records": records}, nil
@@ -5560,7 +5710,7 @@ func runProject(args []string) error {
 
 func runRepo(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot repo create|list")
+		return fmt.Errorf("usage: taskpilot repo create|list|repair")
 	}
 	switch args[0] {
 	case "create":
@@ -5590,9 +5740,63 @@ func runRepo(args []string) error {
 			return err
 		}
 		return print(out, *jsonOut)
+	case "repair":
+		fs := flag.NewFlagSet("repo repair", flag.ExitOnError)
+		repoPath := fs.String("repo", ".", "repo path")
+		dryRun := fs.Bool("dry-run", false, "show planned repairs without writing")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		out, err := repairRepoState(*repoPath, *dryRun)
+		if err != nil {
+			return err
+		}
+		return print(out, *jsonOut)
 	default:
 		return fmt.Errorf("unknown repo command %q", args[0])
 	}
+}
+
+func repairRepoState(repoPath string, dryRun bool) (map[string]any, error) {
+	activity, err := currentRepoActivity(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := tasksForRepo(activity.Config.RepoID, activity.Config.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	actions := []string{}
+	for _, task := range tasks {
+		cleanScope := filterProductRepoFiles(task.Scope)
+		patch := map[string]any{}
+		if !sameStringSet(cleanScope, task.Scope) {
+			patch["scope"] = cleanScope
+			actions = append(actions, "clean task scope "+task.ID)
+		}
+		if strings.HasPrefix(strings.ToLower(task.Title), "inferred work on") && len(cleanScope) > 0 {
+			patch["title"] = "Update " + strings.Join(limitStrings(cleanScope, 3), ", ")
+			actions = append(actions, "rename inferred task "+task.ID)
+		}
+		if len(patch) > 0 && !dryRun {
+			patch["reason"] = "repo repair removed TaskPilot-managed noise"
+			var updated Task
+			_ = request("PATCH", "/api/tasks/"+url.PathEscape(task.ID), patch, &updated)
+		}
+	}
+	locks, _, _ := mcpActiveLocks(map[string]any{"project_id": activity.Config.ProjectID, "limit": 500})
+	releasedLocks := 0
+	for _, lock := range locks {
+		if lock.TaskID == "" || !isTaskPilotManagedRepoFile(lock.Scope) {
+			continue
+		}
+		actions = append(actions, "release TaskPilot-managed lock "+lock.ID+" on "+lock.Scope)
+		releasedLocks++
+		if !dryRun {
+			var out Lock
+			_ = request("POST", "/api/locks/"+url.PathEscape(lock.ID)+"/release", map[string]any{"reason": "repo repair released TaskPilot-managed coordination file lock"}, &out)
+		}
+	}
+	return map[string]any{"status": "ok", "dry_run": dryRun, "repo": activity.Config.RepoID, "actions": actions, "released_locks": releasedLocks}, nil
 }
 
 func runWorkspace(args []string) error {
@@ -5884,9 +6088,10 @@ func runTask(args []string) error {
 
 func runContext(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: taskpilot context append|render")
+		return fmt.Errorf("usage: taskpilot context append|render|checkpoint|draft-summary")
 	}
-	if args[0] == "render" {
+	switch args[0] {
+	case "render":
 		fs := flag.NewFlagSet("context render", flag.ExitOnError)
 		repoPath := fs.String("repo", ".", "repo path")
 		format := fs.String("format", "markdown", "markdown, codex, claude, gemini, or json")
@@ -5901,6 +6106,36 @@ func runContext(args []string) error {
 		}
 		fmt.Println(rendered)
 		return nil
+	case "checkpoint":
+		fs := flag.NewFlagSet("context checkpoint", flag.ExitOnError)
+		repoPath := fs.String("repo", ".", "repo path")
+		source := fs.String("source", "manual", "memory source: manual, agent-hook, daemon, mcp, ui")
+		reason := fs.String("reason", "manual", "checkpoint reason")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		out, err := checkpointRepoContext(*repoPath, *source, *reason)
+		if err != nil {
+			return err
+		}
+		return print(out, *jsonOut)
+	case "draft-summary":
+		fs := flag.NewFlagSet("context draft-summary", flag.ExitOnError)
+		repoPath := fs.String("repo", ".", "repo path")
+		format := fs.String("format", "markdown", "markdown or json")
+		_ = fs.Parse(args[1:])
+		draft, err := draftRepoSemanticSummary(*repoPath)
+		if err != nil {
+			return err
+		}
+		if strings.EqualFold(*format, "json") {
+			return print(draft, true)
+		}
+		if draft.Status == "noop" {
+			fmt.Println("No product file changes detected.")
+			return nil
+		}
+		fmt.Println(draft.Summary)
+		return nil
 	}
 	if args[0] != "append" || len(args) < 2 {
 		return fmt.Errorf("usage: taskpilot context append <task-id> --kind decision --content text")
@@ -5908,14 +6143,308 @@ func runContext(args []string) error {
 	fs := flag.NewFlagSet("context append", flag.ExitOnError)
 	kind := fs.String("kind", "note", "context kind")
 	content := fs.String("content", "", "content")
+	source := fs.String("source", "manual", "context source")
+	reason := fs.String("reason", "", "context reason")
+	confidence := fs.String("confidence", "", "agent_authored, metadata_inferred, or file_checkpoint")
+	files := fs.String("files", "", "comma-separated related files")
+	memoryKey := fs.String("memory-key", "", "stable memory key for compacted repo memory")
+	stage := fs.String("stage", "", "active, working, or final")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	id := args[1]
 	_ = fs.Parse(args[2:])
 	var out ContextEntry
-	if err := request("POST", "/api/tasks/"+id+"/context", map[string]any{"kind": *kind, "content": *content}, &out); err != nil {
+	if err := request("POST", "/api/tasks/"+url.PathEscape(id)+"/context", map[string]any{"kind": *kind, "content": *content, "source": *source, "reason": *reason, "confidence": *confidence, "files": splitCSV(*files), "memory_key": *memoryKey, "stage": *stage}, &out); err != nil {
 		return err
 	}
 	return print(out, *jsonOut)
+}
+
+func checkpointRepoContext(repoPath, source, reason string) (map[string]any, error) {
+	activity, err := currentRepoActivity(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	files := filterProductRepoFiles(activity.ChangedFiles)
+	if len(files) == 0 {
+		return map[string]any{"status": "noop", "reason": "no product file changes detected", "changed_files": files}, nil
+	}
+	task, err := ensureTaskForRepoActivity(activity)
+	if err != nil {
+		return nil, err
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "manual"
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "manual"
+	}
+	draft, _ := draftRepoSemanticSummary(activity.Config.GitRoot)
+	summary := repoCheckpointSummary(activity, files)
+	confidence := "file_checkpoint"
+	if strings.TrimSpace(draft.Summary) != "" && draft.Confidence == "metadata_inferred" {
+		summary = draft.Summary
+		confidence = draft.Confidence
+	}
+	stage := "working"
+	if reason == "session_end" {
+		stage = "final"
+	}
+	memoryKey := repoMemoryKey(activity, task.ID, files)
+	var detail TaskDetail
+	if err := request("GET", "/api/tasks/"+url.PathEscape(task.ID), nil, &detail); err == nil {
+		if repoCheckpointAlreadyRecorded(detail.Context, files, summary, reason) {
+			return map[string]any{"status": "noop", "reason": "checkpoint already recorded", "task": task, "changed_files": files}, nil
+		}
+	}
+	var entry ContextEntry
+	if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": "summary", "content": summary, "source": source, "reason": reason, "confidence": confidence, "files": files, "memory_key": memoryKey, "stage": stage}, &entry); err != nil {
+		return nil, err
+	}
+	return map[string]any{"status": "recorded", "task": task, "context": entry, "changed_files": files, "confidence": confidence, "memory_key": memoryKey, "stage": stage}, nil
+}
+
+type repoSemanticDraft struct {
+	Status     string                  `json:"status"`
+	Summary    string                  `json:"summary,omitempty"`
+	Confidence string                  `json:"confidence,omitempty"`
+	Files      []string                `json:"files,omitempty"`
+	Stats      map[string]repoDiffStat `json:"stats,omitempty"`
+	Headings   map[string][]string     `json:"headings,omitempty"`
+}
+
+type repoDiffStat struct {
+	Added   int    `json:"added"`
+	Deleted int    `json:"deleted"`
+	Status  string `json:"status,omitempty"`
+}
+
+func draftRepoSemanticSummary(repoPath string) (repoSemanticDraft, error) {
+	activity, err := currentRepoActivity(repoPath)
+	if err != nil {
+		return repoSemanticDraft{}, err
+	}
+	files := filterProductRepoFiles(activity.ChangedFiles)
+	if len(files) == 0 {
+		return repoSemanticDraft{Status: "noop", Confidence: "file_checkpoint", Files: files}, nil
+	}
+	stats := repoDiffStats(activity.Config.GitRoot, files)
+	headings := markdownHeadings(activity.Config.GitRoot, files)
+	summary := metadataSemanticSummary(activity, files, stats, headings)
+	confidence := "file_checkpoint"
+	if len(headings) > 0 || hasMeaningfulDiffStats(stats) {
+		confidence = "metadata_inferred"
+	}
+	return repoSemanticDraft{Status: "ok", Summary: summary, Confidence: confidence, Files: files, Stats: stats, Headings: headings}, nil
+}
+
+func metadataSemanticSummary(activity repoActivity, files []string, stats map[string]repoDiffStat, headings map[string][]string) string {
+	action := "Updated"
+	allAdded := len(files) > 0
+	for _, file := range files {
+		status := strings.TrimSpace(stats[file].Status)
+		if status != "??" && !strings.Contains(status, "A") {
+			allAdded = false
+			break
+		}
+	}
+	if allAdded {
+		action = "Added"
+	}
+	if len(files) == 1 {
+		file := redactSensitiveText(files[0])
+		if hs := headings[files[0]]; len(hs) > 0 {
+			return fmt.Sprintf("%s %s with sections covering %s.", action, file, strings.Join(limitStrings(hs, 6), ", "))
+		}
+		if st := stats[files[0]]; st.Added > 0 || st.Deleted > 0 {
+			return fmt.Sprintf("%s %s with %d line(s) added and %d removed.", action, file, st.Added, st.Deleted)
+		}
+		return fmt.Sprintf("%s %s and recorded the repo work checkpoint.", action, file)
+	}
+	parts := []string{}
+	for _, file := range limitStrings(files, 5) {
+		name := redactSensitiveText(file)
+		if hs := headings[file]; len(hs) > 0 {
+			parts = append(parts, name+" sections: "+strings.Join(limitStrings(hs, 3), ", "))
+		} else {
+			parts = append(parts, name)
+		}
+	}
+	return fmt.Sprintf("%s %d product files: %s.", action, len(files), strings.Join(parts, "; "))
+}
+
+func repoDiffStats(root string, files []string) map[string]repoDiffStat {
+	out := map[string]repoDiffStat{}
+	states := gitChangedFileSnapshotIn(root)
+	for _, file := range files {
+		out[file] = repoDiffStat{Status: strings.TrimSpace(states[file].Status)}
+	}
+	args := append([]string{"-C", root, "diff", "--numstat", "HEAD", "--"}, files...)
+	data, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return out
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		file := filepath.ToSlash(fields[len(fields)-1])
+		stat := out[file]
+		stat.Added = parseNumstatField(fields[0])
+		stat.Deleted = parseNumstatField(fields[1])
+		out[file] = stat
+	}
+	return out
+}
+
+func parseNumstatField(value string) int {
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func hasMeaningfulDiffStats(stats map[string]repoDiffStat) bool {
+	for _, stat := range stats {
+		if stat.Added > 0 || stat.Deleted > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func markdownHeadings(root string, files []string) map[string][]string {
+	out := map[string][]string{}
+	for _, file := range files {
+		if !strings.EqualFold(filepath.Ext(file), ".md") {
+			continue
+		}
+		path := filepath.Join(root, filepath.FromSlash(file))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		headings := []string{}
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if !strings.HasPrefix(line, "#") {
+				continue
+			}
+			heading := strings.TrimSpace(strings.TrimLeft(line, "#"))
+			if heading == "" || strings.Contains(heading, "TASKPILOT:") {
+				continue
+			}
+			headings = append(headings, redactSensitiveText(heading))
+			if len(headings) >= 8 {
+				break
+			}
+		}
+		if len(headings) > 0 {
+			out[file] = uniqueStrings(headings)
+		}
+	}
+	return out
+}
+
+func redactSensitiveText(value string) string {
+	value = regexp.MustCompile(`(?i)(password|secret|token|api[_-]?key|credential)[^\s,;:]*`).ReplaceAllString(value, "[redacted]")
+	value = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+`).ReplaceAllString(value, "${1}[redacted]")
+	return strings.TrimSpace(value)
+}
+
+func repoCheckpointSummary(activity repoActivity, files []string) string {
+	action := "Updated"
+	states := gitChangedFileSnapshotIn(activity.Config.GitRoot)
+	allAdded := len(files) > 0
+	for _, file := range files {
+		status := strings.TrimSpace(states[file].Status)
+		if status != "??" && !strings.Contains(status, "A") {
+			allAdded = false
+			break
+		}
+	}
+	if allAdded {
+		action = "Added"
+	}
+	if len(files) == 1 {
+		return fmt.Sprintf("%s %s and recorded the repo work checkpoint.", action, files[0])
+	}
+	return fmt.Sprintf("%s %s and recorded the repo work checkpoint.", action, strings.Join(limitStrings(files, 5), ", "))
+}
+
+func repoMemoryKey(activity repoActivity, taskID string, files []string) string {
+	normalized := normalizedMemoryFiles(files)
+	if len(normalized) == 0 {
+		normalized = []string{"repo"}
+	}
+	scope := activity.Config.RepoID
+	if scope == "" {
+		scope = activity.Config.RemoteURL
+	}
+	if scope == "" {
+		scope = activity.Config.GitRoot
+	}
+	workspace := activity.Config.WorkspaceID
+	if workspace == "" {
+		workspace = "workspace"
+	}
+	return strings.Join([]string{"repo", scope, workspace, taskID, strings.Join(normalized, "|")}, "\x00")
+}
+
+func normalizedMemoryFiles(files []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, file := range files {
+		file = strings.TrimPrefix(filepath.ToSlash(filepath.Clean(strings.TrimSpace(file))), "./")
+		if file == "." || file == "" || isTaskPilotManagedRepoFile(file) {
+			continue
+		}
+		if seen[file] {
+			continue
+		}
+		seen[file] = true
+		out = append(out, file)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func repoCheckpointAlreadyRecorded(entries []ContextEntry, files []string, summary, reason string) bool {
+	for i := len(entries) - 1; i >= 0 && i >= len(entries)-20; i-- {
+		entry := entries[i]
+		if entry.Stage == "superseded" {
+			continue
+		}
+		if isNoisyRunContext(entry.Content) {
+			continue
+		}
+		if strings.TrimSpace(entry.Content) == summary {
+			return true
+		}
+	}
+	return false
+}
+
+func semanticMemoryContent(completed, why, verification, remaining string) string {
+	parts := []string{}
+	if completed = strings.TrimSpace(completed); completed != "" {
+		parts = append(parts, "Completed: "+completed)
+	}
+	if why = strings.TrimSpace(why); why != "" {
+		parts = append(parts, "Why: "+why)
+	}
+	if verification = strings.TrimSpace(verification); verification != "" {
+		parts = append(parts, "Verification: "+verification)
+	}
+	if remaining = strings.TrimSpace(remaining); remaining != "" {
+		parts = append(parts, "Remaining: "+remaining)
+	}
+	return strings.Join(parts, " ")
 }
 
 func runDecision(args []string) error {

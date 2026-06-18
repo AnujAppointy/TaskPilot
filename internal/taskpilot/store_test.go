@@ -298,6 +298,93 @@ func TestProjectsRepositoriesWorkspacesAndTaskFiltering(t *testing.T) {
 	}
 }
 
+func TestAppendContextWithMetadata(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Memory", Goal: "Capture metadata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := s.AppendContextWithConfidence(ctx, a.ID, task.ID, "summary", "Updated futurescope.md", "agent-hook", "session_end", "agent_authored", []string{"futurescope.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Source != "agent-hook" || entry.Reason != "session_end" || entry.Confidence != "agent_authored" || len(entry.Files) != 1 || entry.Files[0] != "futurescope.md" {
+		t.Fatalf("metadata not preserved on append: %+v", entry)
+	}
+	entries, err := s.ListContext(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Source != "agent-hook" || entries[0].Reason != "session_end" || entries[0].Confidence != "agent_authored" || len(entries[0].Files) != 1 {
+		t.Fatalf("metadata not preserved on read: %+v", entries)
+	}
+}
+
+func TestAppendContextWithLifecycleSupersedesWeakerMemory(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Memory", Goal: "Compact repo memory"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Added futurescope.md with headings.", "daemon", "file_change", "metadata_inferred", []string{"futurescope.md"}, "repo\x00task\x00futurescope.md", "working")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Completed: Added futurescope.md. Why: separate future scope. Verification: read it back. Remaining: none.", "mcp", "semantic_memory", "agent_authored", []string{"futurescope.md"}, "repo\x00task\x00futurescope.md", "final")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("expected stronger memory to create a replacement entry")
+	}
+	entries, err := s.ListContext(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected history plus active memory, got %+v", entries)
+	}
+	if entries[0].Stage != "superseded" || entries[0].SupersededBy != second.ID {
+		t.Fatalf("weaker memory was not superseded: %+v", entries[0])
+	}
+	if entries[1].Stage != "final" || entries[1].Confidence != "agent_authored" {
+		t.Fatalf("stronger memory not preserved as final active memory: %+v", entries[1])
+	}
+}
+
+func TestAppendContextWithLifecycleRejectsWeakerReplacement(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Memory", Goal: "Protect repo memory"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "repo\x00task\x00planning.md"
+	strong, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Completed: Created planning.md. Verification: read it back.", "mcp", "semantic_memory", "agent_authored", []string{"planning.md"}, key, "final")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AppendContextWithLifecycle(ctx, a.ID, task.ID, "summary", "Updated planning.md with 2 line(s) added.", "daemon", "file_change", "metadata_inferred", []string{"planning.md"}, key, "working")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != strong.ID {
+		t.Fatalf("weaker memory should return existing stronger entry, got %+v want %+v", got, strong)
+	}
+	entries, err := s.ListContext(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Stage != "final" {
+		t.Fatalf("weaker replacement should not append or supersede: %+v", entries)
+	}
+}
+
 func TestSubtasksAndDependenciesBlockCompletion(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
