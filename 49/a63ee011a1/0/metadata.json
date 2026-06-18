@@ -1,0 +1,96 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "49a63ee011a1",
+  "session_id": "019ebbb9-f67c-7ff1-ab3d-c729b892cd5a",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-18T10:36:18.203359Z",
+  "branch": "main",
+  "checkpoints_count": 7,
+  "files_touched": [
+    "AGENTS.md",
+    "internal/taskpilot/cli.go",
+    "internal/taskpilot/cli_run_test.go",
+    "internal/taskpilot/memory.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.5",
+  "turn_id": "f402c4cb0d82",
+  "checkpoint_transcript_start": 2764,
+  "transcript_lines_at_start": 2764,
+  "token_usage": {
+    "input_tokens": 556695,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 5852800,
+    "output_tokens": 14640,
+    "api_call_count": 56
+  },
+  "session_metrics": {
+    "turn_count": 77
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-18T10:36:18.009653Z",
+    "agent_lines": 138,
+    "agent_removed": 5,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 138,
+    "total_lines_changed": 143,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 30,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        "AGENTS.md": 30
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 30,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 30,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 30,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 106,
+      "agent_lines_removed": 3
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 106,
+      "agent_lines_removed": 3
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 106,
+      "agent_lines_removed": 3
+    }
+  ]
+}
