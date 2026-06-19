@@ -661,7 +661,7 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 		return nil
 	}
 	signature := repoActivitySignature(activity)
-	task, err := ensureTaskForRepoActivity(activity)
+	task, err := ensureTaskForRepoActivityWithProxy(activity, false)
 	if err != nil {
 		return err
 	}
@@ -688,11 +688,15 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 }
 
 func ensureTaskForRepoActivity(activity repoActivity) (Task, error) {
-	if match, err := resolveRepoTask(activity); err == nil && match.Task.ID != "" && match.Score >= 80 {
+	return ensureTaskForRepoActivityWithProxy(activity, true)
+}
+
+func ensureTaskForRepoActivityWithProxy(activity repoActivity, allowProxy bool) (Task, error) {
+	if match, err := resolveRepoTaskWithProxy(activity, allowProxy); err == nil && match.Task.ID != "" && match.Score >= 80 {
 		mergedScope := appendUniqueStrings(filterProductRepoFiles(match.Task.Scope), activity.ChangedFiles...)
 		if !sameStringSet(mergedScope, match.Task.Scope) {
 			var updated Task
-			_ = request("PATCH", "/api/tasks/"+url.PathEscape(match.Task.ID), map[string]any{"scope": mergedScope, "reason": "Repo activity touched new product files"}, &updated)
+			_ = doRequestWithProxy("PATCH", "/api/tasks/"+url.PathEscape(match.Task.ID), map[string]any{"scope": mergedScope, "reason": "Repo activity touched new product files"}, &updated, true, allowProxy)
 			if updated.ID != "" {
 				return updated, nil
 			}
@@ -714,14 +718,18 @@ func ensureTaskForRepoActivity(activity repoActivity) (Task, error) {
 		Requirements: []string{"Replace this inferred title or goal once the exact user intent is known."},
 	}
 	var created Task
-	if err := request("POST", "/api/tasks", body, &created); err != nil {
+	if err := doRequestWithProxy("POST", "/api/tasks", body, &created, true, allowProxy); err != nil {
 		return Task{}, err
 	}
 	return created, nil
 }
 
 func resolveRepoTask(activity repoActivity) (repoTaskMatch, error) {
-	tasks, err := tasksForRepo(activity.Config.RepoID, activity.Config.ProjectID)
+	return resolveRepoTaskWithProxy(activity, true)
+}
+
+func resolveRepoTaskWithProxy(activity repoActivity, allowProxy bool) (repoTaskMatch, error) {
+	tasks, err := tasksForRepoWithProxy(activity.Config.RepoID, activity.Config.ProjectID, allowProxy)
 	if err != nil {
 		return repoTaskMatch{}, err
 	}
@@ -776,6 +784,10 @@ func tasksForProject(projectID string) ([]Task, error) {
 }
 
 func tasksForRepo(repoID, fallbackProjectID string) ([]Task, error) {
+	return tasksForRepoWithProxy(repoID, fallbackProjectID, true)
+}
+
+func tasksForRepoWithProxy(repoID, fallbackProjectID string, allowProxy bool) ([]Task, error) {
 	path := "/api/tasks"
 	if repoID != "" {
 		path += "?repo_id=" + url.QueryEscape(repoID)
@@ -783,7 +795,7 @@ func tasksForRepo(repoID, fallbackProjectID string) ([]Task, error) {
 		path += "?project_id=" + url.QueryEscape(fallbackProjectID)
 	}
 	var tasks []Task
-	err := request("GET", path, nil, &tasks)
+	err := doRequestWithProxy("GET", path, nil, &tasks, true, allowProxy)
 	return tasks, err
 }
 
@@ -2402,7 +2414,7 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		"## TaskPilot Live Repo Context",
 		"",
 		"Use this shared context before planning or editing. Do not upload raw source files, prompts, logs, secrets, screenshots, or customer data.",
-		"After meaningful work, record agent-authored memory before your final response. First use TaskPilot MCP `record_repo_semantic_memory` with completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context record-semantic --repo . --completed-work \"...\" --why \"...\" --verification \"...\" --remaining-work \"...\" --files path1,path2`.",
+		"After meaningful work, record agent-authored memory before your final response and do not move on until TaskPilot returns `recorded` or `queued`. First use TaskPilot MCP `record_repo_semantic_memory` with completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context record-semantic --repo . --completed-work \"...\" --why \"...\" --verification \"...\" --remaining-work \"...\" --files path1,path2`. A `queued` result is success: the daemon will flush it.",
 		"",
 		fmt.Sprintf("- Repo: %s", ctx.Repo.RepoName),
 		fmt.Sprintf("- Branch: %s", fallbackText(ctx.Branch, "unknown")),
@@ -6622,8 +6634,9 @@ func runTask(args []string) error {
 }
 
 func runContext(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: taskpilot context append|render|checkpoint|draft-summary|record-semantic")
+	if len(args) < 1 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		fmt.Println(contextUsage())
+		return nil
 	}
 	switch args[0] {
 	case "render":
@@ -6708,6 +6721,22 @@ func runContext(args []string) error {
 		return err
 	}
 	return print(out, *jsonOut)
+}
+
+func contextUsage() string {
+	return strings.TrimSpace(`usage: taskpilot context <command>
+
+Commands:
+  render           Render repo startup context for agents.
+  record-semantic  Record or queue agent-authored semantic memory for the active repo task.
+  checkpoint       Record or queue a metadata-inferred repo checkpoint.
+  draft-summary    Preview the local privacy-safe semantic draft.
+  append           Append context to an explicit task ID.
+
+Agent semantic memory fallback:
+  taskpilot context record-semantic --repo . --completed-work "..." --why "..." --verification "..." --remaining-work "..." --files path1,path2
+
+Success is either status=recorded or status=queued. Queued memory is flushed by the TaskPilot daemon.`)
 }
 
 func checkpointRepoContext(repoPath, source, reason string) (map[string]any, error) {
@@ -6924,7 +6953,7 @@ func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining 
 	if err != nil {
 		return nil, err
 	}
-	task, err := ensureTaskForRepoActivity(activity)
+	task, err := ensureTaskForRepoActivityWithProxy(activity, false)
 	if err != nil {
 		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, source, err, queueOnRetriable); ok {
 			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; semantic memory queued locally for daemon retry", "queued_memory": queued}, queueErr
@@ -6942,7 +6971,7 @@ func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining 
 	content := semanticMemoryContent(completed, why, verification, remaining)
 	var entry ContextEntry
 	body := map[string]any{"kind": "summary", "content": content, "source": source, "reason": "semantic_memory", "confidence": "agent_authored", "files": files, "memory_key": repoMemoryKey(activity, task.ID, files), "stage": stage}
-	if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", body, &entry); err != nil {
+	if err := requestNoProxy("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", body, &entry); err != nil {
 		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, source, err, queueOnRetriable); ok {
 			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; semantic memory queued locally for daemon retry", "queued_memory": queued, "task": task}, queueErr
 		}
@@ -7922,11 +7951,15 @@ func runHandoff(args []string) error {
 }
 
 func request(method, path string, body any, out any) error {
-	return doRequest(method, path, body, out, true)
+	return doRequestWithProxy(method, path, body, out, true, true)
 }
 
 func requestNoActor(method, path string, body any, out any) error {
-	return doRequest(method, path, body, out, false)
+	return doRequestWithProxy(method, path, body, out, false, true)
+}
+
+func requestNoProxy(method, path string, body any, out any) error {
+	return doRequestWithProxy(method, path, body, out, true, false)
 }
 
 func taskRunOwnershipError(taskID string, cfg Config, detail TaskDetail, cause error) error {
@@ -7952,11 +7985,15 @@ func taskRunOwnershipError(taskID string, cfg Config, detail TaskDetail, cause e
 }
 
 func doRequest(method, path string, body any, out any, includeActor bool) error {
+	return doRequestWithProxy(method, path, body, out, includeActor, true)
+}
+
+func doRequestWithProxy(method, path string, body any, out any, includeActor bool, allowProxy bool) error {
 	var bodyBytes []byte
 	if body != nil {
 		bodyBytes, _ = json.Marshal(body)
 	}
-	data, err := doRequestBytes(method, path, bodyBytes, includeActor, true)
+	data, err := doRequestBytes(method, path, bodyBytes, includeActor, allowProxy)
 	if err != nil {
 		return err
 	}
@@ -8002,10 +8039,11 @@ func doRequestBytesWithConfig(cfg Config, method, path string, bodyBytes []byte,
 	if includeActor && cfg.ActorSecret != "" {
 		req.Header.Set("X-Actor-Secret", cfg.ActorSecret)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: taskPilotHTTPTimeout()}
+	resp, err := client.Do(req)
 	if err != nil {
 		var netErr net.Error
-		if errors.As(err, &netErr) || strings.Contains(err.Error(), "connect: connection refused") || strings.Contains(err.Error(), "operation not permitted") {
+		if errors.As(err, &netErr) || os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "connect: connection refused") || strings.Contains(err.Error(), "operation not permitted") {
 			return nil, retriableRequestError{err: fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080` and check `taskpilot config set-server`", cfg.Server)}
 		}
 		return nil, err
@@ -8029,6 +8067,15 @@ func doRequestBytesWithConfig(cfg Config, method, path string, bodyBytes []byte,
 		return nil, err
 	}
 	return data, nil
+}
+
+func taskPilotHTTPTimeout() time.Duration {
+	if value := strings.TrimSpace(os.Getenv("TASKPILOT_HTTP_TIMEOUT")); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil && duration > 0 {
+			return duration
+		}
+	}
+	return 8 * time.Second
 }
 
 func apiErrorMessage(ae APIError) string {

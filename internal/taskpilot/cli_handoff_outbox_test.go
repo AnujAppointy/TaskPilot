@@ -354,6 +354,76 @@ func TestAPIRequestOutboxFallsBackToRepoLocalAndFlushes(t *testing.T) {
 	}
 }
 
+func TestRecordRepoSemanticMemoryQueuesWithoutAPIProxyWait(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(home, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "controls.md"), []byte("# Controls\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "controls.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "controls.md"), []byte("# Controls\n\n- Use arrow keys.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(Config{Server: "http://127.0.0.1:1", ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	blockGlobalRepoOutbox(t)
+
+	result, err := recordRepoSemanticMemory(root, "Added controls guidance.", "Document keyboard input.", "Read controls.md after editing.", "None.", []string{"controls.md"}, "working", "agent-hook", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["status"] != "queued" {
+		t.Fatalf("expected semantic memory to queue when server is unreachable, got %+v", result)
+	}
+	paths, err := queuedRepoSemanticMemoryPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected one repo semantic memory item, got %v", paths)
+	}
+	apiPaths, err := queuedAPIRequestPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apiPaths) != 0 {
+		t.Fatalf("semantic memory should not wait through API proxy queue, got API requests %v", apiPaths)
+	}
+}
+
+func TestTaskPilotHTTPTimeoutIsRetriable(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	t.Setenv("TASKPILOT_HTTP_TIMEOUT", "20ms")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode([]Task{})
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var tasks []Task
+	err := request("GET", "/api/tasks", nil, &tasks)
+	if !isRetriableRequestError(err) {
+		t.Fatalf("expected timeout to be retriable, got %v", err)
+	}
+}
+
 func TestFlushQueuedHandoffCheckpointsSendsAndDeletesOutboxItem(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
