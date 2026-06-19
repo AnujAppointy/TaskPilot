@@ -101,6 +101,29 @@ type queuedRepoSemanticMemory struct {
 	LastError     string    `json:"last_error,omitempty"`
 }
 
+type queuedAPIRequest struct {
+	ID            string          `json:"id"`
+	Server        string          `json:"server"`
+	ActorID       string          `json:"actor_id"`
+	Method        string          `json:"method"`
+	Path          string          `json:"path"`
+	Body          json.RawMessage `json:"body,omitempty"`
+	IncludeActor  bool            `json:"include_actor"`
+	CreatedAt     time.Time       `json:"created_at"`
+	LastAttemptAt time.Time       `json:"last_attempt_at,omitempty"`
+	Attempts      int             `json:"attempts"`
+	LastError     string          `json:"last_error,omitempty"`
+	QueuePath     string          `json:"queue_path,omitempty"`
+}
+
+type queuedAPIResponse struct {
+	ID          string          `json:"id"`
+	Status      string          `json:"status"`
+	Body        json.RawMessage `json:"body,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	CompletedAt time.Time       `json:"completed_at"`
+}
+
 type handoffSyncOptions struct {
 	Watch       bool
 	Interval    time.Duration
@@ -598,6 +621,7 @@ func runDaemonLoop(interval time.Duration, once bool) error {
 		if err != nil {
 			return err
 		}
+		_, _, _ = flushQueuedAPIRequests(reg.Repos...)
 		_, _, _ = flushQueuedRepoSemanticMemories(reg.Repos...)
 		_, _, _ = flushQueuedRepoCheckpoints(reg.Repos...)
 		for _, repo := range reg.Repos {
@@ -896,6 +920,9 @@ func gitRoot(path string) (string, error) {
 	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
 	out, err := cmd.Output()
 	if err != nil {
+		if root, fallbackErr := taskPilotRepoRoot(path); fallbackErr == nil {
+			return root, nil
+		}
 		return "", fmt.Errorf("not inside a Git repo; run this from a real Git repository")
 	}
 	root := strings.TrimSpace(string(out))
@@ -903,6 +930,31 @@ func gitRoot(path string) (string, error) {
 		return "", fmt.Errorf("could not detect Git root")
 	}
 	return filepath.Clean(root), nil
+}
+
+func taskPilotRepoRoot(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		path = "."
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err == nil && !info.IsDir() {
+		abs = filepath.Dir(abs)
+	}
+	for {
+		if _, err := os.Stat(repoConfigPath(abs)); err == nil {
+			return filepath.Clean(abs), nil
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			break
+		}
+		abs = parent
+	}
+	return "", fmt.Errorf("repo is not TaskPilot-enabled")
 }
 
 func gitRemote(root string) string {
@@ -6662,6 +6714,203 @@ func checkpointRepoContext(repoPath, source, reason string) (map[string]any, err
 	return checkpointRepoContextWithQueue(repoPath, source, reason, true)
 }
 
+func doRequestViaDaemonProxy(cfg Config, method, path string, body []byte, includeActor bool) ([]byte, error) {
+	if strings.TrimSpace(os.Getenv("TASKPILOT_DISABLE_REQUEST_PROXY")) != "" {
+		return nil, fmt.Errorf("TaskPilot request proxy disabled")
+	}
+	queued, responsePath, err := queueAPIRequest(cfg, method, path, body, includeActor)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(apiRequestProxyTimeout())
+	for time.Now().Before(deadline) {
+		response, err := readQueuedAPIResponse(responsePath)
+		if err == nil {
+			_ = os.Remove(responsePath)
+			if response.Status == "ok" {
+				return response.Body, nil
+			}
+			if strings.TrimSpace(response.Error) != "" {
+				return nil, errors.New(response.Error)
+			}
+			return nil, fmt.Errorf("TaskPilot daemon request %s failed without an error message", queued.ID)
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("TaskPilot daemon request %s timed out waiting for local daemon response", queued.ID)
+}
+
+func apiRequestProxyTimeout() time.Duration {
+	if value := strings.TrimSpace(os.Getenv("TASKPILOT_REQUEST_PROXY_TIMEOUT")); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil && duration > 0 {
+			return duration
+		}
+	}
+	return 20 * time.Second
+}
+
+func queueAPIRequest(cfg Config, method, path string, body []byte, includeActor bool) (queuedAPIRequest, string, error) {
+	root, err := taskPilotRepoRoot(".")
+	if err != nil {
+		return queuedAPIRequest{}, "", fmt.Errorf("TaskPilot request proxy requires a TaskPilot-enabled repo: %w", err)
+	}
+	now := time.Now().UTC()
+	seed := fmt.Sprintf("%s\n%s\n%s\n%s\n%d", cfg.Server, cfg.ActorID, method, path, now.UnixNano())
+	sum := sha256.Sum256(append([]byte(seed), body...))
+	id := fmt.Sprintf("api_request_%x", sum[:8])
+	queued := queuedAPIRequest{
+		ID:            id,
+		Server:        cfg.Server,
+		ActorID:       cfg.ActorID,
+		Method:        method,
+		Path:          path,
+		Body:          append([]byte(nil), body...),
+		IncludeActor:  includeActor,
+		CreatedAt:     now,
+		LastAttemptAt: now,
+		Attempts:      1,
+	}
+	paths := queuedAPIRequestCandidatePaths(root, id)
+	queued, err = writeQueuedAPIRequestFirstWritable(paths, queued)
+	if err != nil {
+		return queuedAPIRequest{}, "", err
+	}
+	return queued, queuedAPIResponsePathForRequestPath(queued.QueuePath), nil
+}
+
+func flushQueuedAPIRequests(repoPaths ...string) (int, int, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return 0, 0, err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	paths, err := queuedAPIRequestPaths(repoPaths...)
+	if err != nil {
+		return 0, 0, err
+	}
+	flushed := 0
+	failed := 0
+	for _, path := range paths {
+		queued, err := readQueuedAPIRequest(path)
+		if err != nil {
+			failed++
+			continue
+		}
+		if queued.Server != cfg.Server || queued.ActorID != cfg.ActorID {
+			continue
+		}
+		body, err := doRequestBytes(queued.Method, queued.Path, queued.Body, queued.IncludeActor, false)
+		response := queuedAPIResponse{ID: queued.ID, Status: "ok", CompletedAt: time.Now().UTC()}
+		if err != nil {
+			response.Status = "error"
+			response.Error = err.Error()
+			failed++
+			queued.Attempts++
+			queued.LastAttemptAt = time.Now().UTC()
+			queued.LastError = err.Error()
+			_ = writeQueuedAPIRequest(path, queued)
+		} else {
+			response.Body = body
+			flushed++
+			_ = os.Remove(path)
+		}
+		if writeErr := writeQueuedAPIResponse(queuedAPIResponsePathForRequestPath(path), response); writeErr != nil && err == nil {
+			failed++
+			flushed--
+		}
+	}
+	return flushed, failed, nil
+}
+
+func queuedAPIRequestPaths(repoPaths ...string) ([]string, error) {
+	return queuedJSONPaths(apiRequestOutboxDirs(repoPaths...)...)
+}
+
+func queuedAPIRequestCandidatePaths(repoPath, id string) []string {
+	paths := []string{}
+	for _, dir := range apiRequestOutboxDirs(repoPath) {
+		paths = append(paths, filepath.Join(dir, id+".json"))
+	}
+	return uniqueStrings(paths)
+}
+
+func readQueuedAPIRequest(path string) (queuedAPIRequest, error) {
+	var queued queuedAPIRequest
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return queued, err
+	}
+	return queued, json.Unmarshal(data, &queued)
+}
+
+func writeQueuedAPIRequest(path string, queued queuedAPIRequest) error {
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(queued, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func writeQueuedAPIRequestFirstWritable(paths []string, queued queuedAPIRequest) (queuedAPIRequest, error) {
+	var errs []error
+	for _, path := range uniqueStrings(paths) {
+		next := queued
+		next.QueuePath = path
+		if err := writeQueuedAPIRequest(path, next); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", path, err))
+			continue
+		}
+		return next, nil
+	}
+	return queuedAPIRequest{}, errors.Join(errs...)
+}
+
+func readQueuedAPIResponse(path string) (queuedAPIResponse, error) {
+	var response queuedAPIResponse
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return response, err
+	}
+	return response, json.Unmarshal(data, &response)
+}
+
+func writeQueuedAPIResponse(path string, response queuedAPIResponse) error {
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, _ := json.MarshalIndent(response, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func queuedAPIResponsePathForRequestPath(path string) string {
+	return filepath.Join(filepath.Dir(filepath.Dir(path)), "api-responses", filepath.Base(path))
+}
+
+func apiRequestOutboxDirs(repoPaths ...string) []string {
+	dirs := []string{}
+	for _, repoPath := range repoPaths {
+		root := repoOutboxRoot(repoPath)
+		if root == "" {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(root, ".taskpilot", "outbox", "api-requests"))
+	}
+	return uniqueStrings(dirs)
+}
+
 func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining string, files []string, stage, source string, queueOnRetriable bool) (map[string]any, error) {
 	completed = strings.TrimSpace(completed)
 	if completed == "" {
@@ -7703,21 +7952,48 @@ func taskRunOwnershipError(taskID string, cfg Config, detail TaskDetail, cause e
 }
 
 func doRequest(method, path string, body any, out any, includeActor bool) error {
-	cfg, err := loadConfig()
+	var bodyBytes []byte
+	if body != nil {
+		bodyBytes, _ = json.Marshal(body)
+	}
+	data, err := doRequestBytes(method, path, bodyBytes, includeActor, true)
 	if err != nil {
 		return err
+	}
+	if out != nil {
+		return json.Unmarshal(data, out)
+	}
+	return nil
+}
+
+func doRequestBytes(method, path string, bodyBytes []byte, includeActor bool, allowProxy bool) ([]byte, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Server == "" {
 		cfg.Server = "http://127.0.0.1:8080"
 	}
+	data, err := doRequestBytesWithConfig(cfg, method, path, bodyBytes, includeActor)
+	if err != nil {
+		if allowProxy && isRetriableRequestError(err) {
+			if proxied, proxyErr := doRequestViaDaemonProxy(cfg, method, path, bodyBytes, includeActor); proxyErr == nil {
+				return proxied, nil
+			}
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+func doRequestBytesWithConfig(cfg Config, method, path string, bodyBytes []byte, includeActor bool) ([]byte, error) {
 	var reader io.Reader
-	if body != nil {
-		b, _ := json.Marshal(body)
-		reader = bytes.NewReader(b)
+	if bodyBytes != nil {
+		reader = bytes.NewReader(bodyBytes)
 	}
 	req, err := http.NewRequest(method, strings.TrimRight(cfg.Server, "/")+path, reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if includeActor && cfg.ActorID != "" {
@@ -7730,9 +8006,9 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 	if err != nil {
 		var netErr net.Error
 		if errors.As(err, &netErr) || strings.Contains(err.Error(), "connect: connection refused") || strings.Contains(err.Error(), "operation not permitted") {
-			return retriableRequestError{err: fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080` and check `taskpilot config set-server`", cfg.Server)}
+			return nil, retriableRequestError{err: fmt.Errorf("cannot reach TaskPilot server at %s; start it with `taskpilot serve --addr 127.0.0.1:8080` and check `taskpilot config set-server`", cfg.Server)}
 		}
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
@@ -7742,20 +8018,17 @@ func doRequest(method, path string, body any, out any, includeActor bool) error 
 		if json.Unmarshal(data, &ae) == nil && ae.Message != "" {
 			err := fmt.Errorf("%s: %s", ae.Error, apiErrorMessage(ae))
 			if retriable {
-				return retriableRequestError{err: err}
+				return nil, retriableRequestError{err: err}
 			}
-			return err
+			return nil, err
 		}
 		err := fmt.Errorf("request failed: %s", resp.Status)
 		if retriable {
-			return retriableRequestError{err: err}
+			return nil, retriableRequestError{err: err}
 		}
-		return err
+		return nil, err
 	}
-	if out != nil {
-		return json.Unmarshal(data, out)
-	}
-	return nil
+	return data, nil
 }
 
 func apiErrorMessage(ae APIError) string {

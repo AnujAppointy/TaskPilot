@@ -176,6 +176,24 @@ func TestLoadConfigAppliesEnvironmentOverridesWithoutChangingFileConfig(t *testi
 	}
 }
 
+func TestGitRootFallsBackToTaskPilotRepoConfig(t *testing.T) {
+	root := t.TempDir()
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "docs", "notes")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := gitRoot(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Clean(root) {
+		t.Fatalf("expected TaskPilot repo root fallback %q, got %q", filepath.Clean(root), got)
+	}
+}
+
 func TestEnsureCodexTaskPilotMCPConfigWritesConfigEnv(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(dir, "codex"))

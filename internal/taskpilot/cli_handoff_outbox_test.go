@@ -291,6 +291,69 @@ func TestRepoCheckpointOutboxFallsBackToRepoLocal(t *testing.T) {
 	}
 }
 
+func TestAPIRequestOutboxFallsBackToRepoLocalAndFlushes(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(home, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldwd) }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/api/tasks" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		if r.Header.Get("X-Actor-ID") != "actor_1" || r.Header.Get("X-Actor-Secret") != "secret" {
+			t.Fatalf("actor headers not preserved")
+		}
+		_ = json.NewEncoder(w).Encode([]Task{{ID: "task_1", Title: "proxied task"}})
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	blockGlobalRepoOutbox(t)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, responsePath, err := queueAPIRequest(cfg, "GET", "/api/tasks", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSuffix := filepath.Join(".taskpilot", "outbox", "api-requests")
+	if !strings.HasSuffix(filepath.Dir(queued.QueuePath), localSuffix) {
+		t.Fatalf("expected repo-local API request path ending in %s, got %s", localSuffix, queued.QueuePath)
+	}
+	flushed, failed, err := flushQueuedAPIRequests(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flushed != 1 || failed != 0 {
+		t.Fatalf("expected API request to flush, flushed=%d failed=%d", flushed, failed)
+	}
+	response, err := readQueuedAPIResponse(responsePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "ok" || !strings.Contains(string(response.Body), "proxied task") {
+		t.Fatalf("unexpected API proxy response: %+v body=%s", response, string(response.Body))
+	}
+}
+
 func TestFlushQueuedHandoffCheckpointsSendsAndDeletesOutboxItem(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
