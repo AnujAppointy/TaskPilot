@@ -1,0 +1,14 @@
+# Files mentioned by the user:
+
+## ───────────────────────────────────────────╮ │ >_ OpenAI Codex (v0.134.0) │ │ │…: /Users/appointy/.codex/attachments/ff0287fd-da24-4c2c-9c4f-23ee72c8f075/pasted-text.txt
+
+## >_ OpenAI Codex (v0.130.0) │ │ │ │ model: gpt-5.4-mini low /model to change │ │…: /Users/appointy/.codex/attachments/21cadaf1-6040-46bf-a6c2-5fef252ea054/pasted-text.txt
+
+## My request for Codex:
+after the updates of mcp as you see the mac laptop send the context to the server and also u can see that windows laptop gets that as the context , but as you see a issue came from the windows side that it cant be able to send the context as semantic writes by agent and also u can see that inside the agent environment the taskpilots command failures are coming like "Ran taskpilot task list --json
+  └ cannot reach TaskPilot server at https://taskpilot-production-ca6b.up.railway.app; start it with `taskpilot serve --addr 127.0.0.1:8080` and check
+    `taskpilot config set-server` "      and bcz of that the agent environment has no acces of the full power of the taskpilot features, taskpilot should be easily be accesible by the agent environment in both mac and windows , this server issue for the taskpilot commands should be resolved by the fix
+
+---
+
+what is the issue before such that agent is not able to call the server in the taskpilot commands
