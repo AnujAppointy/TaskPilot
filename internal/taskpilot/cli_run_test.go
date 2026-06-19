@@ -2,6 +2,7 @@ package taskpilot
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,6 +140,122 @@ command = "other"
 	again, changed := ensureTomlTableKey(updated, "mcp_servers.taskpilot.tools.record_repo_semantic_memory", "approval_mode", `"approve"`)
 	if changed || again != updated {
 		t.Fatalf("expected second merge to be idempotent")
+	}
+}
+
+func TestLoadConfigAppliesEnvironmentOverridesWithoutChangingFileConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	if err := saveConfig(Config{Server: "http://file-server", Email: "dev@example.com", ActorID: "actor_file", ActorSecret: "secret_file"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TASKPILOT_SERVER", "http://env-server/")
+	t.Setenv("TASKPILOT_ACTOR_ID", "actor_env")
+	t.Setenv("TASKPILOT_ACTOR_SECRET", "secret_env")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server != "http://env-server" || cfg.ActorID != "actor_env" || cfg.ActorSecret != "secret_env" || cfg.Email != "dev@example.com" {
+		t.Fatalf("expected effective env overrides, got %+v", cfg)
+	}
+	fileCfg, err := loadConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileCfg.Server != "http://file-server" || fileCfg.ActorID != "actor_file" || fileCfg.ActorSecret != "secret_file" {
+		t.Fatalf("file config should not be changed by env overrides, got %+v", fileCfg)
+	}
+	diag, err := loadConfigDiagnostics(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diag.EnvOverrideActive || diag.Sources["server"] != "env:TASKPILOT_SERVER" || diag.Sources["actor_id"] != "env:TASKPILOT_ACTOR_ID" || diag.Sources["actor_secret"] != "env:TASKPILOT_ACTOR_SECRET" {
+		t.Fatalf("expected effective diagnostics to show env sources, got %+v", diag)
+	}
+}
+
+func TestEnsureCodexTaskPilotMCPConfigWritesConfigEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(dir, "codex"))
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "taskpilot", "config.json"))
+
+	result, err := ensureCodexTaskPilotMCPConfig(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed {
+		t.Fatalf("expected fresh Codex MCP config to change")
+	}
+	data, err := os.ReadFile(codexConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	configPath, ok := tomlStringKey(text, "mcp_servers.taskpilot.env", "TASKPILOT_CONFIG")
+	if !ok || configPath != taskPilotConfigEnvPath() {
+		t.Fatalf("expected TASKPILOT_CONFIG env to be written, got ok=%t path=%q text=\n%s", ok, configPath, text)
+	}
+	args, ok := tomlStringArrayKey(text, "mcp_servers.taskpilot", "args")
+	if !ok || len(args) != 2 || args[0] != "mcp" || args[1] != "serve" {
+		t.Fatalf("expected MCP args to be configured, got ok=%t args=%v", ok, args)
+	}
+	again, err := ensureCodexTaskPilotMCPConfig(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Changed {
+		t.Fatalf("expected second configure to be idempotent")
+	}
+}
+
+func TestCodexTaskPilotMCPHealthRequiresConfigEnvAndProbesToolList(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(dir, "codex"))
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "taskpilot", "config.json"))
+	oldProbe := probeCodexTaskPilotMCP
+	defer func() { probeCodexTaskPilotMCP = oldProbe }()
+	var probedEnv map[string]string
+	probeCodexTaskPilotMCP = func(command string, args []string, env map[string]string) error {
+		probedEnv = env
+		return nil
+	}
+
+	if _, err := ensureCodexTaskPilotMCPConfig(false); err != nil {
+		t.Fatal(err)
+	}
+	health := codexTaskPilotMCPHealth()
+	if !health.OK {
+		t.Fatalf("expected MCP health ok, got %+v", health)
+	}
+	if probedEnv["TASKPILOT_CONFIG"] != taskPilotConfigEnvPath() {
+		t.Fatalf("expected probe env to include config path, got %+v", probedEnv)
+	}
+
+	command := codexTaskPilotCommand()
+	broken := fmt.Sprintf(`[mcp_servers.taskpilot]
+command = %q
+args = ["mcp", "serve"]
+
+[mcp_servers.taskpilot.tools.record_repo_semantic_memory]
+approval_mode = "approve"
+
+[mcp_servers.taskpilot.tools.get_current_repo_context]
+approval_mode = "approve"
+
+[mcp_servers.taskpilot.tools.ensure_task_for_repo_session]
+approval_mode = "approve"
+
+[mcp_servers.taskpilot.tools.record_repo_session_context]
+approval_mode = "approve"
+`, command)
+	if err := os.WriteFile(codexConfigPath(), []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	health = codexTaskPilotMCPHealth()
+	if health.OK || !strings.Contains(health.Message, "TASKPILOT_CONFIG") {
+		t.Fatalf("expected missing TASKPILOT_CONFIG env to fail health, got %+v", health)
 	}
 }
 

@@ -162,7 +162,7 @@ func TestFlushQueuedRepoSemanticMemorySendsAgentAuthoredContext(t *testing.T) {
 	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := queueRepoSemanticMemory(root, "Added two reason bullets to tech.md", "document stack rationale", "read tech.md after edit", "none", []string{"tech.md"}, "working", errors.New("previous network failure")); err != nil {
+	if _, err := queueRepoSemanticMemory(root, "Added two reason bullets to tech.md", "document stack rationale", "read tech.md after edit", "none", []string{"tech.md"}, "working", "mcp", errors.New("previous network failure")); err != nil {
 		t.Fatal(err)
 	}
 	flushed, failed, err := flushQueuedRepoSemanticMemories()
@@ -172,11 +172,122 @@ func TestFlushQueuedRepoSemanticMemorySendsAgentAuthoredContext(t *testing.T) {
 	if flushed != 1 || failed != 0 {
 		t.Fatalf("expected queued semantic memory to flush, flushed=%d failed=%d", flushed, failed)
 	}
-	if gotBody["confidence"] != "agent_authored" || gotBody["reason"] != "semantic_memory" {
+	if gotBody["confidence"] != "agent_authored" || gotBody["reason"] != "semantic_memory" || gotBody["source"] != "mcp" {
 		t.Fatalf("expected agent-authored semantic body, got %+v", gotBody)
 	}
 	if content, _ := gotBody["content"].(string); !strings.Contains(content, "Added two reason bullets") || !strings.Contains(content, "Verification: read tech.md") {
 		t.Fatalf("semantic content not preserved: %+v", gotBody)
+	}
+}
+
+func TestRepoSemanticMemoryOutboxFallsBackToRepoLocalAndFlushes(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(home, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "tech.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "tech.md"), []byte("# Tech\n\n## Reason\nUse Canvas.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode([]Task{})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode(Task{ID: "task_1", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Update tech.md", Goal: "Coordinate tech.md", Status: "in_progress"})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks/task_1/context":
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(ContextEntry{ID: "ctx_1", TaskID: "task_1", Kind: "summary"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	blockGlobalRepoOutbox(t)
+
+	queued, err := queueRepoSemanticMemory(root, "Added one reason bullet to tech.md", "document stack rationale", "read tech.md after edit", "none", []string{"tech.md"}, "working", "agent-hook", errors.New("previous network failure"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	localDir := filepath.Join(queued.RepoPath, ".taskpilot", "outbox", "repo-semantic-memory")
+	if filepath.Dir(queued.QueuePath) != localDir {
+		t.Fatalf("expected repo-local semantic outbox path under %s, got %s", localDir, queued.QueuePath)
+	}
+	paths, err := queuedRepoSemanticMemoryPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != queued.QueuePath {
+		t.Fatalf("expected repo-local queued semantic memory path, got %v want %s", paths, queued.QueuePath)
+	}
+
+	flushed, failed, err := flushQueuedRepoSemanticMemories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flushed != 1 || failed != 0 {
+		t.Fatalf("expected repo-local semantic memory to flush, flushed=%d failed=%d", flushed, failed)
+	}
+	if gotBody["confidence"] != "agent_authored" || gotBody["reason"] != "semantic_memory" || gotBody["source"] != "agent-hook" {
+		t.Fatalf("expected agent-authored semantic body, got %+v", gotBody)
+	}
+	paths, err = queuedRepoSemanticMemoryPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("expected repo-local semantic outbox to be empty after flush, got %v", paths)
+	}
+}
+
+func TestRepoCheckpointOutboxFallsBackToRepoLocal(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(home, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	if err := saveConfig(Config{Server: "http://127.0.0.1:1", ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	blockGlobalRepoOutbox(t)
+
+	queued, err := queueRepoCheckpoint(root, "agent-hook", "manual", errors.New("previous network failure"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	localDir := filepath.Join(queued.RepoPath, ".taskpilot", "outbox", "repo-checkpoints")
+	if filepath.Dir(queued.QueuePath) != localDir {
+		t.Fatalf("expected repo-local checkpoint outbox path under %s, got %s", localDir, queued.QueuePath)
+	}
+	paths, err := queuedRepoCheckpointPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != queued.QueuePath {
+		t.Fatalf("expected repo-local queued checkpoint path, got %v want %s", paths, queued.QueuePath)
 	}
 }
 
@@ -357,4 +468,14 @@ The planning document is ready for review.
 ## Handoff Message
 planning.md is complete and verified.
 `
+}
+
+func blockGlobalRepoOutbox(t *testing.T) {
+	t.Helper()
+	if err := os.MkdirAll(taskpilotHomeDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskpilotHomeDir(), "outbox"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
