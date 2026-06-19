@@ -1,0 +1,49 @@
+{
+  "cli_version": "0.6.2",
+  "checkpoint_id": "0063d8918990",
+  "session_id": "019ebbb9-f67c-7ff1-ab3d-c729b892cd5a",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-19T09:50:53.669279Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "internal/taskpilot/cli.go",
+    "internal/taskpilot/cli_handoff_outbox_test.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.5",
+  "turn_id": "7d6eb8984566",
+  "checkpoint_transcript_start": 4789,
+  "transcript_lines_at_start": 4789,
+  "token_usage": {
+    "input_tokens": 142032,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 4258560,
+    "output_tokens": 13313,
+    "api_call_count": 38
+  },
+  "session_metrics": {
+    "turn_count": 94
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-19T09:50:53.405342Z",
+    "agent_lines": 133,
+    "agent_removed": 16,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 133,
+    "total_lines_changed": 149,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
