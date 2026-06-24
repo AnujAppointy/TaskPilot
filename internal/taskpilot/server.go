@@ -80,6 +80,8 @@ func (s *Server) routes() {
 	s.mux.Handle("DELETE /api/tasks/{id}/memory", s.requireScope("context:write", s.handleDeleteTaskMemory))
 	s.mux.Handle("POST /api/tasks/{id}/subtasks", s.requireScope("task:write", s.handleCreateSubtask))
 	s.mux.Handle("POST /api/tasks/{id}/dependencies", s.requireScope("task:write", s.handleAddDependency))
+	s.mux.Handle("POST /api/tasks/{id}/relationships", s.requireScope("task:write", s.handleAddRelationship))
+	s.mux.Handle("POST /api/tasks/{id}/intelligence-decisions", s.requireScope("context:write", s.handleRecordTaskIntelligenceDecision))
 	s.mux.Handle("POST /api/tasks/{id}/claim", s.requireScope("task:write", s.handleClaimTask))
 	s.mux.Handle("POST /api/tasks/{id}/release", s.requireScope("task:write", s.handleReleaseTask))
 	s.mux.Handle("POST /api/tasks/{id}/heartbeat", s.requireScope("task:write", s.handleHeartbeatTask))
@@ -499,6 +501,30 @@ func (s *Server) handleAddDependency(w http.ResponseWriter, r *http.Request) {
 	writeResult(w, out, err)
 }
 
+func (s *Server) handleAddRelationship(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		TargetTaskID string  `json:"target_task_id"`
+		Type         string  `json:"type"`
+		Reason       string  `json:"reason"`
+		Confidence   float64 `json:"confidence"`
+		Source       string  `json:"source"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.AddTaskRelationship(r.Context(), actorID(r), r.PathValue("id"), in.TargetTaskID, in.Type, in.Reason, in.Confidence, in.Source)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleRecordTaskIntelligenceDecision(w http.ResponseWriter, r *http.Request) {
+	var in TaskIntelligenceDecision
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.RecordTaskIntelligenceDecision(r.Context(), actorID(r), r.PathValue("id"), in)
+	writeResult(w, out, err)
+}
+
 func (s *Server) handleRemoveDependency(w http.ResponseWriter, r *http.Request) {
 	err := s.store.RemoveTaskDependency(r.Context(), actorID(r), r.PathValue("id"))
 	writeResult(w, map[string]string{"status": "ok"}, err)
@@ -553,19 +579,28 @@ func (s *Server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAppendContext(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Kind       string   `json:"kind"`
-		Content    string   `json:"content"`
-		Source     string   `json:"source"`
-		Reason     string   `json:"reason"`
-		Confidence string   `json:"confidence"`
-		Files      []string `json:"files"`
-		MemoryKey  string   `json:"memory_key"`
-		Stage      string   `json:"stage"`
+		Kind                 string                    `json:"kind"`
+		Content              string                    `json:"content"`
+		Source               string                    `json:"source"`
+		Reason               string                    `json:"reason"`
+		Confidence           string                    `json:"confidence"`
+		Files                []string                  `json:"files"`
+		MemoryKey            string                    `json:"memory_key"`
+		Stage                string                    `json:"stage"`
+		IntelligenceDecision *TaskIntelligenceDecision `json:"intelligence_decision"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
 	out, err := s.store.AppendContextWithLifecycle(r.Context(), actorID(r), r.PathValue("id"), in.Kind, in.Content, in.Source, in.Reason, in.Confidence, in.Files, in.MemoryKey, in.Stage)
+	if err == nil && in.IntelligenceDecision != nil {
+		decision := *in.IntelligenceDecision
+		decision.TaskID = r.PathValue("id")
+		if decision.SelectedTaskID == "" {
+			decision.SelectedTaskID = r.PathValue("id")
+		}
+		_, err = s.store.RecordTaskIntelligenceDecision(r.Context(), actorID(r), r.PathValue("id"), decision)
+	}
 	writeResult(w, out, err)
 }
 

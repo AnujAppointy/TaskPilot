@@ -87,6 +87,7 @@ type queuedRepoSemanticMemory struct {
 	Server        string    `json:"server"`
 	ActorID       string    `json:"actor_id"`
 	RepoPath      string    `json:"repo_path"`
+	TaskID        string    `json:"task_id,omitempty"`
 	CompletedWork string    `json:"completed_work"`
 	Why           string    `json:"why,omitempty"`
 	Verification  string    `json:"verification,omitempty"`
@@ -295,9 +296,33 @@ type repoActivity struct {
 }
 
 type repoTaskMatch struct {
-	Task    Task     `json:"task"`
-	Score   int      `json:"score"`
-	Reasons []string `json:"reasons"`
+	Task          Task                        `json:"task"`
+	Score         int                         `json:"score"`
+	Confidence    float64                     `json:"confidence"`
+	Action        string                      `json:"action"`
+	Reasons       []string                    `json:"reasons"`
+	Evidence      []string                    `json:"evidence,omitempty"`
+	Candidates    []TaskIntelligenceCandidate `json:"candidates,omitempty"`
+	Relationship  string                      `json:"relationship,omitempty"`
+	ProposedTitle string                      `json:"proposed_title,omitempty"`
+	ProposedGoal  string                      `json:"proposed_goal,omitempty"`
+	Renamed       bool                        `json:"renamed,omitempty"`
+	PreviousTitle string                      `json:"previous_title,omitempty"`
+	NewTitle      string                      `json:"new_title,omitempty"`
+}
+
+type repoWorkIntent struct {
+	Objective    string
+	Completed    string
+	Why          string
+	Verification string
+	Remaining    string
+	Files        []string
+	Stage        string
+	Source       string
+	ActiveTaskID string
+	SessionID    string
+	Kind         string
 }
 
 type AgentDetection struct {
@@ -661,7 +686,7 @@ func syncRepoActivity(repoPath string, state *repoRuntimeState) error {
 		return nil
 	}
 	signature := repoActivitySignature(activity)
-	task, err := ensureTaskForRepoActivityWithProxy(activity, false)
+	task, _, err := ensureTaskForRepoActivityWithIntentWithProxy(activity, repoWorkIntent{Kind: "daemon", ActiveTaskID: state.TaskID, SessionID: state.SessionID, Source: "daemon"}, false)
 	if err != nil {
 		return err
 	}
@@ -692,36 +717,80 @@ func ensureTaskForRepoActivity(activity repoActivity) (Task, error) {
 }
 
 func ensureTaskForRepoActivityWithProxy(activity repoActivity, allowProxy bool) (Task, error) {
-	if match, err := resolveRepoTaskWithProxy(activity, allowProxy); err == nil && match.Task.ID != "" && match.Score >= 80 {
-		mergedScope := appendUniqueStrings(filterProductRepoFiles(match.Task.Scope), activity.ChangedFiles...)
+	task, _, err := ensureTaskForRepoActivityWithIntentWithProxy(activity, repoWorkIntent{Kind: "repo_activity"}, allowProxy)
+	return task, err
+}
+
+func ensureTaskForRepoActivityWithIntentWithProxy(activity repoActivity, intent repoWorkIntent, allowProxy bool) (Task, repoTaskMatch, error) {
+	intent = normalizeRepoWorkIntent(activity, intent)
+	match, err := resolveRepoTaskWithIntentWithProxy(activity, intent, allowProxy)
+	if err != nil {
+		return Task{}, repoTaskMatch{}, err
+	}
+	title, goal, evidence := repoIntentIdentity(activity, intent)
+	match.ProposedTitle = title
+	match.ProposedGoal = goal
+	match.Evidence = appendUniqueStrings(match.Evidence, evidence...)
+	if match.Task.ID != "" && match.Score >= 80 {
+		mergedScope := appendUniqueStrings(filterProductRepoFiles(match.Task.Scope), repoIntentFiles(activity, intent)...)
+		updates := map[string]any{}
 		if !sameStringSet(mergedScope, match.Task.Scope) {
+			updates["scope"] = mergedScope
+		}
+		if shouldEnrichTaskIdentity(match.Task, title, goal) {
+			match.Renamed = true
+			match.PreviousTitle = match.Task.Title
+			match.NewTitle = title
+			updates["title"] = title
+			updates["goal"] = goal
+		}
+		if len(updates) > 0 {
+			updates["reason"] = "TaskPilot intelligence reused existing task for matching repo intent"
+			updates["intelligence_decision"] = repoTaskIntelligenceDecision("reuse", match)
 			var updated Task
-			_ = doRequestWithProxy("PATCH", "/api/tasks/"+url.PathEscape(match.Task.ID), map[string]any{"scope": mergedScope, "reason": "Repo activity touched new product files"}, &updated, true, allowProxy)
+			_ = doRequestWithProxy("PATCH", "/api/tasks/"+url.PathEscape(match.Task.ID), updates, &updated, true, allowProxy)
 			if updated.ID != "" {
-				return updated, nil
+				match.Task = updated
+				return updated, match, nil
 			}
 		}
-		return match.Task, nil
+		return match.Task, match, nil
 	}
-	title := inferredTaskTitle(activity)
+	match.Action = "create"
+	match.Score = maxInt(match.Score, 30)
+	if match.Confidence == 0 {
+		match.Confidence = 0.35
+	}
 	body := TaskInput{
-		ProjectID:    activity.Config.ProjectID,
-		RepoID:       activity.Config.RepoID,
-		WorkspaceID:  activity.Config.WorkspaceID,
-		Title:        title,
-		Goal:         inferredTaskGoal(activity),
-		Type:         "implementation",
-		Priority:     "normal",
-		Status:       "ready",
-		Scope:        activity.ChangedFiles,
-		PrivacyLevel: "sanitized_context",
-		Requirements: []string{"Replace this inferred title or goal once the exact user intent is known."},
+		ProjectID:            activity.Config.ProjectID,
+		RepoID:               activity.Config.RepoID,
+		WorkspaceID:          activity.Config.WorkspaceID,
+		Title:                title,
+		Goal:                 goal,
+		Type:                 "implementation",
+		Priority:             "normal",
+		Status:               "ready",
+		Scope:                repoIntentFiles(activity, intent),
+		PrivacyLevel:         "sanitized_context",
+		Requirements:         []string{"Keep this inferred task identity outcome-based; refine title, goal, scope, and relationships as more semantic context arrives."},
+		IntelligenceDecision: repoTaskIntelligenceDecision("create", match),
+	}
+	if match.Task.ID != "" && match.Score >= 55 {
+		relationshipType := repoRelationshipForMatch(match)
+		body.Relationships = []TaskRelationship{{
+			TargetTaskID: match.Task.ID,
+			Type:         relationshipType,
+			Reason:       "TaskPilot found moderate overlap while creating a distinct repo task: " + strings.Join(match.Reasons, ", "),
+			Confidence:   match.Confidence,
+			Source:       "inference",
+		}}
 	}
 	var created Task
 	if err := doRequestWithProxy("POST", "/api/tasks", body, &created, true, allowProxy); err != nil {
-		return Task{}, err
+		return Task{}, match, err
 	}
-	return created, nil
+	match.Task = created
+	return created, match, nil
 }
 
 func resolveRepoTask(activity repoActivity) (repoTaskMatch, error) {
@@ -729,46 +798,47 @@ func resolveRepoTask(activity repoActivity) (repoTaskMatch, error) {
 }
 
 func resolveRepoTaskWithProxy(activity repoActivity, allowProxy bool) (repoTaskMatch, error) {
+	return resolveRepoTaskWithIntentWithProxy(activity, repoWorkIntent{Kind: "repo_activity"}, allowProxy)
+}
+
+func resolveRepoTaskWithIntentWithProxy(activity repoActivity, intent repoWorkIntent, allowProxy bool) (repoTaskMatch, error) {
 	tasks, err := tasksForRepoWithProxy(activity.Config.RepoID, activity.Config.ProjectID, allowProxy)
 	if err != nil {
 		return repoTaskMatch{}, err
 	}
+	intent = normalizeRepoWorkIntent(activity, intent)
+	title, goal, evidence := repoIntentIdentity(activity, intent)
+	intentText := strings.Join([]string{intent.Objective, intent.Completed, intent.Why, title, goal}, " ")
 	explicit := taskIDPattern.FindString(activity.Branch)
 	best := repoTaskMatch{}
 	now := time.Now().UTC()
 	for _, task := range tasks {
-		if task.Status == "completed" || task.Status == "cancelled" {
+		if task.Status == "cancelled" {
 			continue
 		}
-		score := 0
-		reasons := []string{}
+		score, reasons := repoTaskIntentScore(task, activity, intent, intentText, explicit, now)
 		if explicit != "" && task.ID == explicit {
 			score += 1000
-			reasons = append(reasons, "branch names explicit task id")
 		}
-		if task.RepoID == activity.Config.RepoID {
-			score += 20
-			reasons = append(reasons, "same repo")
-		}
-		if task.WorkspaceID == activity.Config.WorkspaceID {
-			score += 10
-			reasons = append(reasons, "same workspace")
-		}
-		if taskScopesOverlap(task.Scope, activity.ChangedFiles) {
-			score += 80
-			reasons = append(reasons, "overlapping changed files")
-		}
-		if branchMatchesTask(activity.Branch, task) {
-			score += 35
-			reasons = append(reasons, "branch matches task words")
-		}
-		if task.OwnerID != "" && task.LastHeartbeatAt != nil && now.Sub(*task.LastHeartbeatAt) <= DefaultClaimTTL {
-			score += 15
-			reasons = append(reasons, "active task")
-		}
+		confidence := repoTaskMatchConfidence(score)
+		candidate := TaskIntelligenceCandidate{TaskID: task.ID, Title: task.Title, Score: score, Confidence: confidence, Action: repoTaskCandidateAction(score), Reasons: reasons}
+		best.Candidates = append(best.Candidates, candidate)
 		if score > best.Score {
-			best = repoTaskMatch{Task: task, Score: score, Reasons: reasons}
+			best.Task = task
+			best.Score = score
+			best.Confidence = confidence
+			best.Reasons = reasons
 		}
+	}
+	best.Action = repoTaskCandidateAction(best.Score)
+	best.ProposedTitle = title
+	best.ProposedGoal = goal
+	best.Evidence = evidence
+	sort.SliceStable(best.Candidates, func(i, j int) bool {
+		return best.Candidates[i].Score > best.Candidates[j].Score
+	})
+	if len(best.Candidates) > 8 {
+		best.Candidates = best.Candidates[:8]
 	}
 	return best, nil
 }
@@ -817,24 +887,423 @@ func currentRepoActivity(repoPath string) (repoActivity, error) {
 }
 
 func inferredTaskTitle(activity repoActivity) string {
-	if activity.Branch != "" && activity.Branch != "main" && activity.Branch != "master" {
-		return "Work on " + humanizeBranchName(activity.Branch)
-	}
-	if len(activity.ChangedFiles) == 1 {
-		return "Update " + activity.ChangedFiles[0]
-	}
-	if len(activity.ChangedFiles) > 1 {
-		return "Update " + strings.Join(limitStrings(activity.ChangedFiles, 3), ", ")
-	}
-	return "Inferred repo work"
+	title, _, _ := repoIntentIdentity(activity, repoWorkIntent{Kind: "repo_activity"})
+	return title
 }
 
 func inferredTaskGoal(activity repoActivity) string {
-	scope := "the current repo work"
-	if len(activity.ChangedFiles) > 0 {
-		scope = strings.Join(limitStrings(activity.ChangedFiles, 5), ", ")
+	_, goal, _ := repoIntentIdentity(activity, repoWorkIntent{Kind: "repo_activity"})
+	return goal
+}
+
+func normalizeRepoWorkIntent(activity repoActivity, intent repoWorkIntent) repoWorkIntent {
+	intent.Objective = strings.TrimSpace(intent.Objective)
+	intent.Completed = strings.TrimSpace(intent.Completed)
+	intent.Why = strings.TrimSpace(intent.Why)
+	intent.Verification = strings.TrimSpace(intent.Verification)
+	intent.Remaining = strings.TrimSpace(intent.Remaining)
+	intent.Stage = strings.TrimSpace(intent.Stage)
+	intent.Source = strings.TrimSpace(intent.Source)
+	intent.ActiveTaskID = strings.TrimSpace(intent.ActiveTaskID)
+	intent.SessionID = strings.TrimSpace(intent.SessionID)
+	intent.Kind = strings.TrimSpace(intent.Kind)
+	if intent.Kind == "" {
+		intent.Kind = "repo_activity"
 	}
-	return fmt.Sprintf("Coordinate live work in %s around %s.", activity.Config.RepoName, scope)
+	if len(intent.Files) == 0 {
+		intent.Files = activity.ChangedFiles
+	}
+	intent.Files = repoIntentFiles(activity, intent)
+	if intent.Objective == "" && intent.Completed != "" {
+		intent.Objective = intent.Completed
+	}
+	return intent
+}
+
+func repoIntentFiles(activity repoActivity, intent repoWorkIntent) []string {
+	files := filterProductRepoFiles(intent.Files)
+	if len(files) == 0 {
+		files = filterProductRepoFiles(activity.ChangedFiles)
+	}
+	return uniqueStrings(files)
+}
+
+func repoIntentIdentity(activity repoActivity, intent repoWorkIntent) (string, string, []string) {
+	intent = normalizeRepoWorkIntent(activity, intent)
+	files := repoIntentFiles(activity, intent)
+	evidence := []string{}
+	if intent.Objective != "" {
+		evidence = append(evidence, "objective: "+intent.Objective)
+	}
+	if intent.Completed != "" {
+		evidence = append(evidence, "completed_work: "+intent.Completed)
+	}
+	if intent.Why != "" {
+		evidence = append(evidence, "why: "+intent.Why)
+	}
+	if len(files) > 0 {
+		evidence = append(evidence, "files: "+strings.Join(limitStrings(files, 8), ", "))
+	}
+
+	stats := map[string]repoDiffStat{}
+	headings := map[string][]string{}
+	if activity.Config.GitRoot != "" && len(files) > 0 {
+		stats = repoDiffStats(activity.Config.GitRoot, files)
+		headings = markdownHeadings(activity.Config.GitRoot, files)
+		for file, hs := range headings {
+			if len(hs) > 0 {
+				evidence = append(evidence, file+" headings: "+strings.Join(limitStrings(hs, 4), ", "))
+			}
+		}
+	}
+
+	title := ""
+	if intent.Objective != "" {
+		title = outcomeTitleFromText(intent.Objective, "Improve")
+	}
+	if title == "" && intent.Completed != "" {
+		title = outcomeTitleFromText(intent.Completed, "Improve")
+	}
+	if title == "" {
+		title = outcomeTitleFromHeadings(files, stats, headings)
+	}
+	if title == "" && isMeaningfulBranch(activity.Branch) {
+		title = outcomeTitleFromText(humanizeBranchName(activity.Branch), "Improve")
+	}
+	if title == "" {
+		title = "Coordinate repository work"
+	}
+
+	goal := strings.TrimSpace(intent.Objective)
+	if goal == "" && intent.Completed != "" {
+		goal = intent.Completed
+	}
+	if len(files) > 0 {
+		summary := metadataSemanticSummary(activity, files, stats, headings)
+		if goal == "" {
+			goal = summary
+		} else {
+			goal = strings.TrimSuffix(goal, ".") + ". " + summary
+		}
+	}
+	if intent.Why != "" {
+		goal = strings.TrimSuffix(goal, ".") + ". Why: " + intent.Why
+	}
+	if goal == "" {
+		goal = fmt.Sprintf("Coordinate live work in %s around the current repository intent.", activity.Config.RepoName)
+	}
+	return title, goal, evidence
+}
+
+func outcomeTitleFromHeadings(files []string, stats map[string]repoDiffStat, headings map[string][]string) string {
+	if len(files) == 1 {
+		file := files[0]
+		if hs := headings[file]; len(hs) > 0 {
+			return outcomeVerbForFile(file, stats[file], strings.Join(hs, " ")) + " " + sentenceCasePhrase(hs[0])
+		}
+		if topic := fileTopic(file); topic != "" {
+			return outcomeVerbForFile(file, stats[file], topic) + " " + topic
+		}
+	}
+	topics := []string{}
+	for _, file := range files {
+		if hs := headings[file]; len(hs) > 0 {
+			topics = append(topics, sentenceCasePhrase(hs[0]))
+			continue
+		}
+		if topic := fileTopic(file); topic != "" {
+			topics = append(topics, topic)
+		}
+	}
+	topics = uniqueStrings(limitStrings(topics, 3))
+	if len(topics) > 0 {
+		return "Improve " + strings.Join(topics, " and ")
+	}
+	return ""
+}
+
+func outcomeVerbForFile(file string, stat repoDiffStat, text string) string {
+	if strings.TrimSpace(stat.Status) == "??" || strings.Contains(stat.Status, "A") {
+		return "Add"
+	}
+	lower := strings.ToLower(file + " " + text)
+	if strings.EqualFold(filepath.Ext(file), ".md") {
+		if strings.Contains(lower, "rule") || strings.Contains(lower, "control") || strings.Contains(lower, "policy") || strings.Contains(lower, "requirement") || strings.Contains(lower, "spec") || strings.Contains(lower, "plan") || strings.Contains(lower, "design") {
+			return "Define"
+		}
+		return "Clarify"
+	}
+	if strings.Contains(lower, "test") {
+		return "Test"
+	}
+	if strings.Contains(lower, "fix") || strings.Contains(lower, "bug") {
+		return "Fix"
+	}
+	return "Improve"
+}
+
+func outcomeTitleFromText(text, fallbackVerb string) string {
+	text = strings.TrimSpace(singleLine(redactSensitiveText(text)))
+	text = strings.TrimPrefix(text, "Completed:")
+	text = strings.TrimPrefix(text, "completed:")
+	text = strings.TrimSpace(strings.Trim(text, "."))
+	if text == "" {
+		return ""
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return ""
+	}
+	verb := normalizedOutcomeVerb(fields[0])
+	if verb != "" {
+		fields[0] = verb
+	} else {
+		if fallbackVerb == "" {
+			fallbackVerb = "Improve"
+		}
+		fields = append([]string{fallbackVerb}, fields...)
+	}
+	fields = limitStrings(fields, 10)
+	title := strings.Join(fields, " ")
+	title = strings.Trim(title, " .,:;")
+	return title
+}
+
+func normalizedOutcomeVerb(word string) string {
+	switch strings.ToLower(strings.Trim(word, " .,:;")) {
+	case "add", "added", "adds":
+		return "Add"
+	case "build", "built":
+		return "Build"
+	case "clarify", "clarified":
+		return "Clarify"
+	case "coordinate", "coordinated":
+		return "Coordinate"
+	case "create", "created":
+		return "Create"
+	case "define", "defined":
+		return "Define"
+	case "fix", "fixed":
+		return "Fix"
+	case "implement", "implemented":
+		return "Implement"
+	case "improve", "improved", "update", "updated", "change", "changed":
+		return "Improve"
+	case "refactor", "refactored":
+		return "Refactor"
+	case "route", "routed":
+		return "Route"
+	case "test", "tested":
+		return "Test"
+	}
+	return ""
+}
+
+func sentenceCasePhrase(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	return strings.ToLower(value)
+}
+
+func fileTopic(file string) string {
+	base := filepath.Base(file)
+	ext := filepath.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	base = strings.ReplaceAll(base, "-", " ")
+	base = strings.ReplaceAll(base, "_", " ")
+	base = strings.Join(strings.Fields(base), " ")
+	return strings.ToLower(base)
+}
+
+func repoTaskIntentScore(task Task, activity repoActivity, intent repoWorkIntent, intentText, explicit string, now time.Time) (int, []string) {
+	score := 0
+	reasons := []string{}
+	if explicit != "" && task.ID == explicit {
+		reasons = append(reasons, "branch names explicit task id")
+	}
+	if intent.ActiveTaskID != "" && task.ID == intent.ActiveTaskID {
+		score += 260
+		reasons = append(reasons, "active repo session task")
+	}
+	if task.RepoID != "" && task.RepoID == activity.Config.RepoID {
+		score += 20
+		reasons = append(reasons, "same repo")
+	}
+	if task.WorkspaceID != "" && task.WorkspaceID == activity.Config.WorkspaceID {
+		score += 10
+		reasons = append(reasons, "same workspace")
+	}
+	files := repoIntentFiles(activity, intent)
+	taskScope := filterProductRepoFiles(task.Scope)
+	if len(files) > 0 && sameStringSet(taskScope, files) {
+		score += 90
+		reasons = append(reasons, "same changed file set")
+	} else if taskScopesOverlap(taskScope, files) {
+		score += 70
+		reasons = append(reasons, "overlapping changed files")
+	}
+	if branchMatchesTask(activity.Branch, task) {
+		score += 35
+		reasons = append(reasons, "branch matches task words")
+	}
+	shared := sharedRepoKeywordCount(intentText, task.Title+" "+task.Goal+" "+task.SearchText)
+	if shared >= 4 {
+		score += 80
+		reasons = append(reasons, "strong semantic intent match")
+	} else if shared == 3 {
+		score += 60
+		reasons = append(reasons, "semantic intent match")
+	} else if shared == 2 {
+		score += 40
+		reasons = append(reasons, "partial semantic intent match")
+	} else if shared == 1 {
+		score += 20
+		reasons = append(reasons, "weak semantic intent match")
+	}
+	if task.OwnerID != "" && task.LastHeartbeatAt != nil && now.Sub(*task.LastHeartbeatAt) <= DefaultClaimTTL {
+		score += 25
+		reasons = append(reasons, "active task heartbeat")
+	}
+	if task.Status == "completed" {
+		if !task.UpdatedAt.IsZero() && now.Sub(task.UpdatedAt) <= 72*time.Hour {
+			score += 15
+			reasons = append(reasons, "recent completed task may be receiving follow-up")
+		} else {
+			score -= 25
+			reasons = append(reasons, "completed task")
+		}
+	}
+	if isGenericInferredTaskTitle(task.Title) {
+		score -= 15
+		reasons = append(reasons, "generic inferred title needs stronger evidence")
+	}
+	if score < 0 {
+		score = 0
+	}
+	return score, reasons
+}
+
+func sharedRepoKeywordCount(a, b string) int {
+	left := repoKeywords(a)
+	right := repoKeywords(b)
+	count := 0
+	for word := range left {
+		if right[word] {
+			count++
+		}
+	}
+	return count
+}
+
+func repoKeywords(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, word := range regexp.MustCompile(`[a-z0-9]+`).FindAllString(strings.ToLower(text), -1) {
+		if len(word) < 4 || repoIntentStopWord(word) {
+			continue
+		}
+		out[word] = true
+	}
+	return out
+}
+
+func repoIntentStopWord(word string) bool {
+	switch word {
+	case "about", "active", "added", "around", "branch", "changed", "changes", "completed", "context", "current", "files", "implementation", "inferred", "line", "lines", "normal", "product", "recorded", "repository", "repo", "task", "taskpilot", "updated", "work", "working":
+		return true
+	}
+	return false
+}
+
+func repoTaskMatchConfidence(score int) float64 {
+	switch {
+	case score >= 160:
+		return 0.98
+	case score >= 120:
+		return 0.9
+	case score >= 80:
+		return 0.78
+	case score >= 55:
+		return 0.58
+	case score > 0:
+		return 0.35
+	default:
+		return 0.2
+	}
+}
+
+func repoTaskCandidateAction(score int) string {
+	switch {
+	case score >= 80:
+		return "reuse"
+	case score >= 55:
+		return "create_related"
+	default:
+		return "create_provisional"
+	}
+}
+
+func repoRelationshipForMatch(match repoTaskMatch) string {
+	reasons := strings.Join(match.Reasons, " ")
+	if strings.Contains(reasons, "active repo session") || strings.Contains(reasons, "semantic intent") {
+		return "continues"
+	}
+	if match.Score >= 75 {
+		return "related_to"
+	}
+	return "related_to"
+}
+
+func repoTaskIntelligenceDecision(action string, match repoTaskMatch) *TaskIntelligenceDecision {
+	reason := strings.Join(match.Reasons, "; ")
+	if reason == "" {
+		reason = "no existing task reached the reuse threshold"
+	}
+	return &TaskIntelligenceDecision{
+		Decision:       "repo_task_selection",
+		Action:         action,
+		SelectedTaskID: match.Task.ID,
+		Confidence:     match.Confidence,
+		Reason:         reason,
+		Evidence:       match.Evidence,
+		Candidates:     match.Candidates,
+		Renamed:        match.Renamed,
+		PreviousTitle:  match.PreviousTitle,
+		NewTitle:       match.NewTitle,
+	}
+}
+
+func shouldEnrichTaskIdentity(task Task, proposedTitle, proposedGoal string) bool {
+	if strings.TrimSpace(proposedTitle) == "" || isGenericInferredTaskTitle(proposedTitle) {
+		return false
+	}
+	if !isGenericInferredTaskTitle(task.Title) {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(task.Title), strings.TrimSpace(proposedTitle)) || (strings.TrimSpace(task.Goal) != "" && strings.TrimSpace(proposedGoal) != "")
+}
+
+func isGenericInferredTaskTitle(title string) bool {
+	lower := strings.ToLower(strings.TrimSpace(title))
+	return lower == "" ||
+		lower == "inferred repo work" ||
+		strings.HasPrefix(lower, "update ") ||
+		strings.HasPrefix(lower, "work on repo branch") ||
+		strings.HasPrefix(lower, "repository modifications") ||
+		strings.Contains(lower, "changed files") ||
+		strings.Contains(lower, "inferred work")
+}
+
+func isMeaningfulBranch(branch string) bool {
+	branch = strings.TrimSpace(branch)
+	return branch != "" && branch != "main" && branch != "master" && branch != "HEAD"
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func humanizeBranchName(branch string) string {
@@ -1813,6 +2282,7 @@ var requiredCodexTaskPilotMCPTools = []string{
 	"ensure_task_for_repo_session",
 	"record_repo_session_context",
 	"record_repo_semantic_memory",
+	"add_task_relationship",
 }
 
 func ensureCodexTaskPilotMCPConfig(dryRun bool) (codexMCPConfigResult, error) {
@@ -2359,6 +2829,8 @@ type renderedRepoContext struct {
 	ChangedFiles    []string         `json:"changed_files"`
 	LikelyTask      *Task            `json:"likely_task,omitempty"`
 	MatchScore      int              `json:"match_score,omitempty"`
+	MatchConfidence float64          `json:"match_confidence,omitempty"`
+	MatchAction     string           `json:"match_action,omitempty"`
 	MatchReasons    []string         `json:"match_reasons,omitempty"`
 	ActiveOverlaps  []Task           `json:"active_overlaps,omitempty"`
 	ActiveLocks     []Lock           `json:"active_locks,omitempty"`
@@ -2381,6 +2853,8 @@ func renderRepoContext(root, format string) (string, error) {
 	if match, err := resolveRepoTask(activity); err == nil && match.Task.ID != "" {
 		payload.LikelyTask = &match.Task
 		payload.MatchScore = match.Score
+		payload.MatchConfidence = match.Confidence
+		payload.MatchAction = match.Action
 		payload.MatchReasons = match.Reasons
 	}
 	tasks, err := tasksForRepo(activity.Config.RepoID, activity.Config.ProjectID)
@@ -2414,7 +2888,8 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		"## TaskPilot Live Repo Context",
 		"",
 		"Use this shared context before planning or editing. Do not upload raw source files, prompts, logs, secrets, screenshots, or customer data.",
-		"After meaningful work, record agent-authored memory before your final response and do not move on until TaskPilot returns `recorded` or `queued`. First use TaskPilot MCP `record_repo_semantic_memory` with completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context record-semantic --repo . --completed-work \"...\" --why \"...\" --verification \"...\" --remaining-work \"...\" --files path1,path2`. A `queued` result is success: the daemon will flush it.",
+		"Before creating a task, inspect the likely task, active overlaps, recent memory, and relationships. Reuse the matching task when the objective is the same; create a subtask or related task only for a distinct outcome. Avoid generic file-based task names, and improve inferred task identity when semantic context becomes clearer.",
+		"After meaningful work, record agent-authored memory before your final response and do not move on until TaskPilot returns `recorded` or `queued`. First use TaskPilot MCP `record_repo_semantic_memory` with task_id when known, completed work, why, files, verification, and remaining work. If MCP is unavailable, run `taskpilot context record-semantic --repo . --task-id task_... --completed-work \"...\" --why \"...\" --verification \"...\" --remaining-work \"...\" --files path1,path2`. A `queued` result is success: the daemon will flush it.",
 		"",
 		fmt.Sprintf("- Repo: %s", ctx.Repo.RepoName),
 		fmt.Sprintf("- Branch: %s", fallbackText(ctx.Branch, "unknown")),
@@ -2436,6 +2911,9 @@ func renderRepoContextMarkdown(ctx renderedRepoContext) string {
 		}
 		if len(ctx.MatchReasons) > 0 {
 			lines = append(lines, "- Why this task: "+strings.Join(ctx.MatchReasons, ", "))
+		}
+		if ctx.MatchScore > 0 {
+			lines = append(lines, fmt.Sprintf("- Match: action=%s score=%d confidence=%.2f", fallbackText(ctx.MatchAction, "unknown"), ctx.MatchScore, ctx.MatchConfidence))
 		}
 	}
 	if len(ctx.ActiveOverlaps) > 0 {
@@ -2709,9 +3187,9 @@ func runAgentCommand(args []string) error {
 			return taskRunOwnershipError(taskID, cfg, detail, err)
 		}
 	}
-	for _, scope := range detail.Task.Scope {
+	for _, scope := range taskLockScopes(detail.Task) {
 		var lock Lock
-		_ = request("POST", "/api/tasks/"+taskID+"/locks", map[string]any{"scope": scope, "scope_type": "file_glob"}, &lock)
+		_ = request("POST", "/api/tasks/"+taskID+"/locks", map[string]any{"scope": scope.scope, "scope_type": scope.scopeType}, &lock)
 	}
 	if err := request("GET", "/api/tasks/"+taskID, nil, &detail); err != nil {
 		return err
@@ -3469,19 +3947,22 @@ type agentRelatedContextFile struct {
 }
 
 type agentTaskDetail struct {
-	Task         Task             `json:"task"`
-	Owner        *Actor           `json:"owner,omitempty"`
-	Parent       *Task            `json:"parent,omitempty"`
-	Subtasks     []Task           `json:"subtasks,omitempty"`
-	Dependencies []TaskDependency `json:"dependencies,omitempty"`
-	Dependents   []TaskDependency `json:"dependents,omitempty"`
-	Context      []ContextEntry   `json:"context,omitempty"`
-	Decisions    []DecisionRecord `json:"decisions,omitempty"`
-	Comments     []Comment        `json:"comments,omitempty"`
-	Artifacts    []Artifact       `json:"artifacts,omitempty"`
-	GitRefs      []GitRef         `json:"git_refs,omitempty"`
-	Locks        []Lock           `json:"locks,omitempty"`
-	Handoffs     []Handoff        `json:"handoffs,omitempty"`
+	Task                  Task                       `json:"task"`
+	Owner                 *Actor                     `json:"owner,omitempty"`
+	Parent                *Task                      `json:"parent,omitempty"`
+	Subtasks              []Task                     `json:"subtasks,omitempty"`
+	Dependencies          []TaskDependency           `json:"dependencies,omitempty"`
+	Dependents            []TaskDependency           `json:"dependents,omitempty"`
+	Relationships         []TaskRelationship         `json:"relationships,omitempty"`
+	IncomingRelationships []TaskRelationship         `json:"incoming_relationships,omitempty"`
+	IntelligenceDecisions []TaskIntelligenceDecision `json:"intelligence_decisions,omitempty"`
+	Context               []ContextEntry             `json:"context,omitempty"`
+	Decisions             []DecisionRecord           `json:"decisions,omitempty"`
+	Comments              []Comment                  `json:"comments,omitempty"`
+	Artifacts             []Artifact                 `json:"artifacts,omitempty"`
+	GitRefs               []GitRef                   `json:"git_refs,omitempty"`
+	Locks                 []Lock                     `json:"locks,omitempty"`
+	Handoffs              []Handoff                  `json:"handoffs,omitempty"`
 }
 
 type agentRelatedContext struct {
@@ -3728,19 +4209,22 @@ Do not upload or write secrets, raw private logs, customer data, private prompts
 
 func compactAgentTaskDetail(detail TaskDetail) agentTaskDetail {
 	return agentTaskDetail{
-		Task:         detail.Task,
-		Owner:        detail.Owner,
-		Parent:       detail.Parent,
-		Subtasks:     detail.Subtasks,
-		Dependencies: detail.Dependencies,
-		Dependents:   detail.Dependents,
-		Context:      compactContextEntries(detail.Context, 40),
-		Decisions:    limitDecisions(detail.Decisions, 20),
-		Comments:     limitComments(detail.Comments, 20),
-		Artifacts:    limitArtifacts(detail.Artifacts, 20),
-		GitRefs:      limitGitRefs(detail.GitRefs, 20),
-		Locks:        detail.Locks,
-		Handoffs:     detail.Handoffs,
+		Task:                  detail.Task,
+		Owner:                 detail.Owner,
+		Parent:                detail.Parent,
+		Subtasks:              detail.Subtasks,
+		Dependencies:          detail.Dependencies,
+		Dependents:            detail.Dependents,
+		Relationships:         detail.Relationships,
+		IncomingRelationships: detail.IncomingRelationships,
+		IntelligenceDecisions: limitTaskIntelligenceDecisions(detail.IntelligenceDecisions, 10),
+		Context:               compactContextEntries(detail.Context, 40),
+		Decisions:             limitDecisions(detail.Decisions, 20),
+		Comments:              limitComments(detail.Comments, 20),
+		Artifacts:             limitArtifacts(detail.Artifacts, 20),
+		GitRefs:               limitGitRefs(detail.GitRefs, 20),
+		Locks:                 detail.Locks,
+		Handoffs:              detail.Handoffs,
 	}
 }
 
@@ -3876,6 +4360,16 @@ func linkedTaskRelations(detail TaskDetail) map[string][]string {
 	for _, dep := range detail.Dependents {
 		if dep.TaskID != "" {
 			out[dep.TaskID] = append(out[dep.TaskID], "blocking")
+		}
+	}
+	for _, rel := range detail.Relationships {
+		if rel.TargetTaskID != "" {
+			out[rel.TargetTaskID] = append(out[rel.TargetTaskID], rel.Type)
+		}
+	}
+	for _, rel := range detail.IncomingRelationships {
+		if rel.SourceTaskID != "" {
+			out[rel.SourceTaskID] = append(out[rel.SourceTaskID], "incoming_"+rel.Type)
 		}
 	}
 	return out
@@ -4172,6 +4666,13 @@ func limitStrings(values []string, max int) []string {
 }
 
 func limitDecisions(values []DecisionRecord, max int) []DecisionRecord {
+	if len(values) <= max {
+		return values
+	}
+	return values[len(values)-max:]
+}
+
+func limitTaskIntelligenceDecisions(values []TaskIntelligenceDecision, max int) []TaskIntelligenceDecision {
 	if len(values) <= max {
 		return values
 	}
@@ -4627,10 +5128,11 @@ func mcpTools() []map[string]any {
 		mcpTool("get_active_overlaps", "Return active or overlapping TaskPilot work for an enabled Git repo.", map[string]any{"repo": mcpString("Repo path, defaults to current directory")}, []string{}),
 		mcpTool("ensure_task_for_repo_session", "Find or create the TaskPilot task for current live repo activity.", map[string]any{"repo": mcpString("Repo path, defaults to current directory")}, []string{}),
 		mcpTool("record_repo_session_context", "Append sanitized context to the resolved current repo task.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "kind": mcpString("summary, decision, note, risk, blocker, output_ref, next"), "content": mcpString("Sanitized context content"), "files": mcpStringArray("Related product files")}, []string{"content"}),
-		mcpTool("record_repo_semantic_memory", "Append structured semantic memory to the resolved current repo task.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "completed_work": mcpString("What changed or was completed"), "why": mcpString("Why it changed or important reasoning"), "verification": mcpString("Verification performed"), "remaining_work": mcpString("Remaining work or next step"), "files": mcpStringArray("Related product files"), "stage": mcpString("working or final, defaults to working")}, []string{"completed_work"}),
+		mcpTool("record_repo_semantic_memory", "Append structured semantic memory to the resolved current repo task, or to an explicit task_id when supplied.", map[string]any{"repo": mcpString("Repo path, defaults to current directory"), "task_id": mcpString("Optional explicit TaskPilot task ID to receive memory"), "completed_work": mcpString("What changed or was completed"), "why": mcpString("Why it changed or important reasoning"), "verification": mcpString("Verification performed"), "remaining_work": mcpString("Remaining work or next step"), "files": mcpStringArray("Related product files"), "stage": mcpString("working or final, defaults to working")}, []string{"completed_work"}),
 		mcpTool("create_task", "Create a new TaskPilot task.", map[string]any{"title": mcpString("Task title"), "goal": mcpString("Task goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "parent_task_id": mcpString("Optional parent task ID"), "scope": mcpStringArray("Task scopes such as files, globs, artifacts, or semantic areas"), "requirements": mcpStringArray("Task requirements"), "completion_criteria": mcpStringArray("Completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers"), "privacy_level": mcpString("Privacy level, defaults to sanitized_context")}, []string{"title", "goal"}),
 		mcpTool("create_subtask", "Create a subtask under an existing TaskPilot task.", map[string]any{"parent_task_id": mcpString("Parent task ID"), "title": mcpString("Subtask title"), "goal": mcpString("Subtask goal"), "type": mcpString("Task type, defaults to implementation"), "priority": mcpString("Priority, defaults to normal"), "scope": mcpStringArray("Subtask scopes"), "requirements": mcpStringArray("Subtask requirements"), "completion_criteria": mcpStringArray("Subtask completion criteria"), "risks": mcpStringArray("Known risks"), "blockers": mcpStringArray("Known blockers")}, []string{"parent_task_id", "title", "goal"}),
 		mcpTool("add_dependency", "Add a dependency so one task is blocked by another task.", map[string]any{"task_id": mcpString("Task ID that is blocked"), "depends_on_id": mcpString("Task ID this task depends on")}, []string{"task_id", "depends_on_id"}),
+		mcpTool("add_task_relationship", "Add an explicit relationship between two tasks: parent_of, subtask_of, related_to, depends_on, blocks, continues, duplicates, or supersedes.", map[string]any{"source_task_id": mcpString("Source task ID"), "target_task_id": mcpString("Target task ID"), "type": mcpString("Relationship type"), "reason": mcpString("Reason for the relationship"), "confidence": map[string]any{"type": "number", "description": "Confidence from 0 to 1"}, "source": mcpString("Creation source such as agent, inference, or developer")}, []string{"source_task_id", "target_task_id", "type"}),
 		mcpTool("remove_dependency", "Remove a task dependency by dependency ID.", map[string]any{"dependency_id": mcpString("Dependency ID")}, []string{"dependency_id"}),
 		mcpTool("update_task", "Update editable TaskPilot task fields.", map[string]any{"task_id": mcpString("Task ID"), "title": mcpString("Optional title"), "goal": mcpString("Optional goal"), "type": mcpString("Optional type"), "priority": mcpString("Optional priority"), "project_id": mcpString("Optional project ID"), "repo_id": mcpString("Optional repository ID"), "workspace_id": mcpString("Optional workspace ID"), "parent_task_id": mcpString("Optional parent task ID"), "privacy_level": mcpString("Optional privacy level"), "scope": mcpStringArray("Replacement scopes"), "requirements": mcpStringArray("Replacement requirements"), "completion_criteria": mcpStringArray("Replacement completion criteria"), "risks": mcpStringArray("Replacement risks"), "blockers": mcpStringArray("Replacement blockers"), "reason": mcpString("Reason for update")}, []string{"task_id"}),
 		mcpTool("append_task_fields", "Append requirements, completion criteria, risks, blockers, or scopes to a task.", map[string]any{"task_id": mcpString("Task ID"), "scope": mcpStringArray("Scopes to append"), "requirements": mcpStringArray("Requirements to append"), "completion_criteria": mcpStringArray("Completion criteria to append"), "risks": mcpStringArray("Risks to append"), "blockers": mcpStringArray("Blockers to append"), "reason": mcpString("Reason for update")}, []string{"task_id"}),
@@ -4897,11 +5399,11 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		task, err := ensureTaskForRepoActivity(activity)
+		task, match, err := ensureTaskForRepoActivityWithIntentWithProxy(activity, repoWorkIntent{Kind: "mcp_session", Source: "mcp"}, true)
 		if err != nil {
 			return nil, err
 		}
-		return mcpToolResult(map[string]any{"summary": "Resolved TaskPilot task for current repo activity.", "task": task}), nil
+		return mcpToolResult(map[string]any{"summary": "Resolved TaskPilot task for current repo activity.", "task": task, "decision": repoTaskIntelligenceDecision(match.Action, match)}), nil
 	case "record_repo_session_context":
 		repo := mcpArg(args, "repo")
 		if repo == "" {
@@ -4915,7 +5417,8 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		task, err := ensureTaskForRepoActivity(activity)
+		intent := repoWorkIntent{Kind: "repo_session_context", Objective: content, Completed: content, Files: mcpStringSliceArg(args, "files"), Source: "mcp"}
+		task, match, err := ensureTaskForRepoActivityWithIntentWithProxy(activity, intent, true)
 		if err != nil {
 			return nil, err
 		}
@@ -4928,7 +5431,7 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if len(files) == 0 {
 			files = activity.ChangedFiles
 		}
-		if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": kind, "content": content, "source": "mcp", "reason": "repo_session", "confidence": "agent_authored", "files": filterProductRepoFiles(files)}, &out); err != nil {
+		if err := request("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", map[string]any{"kind": kind, "content": content, "source": "mcp", "reason": "repo_session", "confidence": "agent_authored", "files": filterProductRepoFiles(files), "intelligence_decision": repoTaskIntelligenceDecision("route_repo_context", match)}, &out); err != nil {
 			return nil, err
 		}
 		return mcpToolResult(map[string]any{"summary": "Recorded sanitized repo session context.", "task": task, "context": out}), nil
@@ -4941,7 +5444,7 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		out, err := recordRepoSemanticMemory(repo, completed, mcpArg(args, "why"), mcpArg(args, "verification"), mcpArg(args, "remaining_work"), mcpStringSliceArg(args, "files"), mcpArg(args, "stage"), "mcp", true)
+		out, err := recordRepoSemanticMemoryForTask(repo, mcpArg(args, "task_id"), completed, mcpArg(args, "why"), mcpArg(args, "verification"), mcpArg(args, "remaining_work"), mcpStringSliceArg(args, "files"), mcpArg(args, "stage"), "mcp", true)
 		if err != nil {
 			return nil, err
 		}
@@ -4981,6 +5484,25 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 		}
 		var out TaskDependency
 		if err := request("POST", "/api/tasks/"+url.PathEscape(taskID)+"/dependencies", map[string]any{"depends_on_id": dependsOnID}, &out); err != nil {
+			return nil, err
+		}
+		return mcpToolResult(out), nil
+	case "add_task_relationship":
+		sourceTaskID, err := mcpRequireArg(args, "source_task_id")
+		if err != nil {
+			return nil, err
+		}
+		targetTaskID, err := mcpRequireArg(args, "target_task_id")
+		if err != nil {
+			return nil, err
+		}
+		relationshipType, err := mcpRequireArg(args, "type")
+		if err != nil {
+			return nil, err
+		}
+		var out TaskRelationship
+		body := map[string]any{"target_task_id": targetTaskID, "type": relationshipType, "reason": mcpArg(args, "reason"), "confidence": mcpFloatArg(args, "confidence", 1), "source": mcpArg(args, "source")}
+		if err := request("POST", "/api/tasks/"+url.PathEscape(sourceTaskID)+"/relationships", body, &out); err != nil {
 			return nil, err
 		}
 		return mcpToolResult(out), nil
@@ -5459,6 +5981,23 @@ func mcpIntArg(args map[string]any, key string, fallback int) int {
 	case int:
 		if v > 0 {
 			return v
+		}
+	}
+	return fallback
+}
+
+func mcpFloatArg(args map[string]any, key string, fallback float64) float64 {
+	if args == nil {
+		return fallback
+	}
+	switch v := args[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case string:
+		if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return parsed
 		}
 	}
 	return fallback
@@ -6687,6 +7226,7 @@ func runContext(args []string) error {
 	case "record-semantic":
 		fs := flag.NewFlagSet("context record-semantic", flag.ExitOnError)
 		repoPath := fs.String("repo", ".", "repo path")
+		taskID := fs.String("task-id", "", "explicit TaskPilot task ID to receive memory")
 		completed := fs.String("completed-work", "", "what changed or was completed")
 		why := fs.String("why", "", "why it changed or important reasoning")
 		verification := fs.String("verification", "", "verification performed")
@@ -6695,7 +7235,7 @@ func runContext(args []string) error {
 		stage := fs.String("stage", "working", "working or final")
 		jsonOut := fs.Bool("json", false, "print JSON")
 		_ = fs.Parse(args[1:])
-		out, err := recordRepoSemanticMemory(*repoPath, *completed, *why, *verification, *remaining, splitCSV(*files), *stage, "agent-hook", true)
+		out, err := recordRepoSemanticMemoryForTask(*repoPath, *taskID, *completed, *why, *verification, *remaining, splitCSV(*files), *stage, "agent-hook", true)
 		if err != nil {
 			return err
 		}
@@ -6941,6 +7481,10 @@ func apiRequestOutboxDirs(repoPaths ...string) []string {
 }
 
 func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining string, files []string, stage, source string, queueOnRetriable bool) (map[string]any, error) {
+	return recordRepoSemanticMemoryForTask(repoPath, "", completed, why, verification, remaining, files, stage, source, queueOnRetriable)
+}
+
+func recordRepoSemanticMemoryForTask(repoPath, explicitTaskID, completed, why, verification, remaining string, files []string, stage, source string, queueOnRetriable bool) (map[string]any, error) {
 	completed = strings.TrimSpace(completed)
 	if completed == "" {
 		return nil, fmt.Errorf("completed work is required")
@@ -6953,9 +7497,22 @@ func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining 
 	if err != nil {
 		return nil, err
 	}
-	task, err := ensureTaskForRepoActivityWithProxy(activity, false)
+	intent := repoWorkIntent{Kind: "semantic_memory", Completed: completed, Why: why, Verification: verification, Remaining: remaining, Files: files, Stage: stage, Source: source}
+	explicitTaskID = strings.TrimSpace(explicitTaskID)
+	var task Task
+	var match repoTaskMatch
+	if explicitTaskID != "" {
+		var detail TaskDetail
+		err = requestNoProxy("GET", "/api/tasks/"+url.PathEscape(explicitTaskID), nil, &detail)
+		if err == nil {
+			task = detail.Task
+			match = repoTaskMatch{Task: task, Score: 1000, Confidence: 0.99, Action: "reuse", Reasons: []string{"explicit task id provided by agent"}, Evidence: []string{"explicit_task_id: " + explicitTaskID}}
+		}
+	} else {
+		task, match, err = ensureTaskForRepoActivityWithIntentWithProxy(activity, intent, false)
+	}
 	if err != nil {
-		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, source, err, queueOnRetriable); ok {
+		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, source, explicitTaskID, err, queueOnRetriable); ok {
 			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; semantic memory queued locally for daemon retry", "queued_memory": queued}, queueErr
 		}
 		return nil, err
@@ -6970,9 +7527,10 @@ func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining 
 	}
 	content := semanticMemoryContent(completed, why, verification, remaining)
 	var entry ContextEntry
-	body := map[string]any{"kind": "summary", "content": content, "source": source, "reason": "semantic_memory", "confidence": "agent_authored", "files": files, "memory_key": repoMemoryKey(activity, task.ID, files), "stage": stage}
+	decision := repoTaskIntelligenceDecision("route_semantic_memory", match)
+	body := map[string]any{"kind": "summary", "content": content, "source": source, "reason": "semantic_memory", "confidence": "agent_authored", "files": files, "memory_key": repoMemoryKey(activity, task.ID, files), "stage": stage, "intelligence_decision": decision}
 	if err := requestNoProxy("POST", "/api/tasks/"+url.PathEscape(task.ID)+"/context", body, &entry); err != nil {
-		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, source, err, queueOnRetriable); ok {
+		if queued, ok, queueErr := queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining, files, stage, source, explicitTaskID, err, queueOnRetriable); ok {
 			return map[string]any{"status": "queued", "reason": "TaskPilot server unavailable; semantic memory queued locally for daemon retry", "queued_memory": queued, "task": task}, queueErr
 		}
 		return nil, err
@@ -7044,11 +7602,11 @@ func queueRepoCheckpointOnRetriable(repoPath, source, reason string, cause error
 	return queued, true, nil
 }
 
-func queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining string, files []string, stage, source string, cause error, enabled bool) (queuedRepoSemanticMemory, bool, error) {
+func queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, remaining string, files []string, stage, source, taskID string, cause error, enabled bool) (queuedRepoSemanticMemory, bool, error) {
 	if !enabled || !isRetriableRequestError(cause) {
 		return queuedRepoSemanticMemory{}, false, nil
 	}
-	queued, err := queueRepoSemanticMemory(repoPath, completed, why, verification, remaining, files, stage, source, cause)
+	queued, err := queueRepoSemanticMemoryForTask(repoPath, taskID, completed, why, verification, remaining, files, stage, source, cause)
 	if err != nil {
 		return queuedRepoSemanticMemory{}, true, fmt.Errorf("%w; additionally failed to queue semantic memory locally: %v", cause, err)
 	}
@@ -7057,6 +7615,10 @@ func queueRepoSemanticMemoryOnRetriable(repoPath, completed, why, verification, 
 }
 
 func queueRepoSemanticMemory(repoPath, completed, why, verification, remaining string, files []string, stage, source string, cause error) (queuedRepoSemanticMemory, error) {
+	return queueRepoSemanticMemoryForTask(repoPath, "", completed, why, verification, remaining, files, stage, source, cause)
+}
+
+func queueRepoSemanticMemoryForTask(repoPath, taskID, completed, why, verification, remaining string, files []string, stage, source string, cause error) (queuedRepoSemanticMemory, error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return queuedRepoSemanticMemory{}, err
@@ -7077,14 +7639,16 @@ func queueRepoSemanticMemory(repoPath, completed, why, verification, remaining s
 		source = "mcp"
 	}
 	files = filterProductRepoFiles(files)
+	taskID = strings.TrimSpace(taskID)
 	now := time.Now().UTC()
-	sum := sha256.Sum256([]byte(strings.Join(append([]string{cfg.Server, cfg.ActorID, filepath.Clean(repoPath), completed, why, verification, remaining, stage, source}, files...), "\n")))
+	sum := sha256.Sum256([]byte(strings.Join(append([]string{cfg.Server, cfg.ActorID, filepath.Clean(repoPath), taskID, completed, why, verification, remaining, stage, source}, files...), "\n")))
 	id := fmt.Sprintf("repo_semantic_%x", sum[:8])
 	queued := queuedRepoSemanticMemory{
 		ID:            id,
 		Server:        cfg.Server,
 		ActorID:       cfg.ActorID,
 		RepoPath:      filepath.Clean(repoPath),
+		TaskID:        taskID,
 		CompletedWork: completed,
 		Why:           why,
 		Verification:  verification,
@@ -7132,7 +7696,7 @@ func flushQueuedRepoSemanticMemories(repoPaths ...string) (int, int, error) {
 		if source == "" {
 			source = "mcp"
 		}
-		_, err = recordRepoSemanticMemory(queued.RepoPath, queued.CompletedWork, queued.Why, queued.Verification, queued.RemainingWork, queued.Files, queued.Stage, source, false)
+		_, err = recordRepoSemanticMemoryForTask(queued.RepoPath, queued.TaskID, queued.CompletedWork, queued.Why, queued.Verification, queued.RemainingWork, queued.Files, queued.Stage, source, false)
 		if err == nil {
 			_ = os.Remove(path)
 			flushed++

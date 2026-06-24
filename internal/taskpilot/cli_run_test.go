@@ -3,6 +3,8 @@ package taskpilot
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -518,6 +520,177 @@ func TestBranchMatchesTaskUsesMeaningfulWords(t *testing.T) {
 	}
 	if branchMatchesTask("docs-readme", task) {
 		t.Fatalf("unrelated branch should not match task")
+	}
+}
+
+func TestInferredTaskTitleUsesMarkdownHeadingsOutcome(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	path := filepath.Join(root, "controls.md")
+	if err := os.WriteFile(path, []byte("# Placeholder\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "controls.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(path, []byte("# Repository Agent Control Rules\n\n## Semantic Routing\nKeep one logical work item together.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	activity := repoActivity{Config: repoEnableConfig{GitRoot: root, RepoName: "repo", RepoID: "repo_1", WorkspaceID: "workspace_1"}, Branch: "main", ChangedFiles: []string{"controls.md"}}
+	if got := inferredTaskTitle(activity); got != "Define repository agent control rules" {
+		t.Fatalf("expected outcome title from markdown heading, got %q", got)
+	}
+}
+
+func TestRepoTaskIntentScorePrefersExactSemanticTaskOverGenericSuperset(t *testing.T) {
+	now := time.Date(2026, 6, 19, 8, 0, 0, 0, time.UTC)
+	activity := repoActivity{Config: repoEnableConfig{RepoID: "repo_1", WorkspaceID: "workspace_1"}, Branch: "main", ChangedFiles: []string{"controls.md"}}
+	intent := repoWorkIntent{Completed: "Defined repository agent control rules", Why: "Keep semantic memory with the active work", Files: []string{"controls.md"}}
+	intentText := "Define repository agent control rules Keep semantic memory with the active work"
+	exact := Task{ID: "task_controls", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Update controls.md", Goal: "Coordinate controls.md", Status: "ready", Scope: []string{"controls.md"}, SearchText: "Defined repository agent control rules"}
+	generic := Task{ID: "task_generic", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Inferred work on 6 changed files", Goal: "Coordinate changed files", Status: "ready", Scope: []string{"controls.md", "README.md", "internal/taskpilot/cli.go", "internal/taskpilot/store.go", "docs/flow.md", "tests/task_test.go"}}
+	exactScore, exactReasons := repoTaskIntentScore(exact, activity, intent, intentText, "", now)
+	genericScore, genericReasons := repoTaskIntentScore(generic, activity, intent, intentText, "", now)
+	if exactScore <= genericScore {
+		t.Fatalf("expected exact semantic task to win, exact=%d %v generic=%d %v", exactScore, exactReasons, genericScore, genericReasons)
+	}
+	if exactScore < 80 {
+		t.Fatalf("expected exact semantic task to reach reuse threshold, got %d", exactScore)
+	}
+}
+
+func TestRecordRepoSemanticMemoryRoutesToExistingSemanticTaskAndRenames(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "controls.md"), []byte("# Controls\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "controls.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "controls.md"), []byte("# Repository Agent Control Rules\n\n## Semantic Routing\nKeep memory with the owning task.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var patchBody map[string]any
+	var contextBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/tasks":
+			_ = json.NewEncoder(w).Encode([]Task{
+				{ID: "task_controls", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Update controls.md", Goal: "Coordinate controls.md", Status: "ready", Scope: []string{"controls.md"}, SearchText: "Defined repository agent control rules"},
+				{ID: "task_generic", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Inferred work on 6 changed files", Goal: "Coordinate changed files", Status: "ready", Scope: []string{"controls.md", "README.md", "internal/taskpilot/cli.go", "internal/taskpilot/store.go", "docs/flow.md", "tests/task_test.go"}},
+			})
+		case r.Method == "PATCH" && r.URL.Path == "/api/tasks/task_controls":
+			if err := json.NewDecoder(r.Body).Decode(&patchBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(Task{ID: "task_controls", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Define repository agent control rules", Goal: "Defined repository agent control rules", Status: "ready", Scope: []string{"controls.md"}})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks/task_controls/context":
+			if err := json.NewDecoder(r.Body).Decode(&contextBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(ContextEntry{ID: "ctx_1", TaskID: "task_controls", Kind: "summary"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := recordRepoSemanticMemory(root, "Defined repository agent control rules", "keep semantic memory with the active work", "reviewed controls.md", "none", []string{"controls.md"}, "working", "mcp", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, ok := out["task"].(Task)
+	if !ok || task.ID != "task_controls" {
+		t.Fatalf("expected semantic memory to route to task_controls, got %+v", out["task"])
+	}
+	if patchBody["title"] != "Define repository agent control rules" {
+		t.Fatalf("expected inferred task rename, got patch %+v", patchBody)
+	}
+	if _, ok := patchBody["intelligence_decision"].(map[string]any); !ok {
+		t.Fatalf("expected patch to carry intelligence decision, got %+v", patchBody)
+	}
+	if contextBody["memory_key"] == "" || contextBody["reason"] != "semantic_memory" {
+		t.Fatalf("expected semantic memory body, got %+v", contextBody)
+	}
+	if _, ok := contextBody["intelligence_decision"].(map[string]any); !ok {
+		t.Fatalf("expected context to carry intelligence decision, got %+v", contextBody)
+	}
+}
+
+func TestRecordRepoSemanticMemoryHonorsExplicitTaskID(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	root := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "init")
+	runGitTestCommand(t, root, "config", "user.email", "taskpilot@example.com")
+	runGitTestCommand(t, root, "config", "user.name", "TaskPilot")
+	if err := os.WriteFile(filepath.Join(root, "controls.md"), []byte("# Controls\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, "add", "controls.md")
+	runGitTestCommand(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "controls.md"), []byte("# Controls\n\nUpdated.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	var contextBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/tasks/task_explicit":
+			_ = json.NewEncoder(w).Encode(TaskDetail{Task: Task{ID: "task_explicit", ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", Title: "Explicit selected task", Goal: "Own explicit memory", Status: "ready"}})
+		case r.Method == "POST" && r.URL.Path == "/api/tasks/task_explicit/context":
+			if err := json.NewDecoder(r.Body).Decode(&contextBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(ContextEntry{ID: "ctx_1", TaskID: "task_explicit", Kind: "summary"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	if err := saveConfig(Config{Server: server.URL, ActorID: "actor_1", ActorSecret: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := recordRepoSemanticMemoryForTask(root, "task_explicit", "Recorded explicit semantic memory", "agent provided task id", "none", "none", []string{"controls.md"}, "working", "mcp", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, ok := out["task"].(Task)
+	if !ok || task.ID != "task_explicit" {
+		t.Fatalf("expected explicit task, got %+v", out["task"])
+	}
+	decision, ok := contextBody["intelligence_decision"].(map[string]any)
+	if !ok || decision["reason"] != "explicit task id provided by agent" {
+		t.Fatalf("expected explicit decision in context body, got %+v", contextBody)
 	}
 }
 

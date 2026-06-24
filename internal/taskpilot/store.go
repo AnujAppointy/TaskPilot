@@ -283,6 +283,22 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_by TEXT NOT NULL, created_at TEXT NOT NULL,
 			UNIQUE(task_id, depends_on_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS task_relationships (
+			id TEXT PRIMARY KEY, source_task_id TEXT NOT NULL, target_task_id TEXT NOT NULL,
+			relationship_type TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'inference',
+			created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+			UNIQUE(source_task_id, target_task_id, relationship_type)
+		)`,
+		`CREATE TABLE IF NOT EXISTS task_intelligence_decisions (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+			decision TEXT NOT NULL, action TEXT NOT NULL, selected_task_id TEXT NOT NULL,
+			confidence REAL NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
+			evidence_json TEXT NOT NULL DEFAULT '[]', candidates_json TEXT NOT NULL DEFAULT '[]',
+			relationships_json TEXT NOT NULL DEFAULT '[]', renamed INTEGER NOT NULL DEFAULT 0,
+			previous_title TEXT NOT NULL DEFAULT '', new_title TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, actor_id TEXT NOT NULL,
 			event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -698,21 +714,23 @@ func (s *Store) ResetActorSecretForUser(ctx context.Context, actorID, userID str
 }
 
 type TaskInput struct {
-	ProjectID          string   `json:"project_id"`
-	RepoID             string   `json:"repo_id"`
-	WorkspaceID        string   `json:"workspace_id"`
-	ParentTaskID       string   `json:"parent_task_id"`
-	Title              string   `json:"title"`
-	Goal               string   `json:"goal"`
-	Type               string   `json:"type"`
-	Status             string   `json:"status"`
-	Priority           string   `json:"priority"`
-	Scope              []string `json:"scope"`
-	Requirements       []string `json:"requirements"`
-	CompletionCriteria []string `json:"completion_criteria"`
-	Risks              []string `json:"risks"`
-	Blockers           []string `json:"blockers"`
-	PrivacyLevel       string   `json:"privacy_level"`
+	ProjectID            string                    `json:"project_id"`
+	RepoID               string                    `json:"repo_id"`
+	WorkspaceID          string                    `json:"workspace_id"`
+	ParentTaskID         string                    `json:"parent_task_id"`
+	Title                string                    `json:"title"`
+	Goal                 string                    `json:"goal"`
+	Type                 string                    `json:"type"`
+	Status               string                    `json:"status"`
+	Priority             string                    `json:"priority"`
+	Scope                []string                  `json:"scope"`
+	Requirements         []string                  `json:"requirements"`
+	CompletionCriteria   []string                  `json:"completion_criteria"`
+	Risks                []string                  `json:"risks"`
+	Blockers             []string                  `json:"blockers"`
+	PrivacyLevel         string                    `json:"privacy_level"`
+	Relationships        []TaskRelationship        `json:"relationships,omitempty"`
+	IntelligenceDecision *TaskIntelligenceDecision `json:"intelligence_decision,omitempty"`
 }
 
 type TaskListFilter struct {
@@ -723,6 +741,7 @@ type TaskListFilter struct {
 }
 
 func (s *Store) CreateTask(ctx context.Context, actorID string, in TaskInput) (Task, error) {
+	in.Scope = cleanStrings(in.Scope)
 	if strings.TrimSpace(in.Title) == "" || strings.TrimSpace(in.Goal) == "" {
 		return Task{}, userErr("validation", "title and goal are required")
 	}
@@ -779,7 +798,13 @@ func (s *Store) CreateTask(ctx context.Context, actorID string, in TaskInput) (T
 	if err != nil {
 		return Task{}, err
 	}
-	return t, s.addEvent(ctx, t.ID, actorID, "task.created", t)
+	if err := s.addEvent(ctx, t.ID, actorID, "task.created", t); err != nil {
+		return Task{}, err
+	}
+	if err := s.applyTaskInputIntelligence(ctx, actorID, t.ID, in); err != nil {
+		return Task{}, err
+	}
+	return t, nil
 }
 
 func (s *Store) ListTasks(ctx context.Context, projectID string) ([]Task, error) {
@@ -829,6 +854,16 @@ func (s *Store) listTasks(ctx context.Context, filter TaskListFilter) ([]Task, e
 		if err != nil {
 			return nil, err
 		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		t := &out[i]
 		t.ActiveLockCount = s.countActiveLocks(ctx, t.ID)
 		t.LatestHandoffStatus = s.latestHandoffStatus(ctx, t.ID)
 		t.PotentialConflictCount = s.countLockConflicts(ctx, t.ID)
@@ -836,9 +871,8 @@ func (s *Store) listTasks(ctx context.Context, filter TaskListFilter) ([]Task, e
 		t.OpenDependencyCount = s.countOpenDependencies(ctx, t.ID)
 		t.BlockedByCount = s.countDependents(ctx, t.ID)
 		t.SearchText = s.taskSearchText(ctx, t.ID)
-		out = append(out, t)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
@@ -873,6 +907,9 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 	subtasks, _ := s.ListSubtasks(ctx, id)
 	dependencies, _ := s.ListTaskDependencies(ctx, id)
 	dependents, _ := s.ListTaskDependents(ctx, id)
+	relationships, _ := s.ListTaskRelationships(ctx, id)
+	incomingRelationships, _ := s.ListIncomingTaskRelationships(ctx, id)
+	intelligenceDecisions, _ := s.ListTaskIntelligenceDecisions(ctx, id)
 	var parent *Task
 	if t.ParentTaskID != "" {
 		if p, err := s.GetTask(ctx, t.ParentTaskID); err == nil {
@@ -883,7 +920,7 @@ func (s *Store) TaskDetail(ctx context.Context, id string) (TaskDetail, error) {
 	if len(snapshots) > 0 {
 		latestSnapshot = &snapshots[len(snapshots)-1]
 	}
-	detail := TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, HandoffCheckpoints: checkpoints, Events: e}
+	detail := TaskDetail{Task: t, Owner: owner, Parent: parent, Subtasks: subtasks, Dependencies: dependencies, Dependents: dependents, Relationships: relationships, IncomingRelationships: incomingRelationships, IntelligenceDecisions: intelligenceDecisions, Context: c, Decisions: decisions, Comments: comments, Artifacts: artifacts, GitRefs: gitRefs, Locks: l, Handoffs: h, Snapshots: snapshots, LatestSnapshot: latestSnapshot, HandoffPacket: packet, HandoffCheckpoints: checkpoints, Events: e}
 	if packet != nil && len(checkpoints) > 0 && packet.Source == "agent_authored" {
 		rebuilt := buildHandoffPacketFromCheckpoints(detail, checkpoints)
 		rebuiltPacket := *packet
@@ -955,7 +992,7 @@ func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput
 		t.PrivacyLevel = in.PrivacyLevel
 	}
 	if in.Scope != nil {
-		t.Scope = in.Scope
+		t.Scope = cleanStrings(in.Scope)
 	}
 	if in.Requirements != nil {
 		t.Requirements = in.Requirements
@@ -981,7 +1018,46 @@ func (s *Store) UpdateTask(ctx context.Context, actorID, id string, in TaskInput
 	if oldStatus != t.Status {
 		_ = s.addEvent(ctx, t.ID, actorID, "task.status_changed", map[string]any{"from": oldStatus, "to": t.Status, "reason": reason})
 	}
-	return t, s.addEvent(ctx, t.ID, actorID, "task.updated", map[string]any{"task": t, "reason": reason})
+	if err := s.addEvent(ctx, t.ID, actorID, "task.updated", map[string]any{"task": t, "reason": reason}); err != nil {
+		return Task{}, err
+	}
+	if err := s.applyTaskInputIntelligence(ctx, actorID, t.ID, in); err != nil {
+		return Task{}, err
+	}
+	return t, nil
+}
+
+func (s *Store) applyTaskInputIntelligence(ctx context.Context, actorID, taskID string, in TaskInput) error {
+	createdRelationships := []TaskRelationship{}
+	for _, rel := range in.Relationships {
+		sourceTaskID := strings.TrimSpace(rel.SourceTaskID)
+		if sourceTaskID == "" {
+			sourceTaskID = taskID
+		}
+		targetTaskID := strings.TrimSpace(rel.TargetTaskID)
+		if targetTaskID == "" {
+			continue
+		}
+		created, err := s.AddTaskRelationship(ctx, actorID, sourceTaskID, targetTaskID, rel.Type, rel.Reason, rel.Confidence, rel.Source)
+		if err != nil {
+			return err
+		}
+		createdRelationships = append(createdRelationships, created)
+	}
+	if in.IntelligenceDecision != nil {
+		decision := *in.IntelligenceDecision
+		decision.TaskID = taskID
+		if decision.SelectedTaskID == "" {
+			decision.SelectedTaskID = taskID
+		}
+		if len(decision.Relationships) == 0 {
+			decision.Relationships = createdRelationships
+		}
+		if _, err := s.RecordTaskIntelligenceDecision(ctx, actorID, taskID, decision); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) DeleteTask(ctx context.Context, actorID, id string) error {
@@ -1009,6 +1085,8 @@ func (s *Store) DeleteTask(ctx context.Context, actorID, id string) error {
 	}{
 		{`UPDATE tasks SET parent_task_id=NULL WHERE parent_task_id=?`, []any{id}},
 		{`DELETE FROM task_dependencies WHERE task_id=? OR depends_on_id=?`, []any{id, id}},
+		{`DELETE FROM task_relationships WHERE source_task_id=? OR target_task_id=?`, []any{id, id}},
+		{`DELETE FROM task_intelligence_decisions WHERE task_id=? OR selected_task_id=?`, []any{id, id}},
 		{`DELETE FROM locks WHERE task_id=?`, []any{id}},
 		{`DELETE FROM conflicts WHERE task_id=? OR other_task_id=?`, []any{id, id}},
 		{`DELETE FROM context_entries WHERE task_id=?`, []any{id}},
@@ -1171,7 +1249,8 @@ func (s *Store) StartTaskSession(ctx context.Context, actorID, taskID string) (T
 		return TaskSession{}, err
 	}
 	if t.OwnerID == "" || t.OwnerID != actorID {
-		if _, err := s.ClaimTask(ctx, actorID, taskID, "session start", false); err != nil {
+		t, err = s.ClaimTask(ctx, actorID, taskID, "session start", false)
+		if err != nil {
 			return TaskSession{}, err
 		}
 	}
@@ -1359,6 +1438,277 @@ func (s *Store) listTaskDependencyRows(ctx context.Context, where, id string) ([
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) AddTaskRelationship(ctx context.Context, actorID, sourceTaskID, targetTaskID, relationshipType, reason string, confidence float64, source string) (TaskRelationship, error) {
+	sourceTaskID = strings.TrimSpace(sourceTaskID)
+	targetTaskID = strings.TrimSpace(targetTaskID)
+	if sourceTaskID == "" || targetTaskID == "" {
+		return TaskRelationship{}, userErr("validation", "source_task_id and target_task_id are required")
+	}
+	if sourceTaskID == targetTaskID {
+		return TaskRelationship{}, userErr("validation", "task relationship cannot point to itself")
+	}
+	relationshipType = normalizeTaskRelationshipType(relationshipType)
+	if !oneOf(relationshipType, "parent_of", "subtask_of", "related_to", "depends_on", "blocks", "continues", "duplicates", "supersedes") {
+		return TaskRelationship{}, userErr("validation", "invalid task relationship type")
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "inference"
+	}
+	if !oneOf(source, "agent", "inference", "developer", "daemon", "mcp", "taskpilot-run", "server") {
+		return TaskRelationship{}, userErr("validation", "invalid task relationship source")
+	}
+	sourceTask, err := s.GetTask(ctx, sourceTaskID)
+	if err != nil {
+		return TaskRelationship{}, err
+	}
+	targetTask, err := s.GetTask(ctx, targetTaskID)
+	if err != nil {
+		return TaskRelationship{}, err
+	}
+	if sourceTask.ProjectID != targetTask.ProjectID {
+		return TaskRelationship{}, userErr("validation", "task relationship must stay within one project")
+	}
+	if err := s.syncRelationshipSideEffects(ctx, actorID, sourceTask, targetTask, relationshipType); err != nil {
+		return TaskRelationship{}, err
+	}
+	confidence = normalizeConfidence(confidence)
+	now := time.Now().UTC()
+	rel := TaskRelationship{
+		ID:           newID("rel"),
+		SourceTaskID: sourceTaskID,
+		TargetTaskID: targetTaskID,
+		Type:         relationshipType,
+		Reason:       strings.TrimSpace(reason),
+		Confidence:   confidence,
+		Source:       source,
+		CreatedBy:    actorID,
+		CreatedAt:    now,
+	}
+	_, err = s.exec(ctx, `INSERT INTO task_relationships (id,source_task_id,target_task_id,relationship_type,reason,confidence,source,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		rel.ID, rel.SourceTaskID, rel.TargetTaskID, rel.Type, rel.Reason, rel.Confidence, rel.Source, rel.CreatedBy, ts(rel.CreatedAt))
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			if existing, ok, getErr := s.getTaskRelationshipByKey(ctx, sourceTaskID, targetTaskID, relationshipType); getErr != nil {
+				return TaskRelationship{}, getErr
+			} else if ok {
+				return existing, nil
+			}
+			return TaskRelationship{}, userErr("conflict", "task relationship already exists")
+		}
+		return TaskRelationship{}, err
+	}
+	return rel, s.addEvent(ctx, sourceTaskID, actorID, "task.relationship_added", rel)
+}
+
+func normalizeTaskRelationshipType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "_")
+	value = strings.ReplaceAll(value, " ", "_")
+	return value
+}
+
+func normalizeConfidence(value float64) float64 {
+	if value > 1 && value <= 100 {
+		value = value / 100
+	}
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
+}
+
+func (s *Store) syncRelationshipSideEffects(ctx context.Context, actorID string, sourceTask, targetTask Task, relationshipType string) error {
+	switch relationshipType {
+	case "subtask_of":
+		return s.setTaskParentFromRelationship(ctx, actorID, sourceTask, targetTask.ID, relationshipType)
+	case "parent_of":
+		return s.setTaskParentFromRelationship(ctx, actorID, targetTask, sourceTask.ID, relationshipType)
+	case "depends_on":
+		_, err := s.AddTaskDependency(ctx, actorID, sourceTask.ID, targetTask.ID)
+		if err != nil && errorCode(err) != "conflict" {
+			return err
+		}
+	case "blocks":
+		_, err := s.AddTaskDependency(ctx, actorID, targetTask.ID, sourceTask.ID)
+		if err != nil && errorCode(err) != "conflict" {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) setTaskParentFromRelationship(ctx context.Context, actorID string, child Task, parentID, relationshipType string) error {
+	if child.ParentTaskID == parentID {
+		return nil
+	}
+	if parentWouldCreateCycle(ctx, s, child.ID, parentID) {
+		return userErr("validation", "parent relationship would create a cycle")
+	}
+	_, err := s.UpdateTask(ctx, actorID, child.ID, TaskInput{ParentTaskID: parentID}, "task relationship "+relationshipType)
+	return err
+}
+
+func parentWouldCreateCycle(ctx context.Context, s *Store, childID, parentID string) bool {
+	for parentID != "" {
+		if parentID == childID {
+			return true
+		}
+		parent, err := s.GetTask(ctx, parentID)
+		if err != nil {
+			return false
+		}
+		parentID = parent.ParentTaskID
+	}
+	return false
+}
+
+func (s *Store) getTaskRelationshipByKey(ctx context.Context, sourceTaskID, targetTaskID, relationshipType string) (TaskRelationship, bool, error) {
+	row := s.queryRow(ctx, `SELECT id,source_task_id,target_task_id,relationship_type,reason,confidence,source,created_by,created_at FROM task_relationships WHERE source_task_id=? AND target_task_id=? AND relationship_type=?`, sourceTaskID, targetTaskID, relationshipType)
+	rel, err := scanTaskRelationship(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskRelationship{}, false, nil
+	}
+	if err != nil {
+		return TaskRelationship{}, false, err
+	}
+	s.hydrateTaskRelationship(ctx, &rel)
+	return rel, true, nil
+}
+
+func (s *Store) ListTaskRelationships(ctx context.Context, taskID string) ([]TaskRelationship, error) {
+	return s.listTaskRelationshipRows(ctx, `WHERE source_task_id=?`, taskID)
+}
+
+func (s *Store) ListIncomingTaskRelationships(ctx context.Context, taskID string) ([]TaskRelationship, error) {
+	return s.listTaskRelationshipRows(ctx, `WHERE target_task_id=?`, taskID)
+}
+
+func (s *Store) listTaskRelationshipRows(ctx context.Context, where, id string) ([]TaskRelationship, error) {
+	rows, err := s.query(ctx, `SELECT id,source_task_id,target_task_id,relationship_type,reason,confidence,source,created_by,created_at FROM task_relationships `+where+` ORDER BY created_at DESC`, id)
+	if err != nil {
+		return nil, err
+	}
+	out := []TaskRelationship{}
+	for rows.Next() {
+		rel, err := scanTaskRelationship(rows)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		out = append(out, rel)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		s.hydrateTaskRelationship(ctx, &out[i])
+	}
+	return out, nil
+}
+
+func (s *Store) hydrateTaskRelationship(ctx context.Context, rel *TaskRelationship) {
+	if rel == nil {
+		return
+	}
+	if t, err := s.GetTask(ctx, rel.SourceTaskID); err == nil {
+		rel.SourceTask = &t
+	}
+	if t, err := s.GetTask(ctx, rel.TargetTaskID); err == nil {
+		rel.TargetTask = &t
+	}
+}
+
+func (s *Store) RecordTaskIntelligenceDecision(ctx context.Context, actorID, taskID string, in TaskIntelligenceDecision) (TaskIntelligenceDecision, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		taskID = strings.TrimSpace(in.TaskID)
+	}
+	if taskID == "" {
+		return TaskIntelligenceDecision{}, userErr("validation", "task_id is required")
+	}
+	if _, err := s.GetTask(ctx, taskID); err != nil {
+		return TaskIntelligenceDecision{}, err
+	}
+	selectedTaskID := strings.TrimSpace(in.SelectedTaskID)
+	if selectedTaskID == "" {
+		selectedTaskID = taskID
+	}
+	if _, err := s.GetTask(ctx, selectedTaskID); err != nil {
+		return TaskIntelligenceDecision{}, err
+	}
+	action := strings.TrimSpace(in.Action)
+	if action == "" {
+		action = "reuse"
+	}
+	decision := strings.TrimSpace(in.Decision)
+	if decision == "" {
+		decision = "task_intelligence"
+	}
+	now := time.Now().UTC()
+	out := TaskIntelligenceDecision{
+		ID:             newID("intel"),
+		TaskID:         taskID,
+		ActorID:        actorID,
+		Decision:       decision,
+		Action:         action,
+		SelectedTaskID: selectedTaskID,
+		Confidence:     normalizeConfidence(in.Confidence),
+		Reason:         strings.TrimSpace(in.Reason),
+		Evidence:       cleanStrings(in.Evidence),
+		Candidates:     in.Candidates,
+		Relationships:  in.Relationships,
+		Renamed:        in.Renamed,
+		PreviousTitle:  strings.TrimSpace(in.PreviousTitle),
+		NewTitle:       strings.TrimSpace(in.NewTitle),
+		CreatedAt:      now,
+	}
+	_, err := s.exec(ctx, `INSERT INTO task_intelligence_decisions (id,task_id,actor_id,decision,action,selected_task_id,confidence,reason,evidence_json,candidates_json,relationships_json,renamed,previous_title,new_title,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		out.ID, out.TaskID, out.ActorID, out.Decision, out.Action, out.SelectedTaskID, out.Confidence, out.Reason, js(out.Evidence), js(out.Candidates), js(out.Relationships), boolInt(out.Renamed), out.PreviousTitle, out.NewTitle, ts(out.CreatedAt))
+	if err != nil {
+		return TaskIntelligenceDecision{}, err
+	}
+	return out, s.addEvent(ctx, taskID, actorID, "task.intelligence_decision", out)
+}
+
+func (s *Store) ListTaskIntelligenceDecisions(ctx context.Context, taskID string) ([]TaskIntelligenceDecision, error) {
+	rows, err := s.query(ctx, `SELECT id,task_id,actor_id,decision,action,selected_task_id,confidence,reason,evidence_json,candidates_json,relationships_json,renamed,previous_title,new_title,created_at FROM task_intelligence_decisions WHERE task_id=? ORDER BY created_at DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	out := []TaskIntelligenceDecision{}
+	for rows.Next() {
+		d, err := scanTaskIntelligenceDecision(rows)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) AppendContext(ctx context.Context, actorID, taskID, kind, content string) (ContextEntry, error) {
@@ -2759,6 +3109,18 @@ func (s *Store) taskSearchText(ctx context.Context, taskID string) string {
 		}
 		_ = rows.Close()
 	}
+	rows, err = s.query(ctx, `SELECT decision,reason,evidence_json FROM task_intelligence_decisions WHERE task_id=? ORDER BY created_at DESC LIMIT 20`, taskID)
+	if err == nil {
+		for rows.Next() {
+			var decision, reason, evidenceJSON string
+			if rows.Scan(&decision, &reason, &evidenceJSON) == nil {
+				evidence := []string{}
+				fromJS(evidenceJSON, &evidence)
+				parts = append(parts, decision, reason, strings.Join(evidence, " "))
+			}
+		}
+		_ = rows.Close()
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -2809,6 +3171,31 @@ func scanTask(row scanner) (Task, error) {
 	fromJS(risks, &t.Risks)
 	fromJS(blockers, &t.Blockers)
 	return t, nil
+}
+
+func scanTaskRelationship(row scanner) (TaskRelationship, error) {
+	var rel TaskRelationship
+	var created string
+	if err := row.Scan(&rel.ID, &rel.SourceTaskID, &rel.TargetTaskID, &rel.Type, &rel.Reason, &rel.Confidence, &rel.Source, &rel.CreatedBy, &created); err != nil {
+		return TaskRelationship{}, err
+	}
+	rel.CreatedAt = parseTS(created)
+	return rel, nil
+}
+
+func scanTaskIntelligenceDecision(row scanner) (TaskIntelligenceDecision, error) {
+	var d TaskIntelligenceDecision
+	var evidence, candidates, relationships, created string
+	var renamed int
+	if err := row.Scan(&d.ID, &d.TaskID, &d.ActorID, &d.Decision, &d.Action, &d.SelectedTaskID, &d.Confidence, &d.Reason, &evidence, &candidates, &relationships, &renamed, &d.PreviousTitle, &d.NewTitle, &created); err != nil {
+		return TaskIntelligenceDecision{}, err
+	}
+	fromJS(evidence, &d.Evidence)
+	fromJS(candidates, &d.Candidates)
+	fromJS(relationships, &d.Relationships)
+	d.Renamed = renamed != 0
+	d.CreatedAt = parseTS(created)
+	return d, nil
 }
 
 func scanLock(row scanner) (Lock, error) {

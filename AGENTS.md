@@ -13,6 +13,19 @@ When the user gives you a TaskPilot task ID:
 7. Prepare a handoff if stopping before completion.
 8. Mark complete only when the task completion criteria are satisfied.
 
+# Task Intelligence Rules
+
+Before creating a TaskPilot task or recording repo memory:
+
+1. Inspect the active task context, likely current repo task, related tasks, recent memory, changed files, and existing relationships.
+2. Prefer an existing task when the objective, active session, semantic memory, or changed files match the current work.
+3. Create a subtask for a smaller piece of an existing objective.
+4. Create a new task only for a distinct outcome, and connect it to related work with `parent_of`, `subtask_of`, `related_to`, `depends_on`, `blocks`, `continues`, `duplicates`, or `supersedes` when relevant.
+5. Record semantic memory against the task that owns the work, not a fresh file-based task.
+6. Use outcome-based task names such as `Fix semantic memory routing for active repo tasks`; avoid names like `Update controls.md` or `Inferred work on changed files`.
+7. Include the intended outcome, reasoning, verification, files, and remaining work when recording semantic memory.
+8. Improve inferred task titles, goals, scope, and relationships when better context becomes available.
+
 # Codebase Exploration Rules
 
 This repository is indexed using Codebase Memory MCP.

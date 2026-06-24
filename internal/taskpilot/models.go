@@ -109,6 +109,47 @@ type TaskDependency struct {
 	DependsOnTask *Task     `json:"depends_on_task,omitempty"`
 }
 
+type TaskRelationship struct {
+	ID           string    `json:"id"`
+	SourceTaskID string    `json:"source_task_id"`
+	TargetTaskID string    `json:"target_task_id"`
+	Type         string    `json:"type"`
+	Reason       string    `json:"reason"`
+	Confidence   float64   `json:"confidence"`
+	Source       string    `json:"source"`
+	CreatedBy    string    `json:"created_by"`
+	CreatedAt    time.Time `json:"created_at"`
+	SourceTask   *Task     `json:"source_task,omitempty"`
+	TargetTask   *Task     `json:"target_task,omitempty"`
+}
+
+type TaskIntelligenceCandidate struct {
+	TaskID     string   `json:"task_id,omitempty"`
+	Title      string   `json:"title,omitempty"`
+	Score      int      `json:"score"`
+	Confidence float64  `json:"confidence"`
+	Action     string   `json:"action"`
+	Reasons    []string `json:"reasons"`
+}
+
+type TaskIntelligenceDecision struct {
+	ID             string                      `json:"id"`
+	TaskID         string                      `json:"task_id"`
+	ActorID        string                      `json:"actor_id"`
+	Decision       string                      `json:"decision"`
+	Action         string                      `json:"action"`
+	SelectedTaskID string                      `json:"selected_task_id"`
+	Confidence     float64                     `json:"confidence"`
+	Reason         string                      `json:"reason"`
+	Evidence       []string                    `json:"evidence"`
+	Candidates     []TaskIntelligenceCandidate `json:"candidates"`
+	Relationships  []TaskRelationship          `json:"relationships,omitempty"`
+	Renamed        bool                        `json:"renamed,omitempty"`
+	PreviousTitle  string                      `json:"previous_title,omitempty"`
+	NewTitle       string                      `json:"new_title,omitempty"`
+	CreatedAt      time.Time                   `json:"created_at"`
+}
+
 type ContextEntry struct {
 	ID           string    `json:"id"`
 	TaskID       string    `json:"task_id"`
@@ -339,24 +380,27 @@ type Event struct {
 }
 
 type TaskDetail struct {
-	Task               Task                `json:"task"`
-	Owner              *Actor              `json:"owner,omitempty"`
-	Parent             *Task               `json:"parent,omitempty"`
-	Subtasks           []Task              `json:"subtasks"`
-	Dependencies       []TaskDependency    `json:"dependencies"`
-	Dependents         []TaskDependency    `json:"dependents"`
-	Context            []ContextEntry      `json:"context"`
-	Decisions          []DecisionRecord    `json:"decisions"`
-	Comments           []Comment           `json:"comments"`
-	Artifacts          []Artifact          `json:"artifacts"`
-	GitRefs            []GitRef            `json:"git_refs"`
-	Locks              []Lock              `json:"locks"`
-	Handoffs           []Handoff           `json:"handoffs"`
-	Snapshots          []ContextSnapshot   `json:"snapshots"`
-	LatestSnapshot     *ContextSnapshot    `json:"latest_snapshot,omitempty"`
-	HandoffPacket      *HandoffPacket      `json:"handoff_packet,omitempty"`
-	HandoffCheckpoints []HandoffCheckpoint `json:"handoff_checkpoints,omitempty"`
-	Events             []Event             `json:"events"`
+	Task                  Task                       `json:"task"`
+	Owner                 *Actor                     `json:"owner,omitempty"`
+	Parent                *Task                      `json:"parent,omitempty"`
+	Subtasks              []Task                     `json:"subtasks"`
+	Dependencies          []TaskDependency           `json:"dependencies"`
+	Dependents            []TaskDependency           `json:"dependents"`
+	Relationships         []TaskRelationship         `json:"relationships"`
+	IncomingRelationships []TaskRelationship         `json:"incoming_relationships"`
+	IntelligenceDecisions []TaskIntelligenceDecision `json:"intelligence_decisions,omitempty"`
+	Context               []ContextEntry             `json:"context"`
+	Decisions             []DecisionRecord           `json:"decisions"`
+	Comments              []Comment                  `json:"comments"`
+	Artifacts             []Artifact                 `json:"artifacts"`
+	GitRefs               []GitRef                   `json:"git_refs"`
+	Locks                 []Lock                     `json:"locks"`
+	Handoffs              []Handoff                  `json:"handoffs"`
+	Snapshots             []ContextSnapshot          `json:"snapshots"`
+	LatestSnapshot        *ContextSnapshot           `json:"latest_snapshot,omitempty"`
+	HandoffPacket         *HandoffPacket             `json:"handoff_packet,omitempty"`
+	HandoffCheckpoints    []HandoffCheckpoint        `json:"handoff_checkpoints,omitempty"`
+	Events                []Event                    `json:"events"`
 }
 
 type APIError struct {

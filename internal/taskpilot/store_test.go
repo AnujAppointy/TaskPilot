@@ -52,6 +52,30 @@ func TestLockConflictAndRelease(t *testing.T) {
 	}
 }
 
+func TestTaskScopeIsCleanedBeforePersisting(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Scoped Task", Goal: "Keep valid scopes only", Scope: []string{"", " README.md ", "  ", "src/*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(task.Scope, ","), "README.md,src/*"; got != want {
+		t.Fatalf("expected cleaned create scope %q, got %q", want, got)
+	}
+	updated, err := s.UpdateTask(ctx, a.ID, task.ID, TaskInput{Scope: []string{" ", "\t"}}, "clear blank scopes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Scope) != 0 {
+		t.Fatalf("expected blank update scope to be removed, got %+v", updated.Scope)
+	}
+	scopes := taskLockScopes(updated)
+	if len(scopes) != 1 || scopes[0].scope != "task:"+updated.ID || scopes[0].scopeType != "semantic_area" {
+		t.Fatalf("expected blank task scope to fall back to semantic task lock, got %+v", scopes)
+	}
+}
+
 func TestListTasksWithOrphanedLockOwnerDoesNotPanic(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -499,6 +523,76 @@ func TestTaskDependencyDuplicateRemovalAndCycleValidation(t *testing.T) {
 	}
 	if _, err := s.AddTaskDependency(ctx, a.ID, second.ID, first.ID); err != nil {
 		t.Fatalf("expected reverse dependency after removal to succeed: %v", err)
+	}
+}
+
+func TestTaskRelationshipsAndIntelligenceDecisionsInTaskDetail(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	parent, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Improve repo integration", Goal: "Coordinate repo intelligence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Define repository agent control rules", Goal: "Document repo control behavior"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Fix semantic routing", Goal: "Route memory to active repo task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subtaskRel, err := s.AddTaskRelationship(ctx, a.ID, child.ID, parent.ID, "subtask_of", "Control rules are part of repo integration", 0.92, "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subtaskRel.Type != "subtask_of" || subtaskRel.Confidence != 0.92 {
+		t.Fatalf("unexpected subtask relationship: %+v", subtaskRel)
+	}
+	if updated, err := s.GetTask(ctx, child.ID); err != nil {
+		t.Fatal(err)
+	} else if updated.ParentTaskID != parent.ID {
+		t.Fatalf("expected subtask relationship to set parent, got %+v", updated)
+	}
+	depRel, err := s.AddTaskRelationship(ctx, a.ID, child.ID, blocker.ID, "depends_on", "Controls depend on routing behavior", 0.8, "inference")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if depRel.Type != "depends_on" {
+		t.Fatalf("unexpected dependency relationship: %+v", depRel)
+	}
+	if _, err := s.RecordTaskIntelligenceDecision(ctx, a.ID, child.ID, TaskIntelligenceDecision{
+		Decision:       "repo_task_selection",
+		Action:         "reuse",
+		SelectedTaskID: child.ID,
+		Confidence:     0.87,
+		Reason:         "same objective and changed files",
+		Evidence:       []string{"objective: define controls", "files: controls.md"},
+		Candidates:     []TaskIntelligenceCandidate{{TaskID: child.ID, Title: child.Title, Score: 140, Confidence: 0.87, Action: "reuse", Reasons: []string{"same changed file set"}}},
+		Renamed:        true,
+		PreviousTitle:  "Update controls.md",
+		NewTitle:       child.Title,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := s.TaskDetail(ctx, child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Parent == nil || detail.Parent.ID != parent.ID {
+		t.Fatalf("expected parent in task detail, got %+v", detail.Parent)
+	}
+	if len(detail.Relationships) != 2 {
+		t.Fatalf("expected relationships in task detail, got %+v", detail.Relationships)
+	}
+	if len(detail.Dependencies) != 1 || detail.Dependencies[0].DependsOnID != blocker.ID {
+		t.Fatalf("depends_on relationship should mirror task dependency, got %+v", detail.Dependencies)
+	}
+	if len(detail.IntelligenceDecisions) != 1 || detail.IntelligenceDecisions[0].Reason != "same objective and changed files" {
+		t.Fatalf("expected intelligence decision in detail, got %+v", detail.IntelligenceDecisions)
+	}
+	if len(detail.IntelligenceDecisions[0].Candidates) != 1 || detail.IntelligenceDecisions[0].Candidates[0].TaskID != child.ID {
+		t.Fatalf("expected decision candidates in detail, got %+v", detail.IntelligenceDecisions[0].Candidates)
 	}
 }
 
@@ -1667,6 +1761,33 @@ func TestTaskSessionLifecycleReturnsToClaimed(t *testing.T) {
 	}
 	if len(locks) == 0 || locks[0].OwnerID != a.ID || locks[0].Status != "active" {
 		t.Fatalf("expected owned lock to remain active, got %+v", locks)
+	}
+}
+
+func TestTaskSessionWithBlankScopeUsesClaimedTaskSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Blank Scope Session", Goal: "Start cleanly", Scope: []string{" "}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := s.StartTaskSession(ctx, a.ID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ActorID != a.ID {
+		t.Fatalf("expected session actor %q, got %+v", a.ID, session)
+	}
+	if _, err := s.HeartbeatTask(ctx, a.ID, task.ID); err != nil {
+		t.Fatalf("expected session owner heartbeat to succeed: %v", err)
+	}
+	locks, err := s.ListLocks(ctx, task.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].OwnerID != a.ID || locks[0].Scope != "task:"+task.ID || locks[0].ScopeType != "semantic_area" {
+		t.Fatalf("expected semantic fallback lock owned by session actor, got %+v", locks)
 	}
 }
 
