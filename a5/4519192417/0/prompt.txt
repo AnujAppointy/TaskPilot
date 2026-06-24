@@ -1,0 +1,865 @@
+# Implement Multi-Terminal Actor Sessions and Real-Time Actor Management
+
+## Background
+
+TaskPilot currently supports only one globally registered actor per machine.
+
+When an actor is registered through the CLI, its credentials are stored in the global TaskPilot configuration. As a result, every terminal on that machine uses the same actor.
+
+This model does not match how developers actually work.
+
+A developer may simultaneously run:
+
+* Codex in one terminal
+* Claude Code in another terminal
+* Gemini or another agent in a third terminal
+* A manual TaskPilot CLI workflow in another terminal
+
+Each agent may be working on a different task and must communicate with TaskPilot using its own actor identity.
+
+The current machine-global actor configuration prevents this. Registering or activating another actor replaces the actor used by every terminal.
+
+## Goal
+
+Change TaskPilot from a **single globally active actor per machine** model to a **terminal-scoped actor session** model.
+
+Each terminal should be able to activate a different actor independently.
+
+Multiple actors running in separate terminals on the same laptop must be able to:
+
+* Connect to the same TaskPilot server simultaneously
+* Maintain separate actor identities
+* Work on different tasks
+* Record semantic memory against their respective tasks
+* Send heartbeats independently
+* Acquire and release locks independently
+* Appear as active actors in the TaskPilot UI
+* Disconnect without affecting actors running in other terminals
+
+The server URL and general TaskPilot settings may remain global, but the active actor identity must not be stored as one machine-wide value.
+
+---
+
+# Current Problem
+
+The current flow is approximately:
+
+1. An actor is created in the TaskPilot UI.
+2. The actor secret is copied from the UI.
+3. The developer registers or activates that actor through the CLI.
+4. TaskPilot saves that actor globally.
+5. Every terminal on the machine starts using the same actor.
+
+This causes several problems:
+
+* Only one actor can practically be active on a machine.
+* Activating one actor replaces the previously active actor.
+* Parallel agents cannot maintain separate identities.
+* Semantic memory may be attributed to the wrong actor.
+* Task ownership and lock information become unreliable.
+* The UI cannot accurately show which actors are currently active.
+* Closing one terminal may incorrectly affect the global actor state.
+
+---
+
+# Required Direction
+
+## 1. Separate Global Configuration from Terminal Actor Identity
+
+The TaskPilot configuration should be divided into two scopes.
+
+### Machine-level configuration
+
+The following values may remain global:
+
+* TaskPilot server URL
+* Workspace
+* Project or repository defaults
+* General CLI preferences
+* TLS or network settings
+* Non-actor-specific authentication settings
+
+### Terminal or session-level configuration
+
+The following values must be terminal-specific:
+
+* Actor ID
+* Actor secret or session token
+* Actor session ID
+* Current task ID
+* Agent/provider identity
+* Repository path
+* Process information
+* Session start time
+* Last heartbeat time
+
+Activating an actor in one terminal must not modify the actor used by any other terminal.
+
+---
+
+## 2. Introduce Terminal-Scoped Actor Activation
+
+The CLI should support activating an actor only for the current terminal session.
+
+Example flow:
+
+```bash
+taskpilot actor activate --secret <actor-secret>
+```
+
+After activation:
+
+* The current terminal uses that actor.
+* Other existing terminals remain unchanged.
+* New terminals do not automatically inherit the actor unless explicitly configured.
+* Commands executed in the current terminal are attributed to that actor.
+* Child agent processes started from the terminal may inherit the actor session.
+* Closing or deactivating the terminal session should not disconnect other actors.
+
+The implementation may use:
+
+* Environment variables
+* A shell-session-specific configuration file
+* A generated session token
+* A terminal session identifier
+* A wrapper process that injects actor context
+* Another reliable session-scoped mechanism
+
+Do not use a single globally overwritten `actor_id` or `actor_secret`.
+
+---
+
+## 3. Create a Server-Side Actor Session
+
+Activating an actor should create a distinct server-side session.
+
+Each session should include fields such as:
+
+```text
+session_id
+actor_id
+user_id
+workspace_id
+project_id
+repository_id
+machine_id
+terminal_id
+agent_provider
+process_id
+started_at
+last_heartbeat_at
+ended_at
+status
+current_task_id
+client_version
+```
+
+The session must have a unique ID, even when the same actor is activated more than once.
+
+This allows TaskPilot to distinguish between:
+
+* One actor running in one terminal
+* One actor running in multiple terminals
+* Multiple actors running on the same machine
+* Multiple actors working in the same repository
+* Actors that are connected but idle
+* Actors that have stopped unexpectedly
+
+---
+
+## 4. Define Actor and Session Status Clearly
+
+The UI must distinguish between an **actor** and an **actor session**.
+
+An actor is a persistent identity.
+
+A session represents one active connection from a terminal, agent, or process.
+
+Recommended session statuses:
+
+* `connecting`
+* `active`
+* `idle`
+* `disconnected`
+* `stale`
+* `ended`
+
+An actor should be considered active when it has at least one non-stale active session.
+
+For example:
+
+```text
+Actor: anuj_codex
+Status: Active
+Active sessions: 2
+```
+
+If all sessions become stale or end:
+
+```text
+Actor: anuj_codex
+Status: Offline
+Active sessions: 0
+```
+
+The UI should show both:
+
+* Number of active actors
+* Number of active terminal sessions
+
+Example:
+
+```text
+3 active actors
+5 active sessions
+```
+
+Do not treat five sessions belonging to the same actor as five different actors.
+
+---
+
+## 5. Add Session Heartbeats
+
+Every active terminal actor session should send periodic heartbeats to the TaskPilot server.
+
+The server should update:
+
+* Last heartbeat time
+* Session status
+* Current task
+* Repository
+* Agent provider
+* Relevant process information
+
+If heartbeats stop beyond a configured timeout, the session should become `stale` or `disconnected`.
+
+Recommended behaviour:
+
+* Active heartbeat interval: configurable
+* Stale threshold: configurable
+* Session cleanup: server-controlled
+* Reconnection: reuse or replace the session safely
+* Closing one session: affect only that specific session
+
+The server must not mark the entire actor offline while another healthy session for that actor still exists.
+
+---
+
+## 6. Preserve Actor Identity Across CLI and Agent Operations
+
+Every operation originating from a terminal must include its actor session context.
+
+This includes:
+
+* Task creation
+* Task claiming
+* Task updates
+* Semantic-memory writes
+* Repository activity
+* File-change observations
+* Heartbeats
+* Lock creation
+* Lock renewal
+* Lock release
+* Handoffs
+* Context retrieval
+* Agent-authored decisions
+
+Every write should include, where applicable:
+
+```text
+actor_id
+actor_session_id
+task_id
+repository_id
+machine_id
+agent_provider
+timestamp
+```
+
+This ensures that semantic memory from one terminal cannot accidentally be attributed to the actor active in another terminal.
+
+---
+
+## 7. Route Semantic Memory by Actor Session
+
+Semantic-memory routing must use the current terminal’s actor session.
+
+The routing priority should be:
+
+1. Explicit task ID supplied by the agent
+2. Current task associated with the actor session
+3. Task associated with the current repository activity
+4. Existing task with the strongest intent match
+5. New inferred task only when no suitable task exists
+
+The server must validate that the memory write belongs to the actor session making the request.
+
+Example:
+
+```text
+Terminal 1
+Actor: anuj_codex
+Task: Improve task relationship inference
+
+Terminal 2
+Actor: anuj_claude
+Task: Add actor session management
+```
+
+Semantic memory from Terminal 1 must never be written to Terminal 2’s task merely because both terminals are running on the same machine or repository.
+
+---
+
+# CLI Requirements
+
+## 8. Update Actor Activation Commands
+
+Provide clear actor-session commands.
+
+Example command structure:
+
+```bash
+taskpilot actor activate --secret <secret>
+taskpilot actor current
+taskpilot actor deactivate
+taskpilot actor sessions
+```
+
+Possible behaviour:
+
+### Activate an actor
+
+```bash
+taskpilot actor activate --secret tp_actor_xxx
+```
+
+Expected output:
+
+```text
+Actor activated for this terminal.
+
+Actor: anuj_codex
+Session: session_xxx
+Server: https://taskpilot.example.com
+Status: active
+```
+
+### Show current terminal actor
+
+```bash
+taskpilot actor current
+```
+
+Expected output:
+
+```text
+Actor: anuj_codex
+Session: session_xxx
+Scope: current terminal
+Current task: Improve actor session management
+Status: active
+```
+
+### Deactivate current terminal actor
+
+```bash
+taskpilot actor deactivate
+```
+
+This should end only the current terminal session.
+
+It must not:
+
+* Log out other terminals
+* Remove the actor
+* Revoke the actor secret
+* End other sessions belonging to the same actor
+
+---
+
+## 9. Change `taskpilot config show`
+
+`taskpilot config show` currently exposes one globally configured actor.
+
+Change the output so it clearly separates global and current-session configuration.
+
+Example:
+
+```text
+Global configuration
+--------------------
+Server: https://taskpilot.example.com
+Workspace: workspace_demo
+Repository: /Users/anuj/project
+
+Current terminal session
+------------------------
+Actor: anuj_codex
+Actor ID: actor_xxx
+Session ID: session_xxx
+Provider: codex
+Status: active
+Current task: task_xxx
+```
+
+When no actor is active in the terminal:
+
+```text
+Current terminal session
+------------------------
+No actor is active in this terminal.
+
+Activate one with:
+taskpilot actor activate --secret <actor-secret>
+```
+
+The command must not show another terminal’s actor as the current actor.
+
+---
+
+## 10. Support Non-Interactive Agent Startup
+
+TaskPilot must support terminal-specific actor identity in automated commands.
+
+Examples:
+
+```bash
+TASKPILOT_ACTOR_SECRET=<secret> codex
+```
+
+or:
+
+```bash
+taskpilot actor run --secret <secret> -- codex
+```
+
+or:
+
+```bash
+taskpilot session start --actor-secret <secret> --provider codex
+```
+
+The final interface should support:
+
+* Interactive terminals
+* CLI agents
+* GUI agents that launch local processes
+* MCP servers
+* Scripts and CI-style workflows
+
+Secrets should not unnecessarily appear in process lists, logs, shell history, or diagnostic output.
+
+---
+
+# UI Actor Management
+
+## 11. Improve the Actors Page
+
+The Actors page should show all actors available to the logged-in user or team.
+
+For each actor, display:
+
+* Actor name
+* Actor ID
+* Provider or agent type
+* Owner
+* Current status
+* Active session count
+* Current task or tasks
+* Connected repositories
+* Last activity
+* Last heartbeat
+* Machine or device information
+* Session start time
+
+Example:
+
+```text
+anuj_codex
+Status: Active
+Active sessions: 1
+Current task: Improve task relationship inference
+Repository: taskpilot
+Device: Appointys-MacBook-Air-4
+Last heartbeat: 8 seconds ago
+```
+
+Another example:
+
+```text
+anuj_claude
+Status: Active
+Active sessions: 2
+Tasks:
+- Add multi-terminal actor sessions
+- Improve CLI context injection
+Last heartbeat: 4 seconds ago
+```
+
+---
+
+## 12. Show Active Actor Counts
+
+The UI should display summary information such as:
+
+```text
+Total actors: 8
+Active actors: 3
+Active sessions: 5
+Idle actors: 1
+Offline actors: 4
+```
+
+These counts must update in near real time.
+
+The active status should be calculated from session heartbeats, not from whether an actor was previously registered.
+
+---
+
+## 13. Add Actor Session Details
+
+Selecting an actor should show its individual sessions.
+
+Example:
+
+```text
+Actor: anuj_codex
+
+Session 1
+Terminal: terminal_a12
+Provider: Codex
+Device: Appointys-MacBook-Air-4
+Repository: taskpilot
+Current task: Improve task relationship inference
+Started: 10:15 AM
+Last heartbeat: 5 seconds ago
+Status: Active
+
+Session 2
+Terminal: terminal_b73
+Provider: Codex
+Device: Appointys-MacBook-Air-4
+Repository: ux-intelligence
+Current task: Fix PostHog ingestion
+Started: 11:05 AM
+Last heartbeat: 12 seconds ago
+Status: Active
+```
+
+This makes parallel activity visible and debuggable.
+
+---
+
+## 14. Preserve the Secret Copy Flow
+
+The existing flow of copying an actor secret from the UI and using it in the CLI should remain available.
+
+For every actor, provide:
+
+* Copy activation command
+* Copy actor secret
+* Reveal secret where security rules permit
+* Rotate or regenerate secret
+* Revoke secret
+* View active sessions
+
+Example copyable command:
+
+```bash
+taskpilot actor activate --secret tp_actor_xxx
+```
+
+The copied command should activate that actor only in the terminal where it is executed.
+
+It must not replace the actor identity in other terminals.
+
+For security:
+
+* Secrets should be masked by default.
+* Secrets must never appear in routine logs.
+* Secret rotation should invalidate affected sessions according to a defined policy.
+* Revoking an actor secret should prevent new sessions.
+* The UI should clearly warn before terminating existing sessions.
+
+---
+
+## 15. Real-Time UI Updates
+
+When an actor is activated in a terminal, the UI should quickly reflect:
+
+* Actor status changed to active
+* Active session count increased
+* Device and terminal details
+* Provider
+* Current repository
+* Current task, when known
+* Last heartbeat
+
+When the terminal is closed or deactivated:
+
+* Only that session should be marked ended or disconnected.
+* The session count should decrease.
+* The actor should remain active if another session is still healthy.
+* The actor should become offline only when no active sessions remain.
+
+Use real-time updates through WebSocket, server-sent events, polling, or the existing TaskPilot event mechanism.
+
+---
+
+# Parallel Working Example
+
+Assume one developer opens three terminals.
+
+## Terminal 1
+
+```bash
+taskpilot actor activate --secret <anuj-codex-secret>
+codex
+```
+
+Actor:
+
+```text
+anuj_codex
+```
+
+Current task:
+
+```text
+Improve task naming and relationships
+```
+
+## Terminal 2
+
+```bash
+taskpilot actor activate --secret <anuj-claude-secret>
+claude
+```
+
+Actor:
+
+```text
+anuj_claude
+```
+
+Current task:
+
+```text
+Add multi-terminal actor sessions
+```
+
+## Terminal 3
+
+```bash
+taskpilot actor activate --secret <anuj-gemini-secret>
+gemini
+```
+
+Actor:
+
+```text
+anuj_gemini
+```
+
+Current task:
+
+```text
+Improve repository context injection
+```
+
+Expected behaviour:
+
+* All three actor sessions remain connected simultaneously.
+* Each terminal has its own actor identity.
+* Each actor sends independent heartbeats.
+* Each actor writes semantic memory to its own task.
+* Task locks are owned by the correct actor session.
+* Activating Terminal 3 does not modify Terminals 1 or 2.
+* The UI shows three active actors and three active sessions.
+* Closing Terminal 2 does not affect Terminals 1 or 3.
+
+---
+
+# Same Actor in Multiple Terminals
+
+The system should also define behaviour when the same actor is activated in multiple terminals.
+
+Recommended behaviour:
+
+* Allow multiple sessions unless actor policy explicitly forbids it.
+* Give every activation a unique session ID.
+* Show the number of sessions in the UI.
+* Attribute operations to both the actor ID and session ID.
+* Detect conflicting work by session and task.
+* Do not silently overwrite the previous session.
+
+Example:
+
+```text
+Actor: anuj_codex
+Active sessions: 2
+```
+
+The UI should make it clear that this is one actor identity running from two terminal sessions.
+
+---
+
+# Locks and Task Ownership
+
+Task locks must become session-aware.
+
+A lock should include:
+
+```text
+lock_id
+task_id
+actor_id
+actor_session_id
+repository_id
+resource
+created_at
+renewed_at
+expires_at
+```
+
+Important behaviour:
+
+* One session cannot accidentally renew another session’s lock.
+* Ending a session releases or expires only its locks.
+* Locks should not be tied only to a machine-global actor.
+* The UI should show which actor session owns a lock.
+* Stale session cleanup should safely release expired locks.
+* Two sessions belonging to the same actor should still be treated as separate workers.
+
+---
+
+# Migration Requirements
+
+Existing users may already have a globally registered actor.
+
+Provide a safe migration:
+
+1. Keep existing server and workspace configuration.
+2. Detect the old global actor configuration.
+3. Offer or automatically migrate it into a terminal session.
+4. Stop treating it as a permanent machine-global active actor.
+5. Avoid breaking existing CLI and MCP workflows.
+6. Clearly warn when deprecated global actor fields are being used.
+7. Remove deprecated behaviour after an appropriate compatibility period.
+
+Do not silently delete existing credentials or actor records.
+
+---
+
+# Reliability Requirements
+
+The implementation must handle:
+
+* Terminal crashes
+* Laptop sleep and wake
+* Network disconnection
+* Server restart
+* CLI restart
+* Agent process crash
+* Duplicate heartbeats
+* Session reconnection
+* Secret rotation
+* Actor deletion
+* Stale sessions
+* Multiple repositories
+* Multiple actors using the same repository
+* One actor using multiple terminals
+* Concurrent semantic-memory writes
+
+Session creation and heartbeat handling must be idempotent where appropriate.
+
+---
+
+# Security Requirements
+
+* Never store actor secrets in plain-text logs.
+* Do not include complete secrets in `config show`.
+* Mask secrets in the UI by default.
+* Prefer exchanging the actor secret for a short-lived session token.
+* Associate session tokens with actor, workspace, device, and session.
+* Support secret revocation and rotation.
+* Validate every semantic write and task operation against the actor session.
+* Prevent one terminal from impersonating another session.
+* Do not expose another user’s actors or secrets.
+* Record security-sensitive actor actions in an audit log.
+
+---
+
+# Auditability
+
+Record important session events:
+
+* Actor activated
+* Session created
+* Session reconnected
+* Session became stale
+* Session ended
+* Secret rotated
+* Secret revoked
+* Task association changed
+* Semantic memory written
+* Lock acquired or released
+
+Each audit record should include:
+
+```text
+actor_id
+actor_session_id
+user_id
+machine_id
+event_type
+timestamp
+relevant_task_id
+relevant_repository_id
+```
+
+---
+
+# Acceptance Criteria
+
+The feature is complete when:
+
+1. Different actors can be active in different terminals on the same machine.
+2. Activating an actor in one terminal does not change any other terminal.
+3. `taskpilot config show` separates global configuration from the current terminal session.
+4. Every actor activation creates an independent server-side session.
+5. Multiple sessions communicate with the server simultaneously.
+6. Heartbeats and active status are tracked per session.
+7. The UI accurately shows the number of active actors.
+8. The UI separately shows the number of active sessions.
+9. The UI updates when an actor connects or disconnects.
+10. Semantic memory is attributed to the correct actor, session, and task.
+11. Locks are owned and renewed by the correct actor session.
+12. Closing one terminal affects only its corresponding session.
+13. One actor may have multiple visible sessions without overwriting previous sessions.
+14. Actor secrets remain copyable from the UI using a secure, masked flow.
+15. Existing global actor configurations can migrate safely.
+16. CLI, MCP, GUI-agent, and repository-enabled workflows continue to function.
+17. Parallel agents can work in the same repository without actor identity collisions.
+18. The system remains reliable after crashes, network interruptions, and reconnects.
+
+## Final Expected Outcome
+
+TaskPilot should treat every terminal or agent process as an independent actor session rather than assuming that one machine has only one globally active actor.
+
+A developer should be able to open several terminals, activate a different actor in each one, run multiple agents in parallel, and have every task action, semantic-memory write, heartbeat, and lock correctly attributed.
+
+The TaskPilot UI should provide a real-time view of:
+
+* Which actors are active
+* How many actors are active
+* How many sessions each actor has
+* Which terminal, agent, repository, and task each session is using
+* When each actor was last active
+
+The complete experience should work without actor identities replacing or interfering with one another.
+
+---
+
+explain the scenario after this update in 2 different laptop
