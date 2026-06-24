@@ -218,6 +218,53 @@ func TestActorSecretVerification(t *testing.T) {
 	}
 }
 
+func TestSignedUserSessionSurvivesMissingSessionRow(t *testing.T) {
+	t.Setenv("TASKPILOT_SECRET_KEY", strings.Repeat("s", 32))
+	ctx := context.Background()
+	s := testStore(t)
+	user, err := s.CreateUser(ctx, "signed@example.com", "Signed User", "strong-password", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateSession(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(token, signedSessionPrefix) {
+		t.Fatalf("expected signed token, got %q", token)
+	}
+	if _, err := s.exec(ctx, `DELETE FROM sessions WHERE token_hash=?`, hashToken(token)); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.VerifySession(ctx, token)
+	if err != nil {
+		t.Fatalf("signed fallback should verify without a session row: %v", err)
+	}
+	if p.UserID != user.ID || p.Email != user.Email {
+		t.Fatalf("unexpected principal: %+v", p)
+	}
+}
+
+func TestSignedUserSessionRevokedRowBlocksFallback(t *testing.T) {
+	t.Setenv("TASKPILOT_SECRET_KEY", strings.Repeat("s", 32))
+	ctx := context.Background()
+	s := testStore(t)
+	user, err := s.CreateUser(ctx, "revoked@example.com", "Revoked User", "strong-password", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateSession(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeSession(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifySession(ctx, token); err == nil || errorCode(err) != "unauthorized" {
+		t.Fatalf("revoked session should not use signed fallback, err=%v", err)
+	}
+}
+
 func TestUserSessionAuth(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

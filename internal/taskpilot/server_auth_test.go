@@ -145,6 +145,38 @@ func TestLoginSessionTokenAuthenticatesWhenCookieIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestBearerSessionAuthenticatesWhenCookieIsStale(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	user, err := store.CreateUser(ctx, "mixed@example.com", "Mixed Auth User", "strong-password", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(store, "dev-token")
+
+	login := req(t, server, "POST", "/api/auth/login", map[string]any{"email": user.Email, "password": "strong-password"})
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
+	}
+	var loginBody map[string]any
+	if err := json.Unmarshal(login.Body.Bytes(), &loginBody); err != nil {
+		t.Fatal(err)
+	}
+	token, _ := loginBody["session_token"].(string)
+	if token == "" {
+		t.Fatalf("expected login response to include session token: %+v", loginBody)
+	}
+
+	r := httptest.NewRequest("GET", "/api/workspaces", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.AddCookie(&http.Cookie{Name: "taskpilot_session", Value: "stale-session-token"})
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid bearer should authenticate after stale cookie fails, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestSessionHandoffAcceptUsesDefaultActorOwner(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

@@ -2,10 +2,14 @@ package taskpilot
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"time"
 
@@ -13,6 +17,14 @@ import (
 )
 
 const sessionTTL = 12 * time.Hour
+
+const signedSessionPrefix = "tps2_"
+
+type signedSessionPayload struct {
+	UserID    string `json:"uid"`
+	ExpiresAt int64  `json:"exp"`
+	Nonce     string `json:"nonce"`
+}
 
 func hashPassword(password string) (string, error) {
 	if len(password) < 8 {
@@ -216,9 +228,9 @@ func (s *Store) AuthenticateUser(ctx context.Context, email, password string) (U
 }
 
 func (s *Store) CreateSession(ctx context.Context, userID string) (string, error) {
-	token := "tps_" + newSecret()
 	now := time.Now().UTC()
 	expires := now.Add(sessionTTL)
+	token := newUserSessionToken(userID, expires)
 	_, err := s.exec(ctx, `INSERT INTO sessions (id,user_id,token_hash,created_at,expires_at,revoked_at) VALUES (?,?,?,?,?,NULL)`,
 		newID("sess"), userID, hashToken(token), ts(now), ts(expires))
 	return token, err
@@ -231,16 +243,104 @@ func (s *Store) VerifySession(ctx context.Context, token string) (Principal, err
 	var userID, email, name string
 	err := s.queryRow(ctx, `SELECT users.id, users.email, users.name FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.revoked_at IS NULL AND sessions.expires_at>? AND users.active=1`,
 		hashToken(token), ts(time.Now().UTC())).Scan(&userID, &email, &name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if blocked, blockErr := s.sessionTokenKnownButInvalid(ctx, token); blockErr != nil {
+				return Principal{}, blockErr
+			} else if blocked {
+				return Principal{}, userErr("unauthorized", "invalid session")
+			}
+			return s.verifySignedSessionFallback(ctx, token)
+		}
+		return Principal{}, err
+	}
+	return Principal{ID: userID, Kind: "user", UserID: userID, ActorID: userID, Email: email, Name: name}, nil
+}
+
+func (s *Store) sessionTokenKnownButInvalid(ctx context.Context, token string) (bool, error) {
+	var id string
+	err := s.queryRow(ctx, `SELECT id FROM sessions WHERE token_hash=?`, hashToken(token)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) verifySignedSessionFallback(ctx context.Context, token string) (Principal, error) {
+	payload, ok := verifySignedSessionToken(token)
+	if !ok {
+		return Principal{}, userErr("unauthorized", "invalid session")
+	}
+	var email, name string
+	var active int
+	err := s.queryRow(ctx, `SELECT email,name,active FROM users WHERE id=?`, payload.UserID).Scan(&email, &name, &active)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Principal{}, userErr("unauthorized", "invalid session")
 	}
 	if err != nil {
 		return Principal{}, err
 	}
-	return Principal{ID: userID, Kind: "user", UserID: userID, ActorID: userID, Email: email, Name: name}, nil
+	if active != 1 {
+		return Principal{}, userErr("unauthorized", "invalid session")
+	}
+	return Principal{ID: payload.UserID, Kind: "user", UserID: payload.UserID, ActorID: payload.UserID, Email: email, Name: name}, nil
 }
 
 func (s *Store) RevokeSession(ctx context.Context, token string) error {
 	_, err := s.exec(ctx, `UPDATE sessions SET revoked_at=? WHERE token_hash=?`, ts(time.Now().UTC()), hashToken(token))
 	return err
+}
+
+func newUserSessionToken(userID string, expires time.Time) string {
+	if sessionSigningKey() == "" {
+		return "tps_" + newSecret()
+	}
+	payload := signedSessionPayload{UserID: userID, ExpiresAt: expires.UTC().Unix(), Nonce: newSecret()}
+	payloadBytes, _ := json.Marshal(payload)
+	payloadPart := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	sig := signSessionPayload(payloadPart)
+	return signedSessionPrefix + payloadPart + "." + sig
+}
+
+func verifySignedSessionToken(token string) (signedSessionPayload, bool) {
+	if sessionSigningKey() == "" || !strings.HasPrefix(token, signedSessionPrefix) {
+		return signedSessionPayload{}, false
+	}
+	parts := strings.Split(strings.TrimPrefix(token, signedSessionPrefix), ".")
+	if len(parts) != 2 {
+		return signedSessionPayload{}, false
+	}
+	expected := signSessionPayload(parts[0])
+	if !hmac.Equal([]byte(expected), []byte(parts[1])) {
+		return signedSessionPayload{}, false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return signedSessionPayload{}, false
+	}
+	var payload signedSessionPayload
+	if json.Unmarshal(payloadBytes, &payload) != nil || payload.UserID == "" {
+		return signedSessionPayload{}, false
+	}
+	if time.Now().UTC().Unix() > payload.ExpiresAt {
+		return signedSessionPayload{}, false
+	}
+	return payload, true
+}
+
+func signSessionPayload(payloadPart string) string {
+	mac := hmac.New(sha256.New, []byte(sessionSigningKey()))
+	_, _ = mac.Write([]byte(payloadPart))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func sessionSigningKey() string {
+	key := strings.TrimSpace(os.Getenv("TASKPILOT_SECRET_KEY"))
+	if len(key) < 32 {
+		return ""
+	}
+	return key
 }

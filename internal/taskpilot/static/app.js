@@ -267,6 +267,16 @@ async function refreshNow() {
     ensureEventStream();
   } catch (err) {
     if (epoch !== apiState.authEpoch) return;
+    if (err.status === 401) {
+      apiState.authEpoch += 1;
+      setSessionToken("");
+      clearActorSettings();
+      apiState.principal = null;
+      apiState.error = "";
+      stopEventStream();
+      renderWhenSafe();
+      return;
+    }
     apiState.error = err.message;
     stopEventStream();
   }

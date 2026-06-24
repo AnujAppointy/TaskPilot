@@ -201,7 +201,9 @@ func principal(r *http.Request) Principal {
 
 func (s *Server) authPrincipal(r *http.Request) (Principal, bool) {
 	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
-		return s.authPrincipalFromSessionToken(r, cookie.Value)
+		if p, ok := s.authPrincipalFromSessionToken(r, cookie.Value); ok {
+			return p, true
+		}
 	}
 	if token := bearerToken(r); token != "" {
 		return s.authPrincipalFromSessionToken(r, token)
