@@ -110,6 +110,41 @@ func TestSessionLoginPasswordAndUserRoutes(t *testing.T) {
 	}
 }
 
+func TestLoginSessionTokenAuthenticatesWhenCookieIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	user, err := store.CreateUser(ctx, "token@example.com", "Token User", "strong-password", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(store, "dev-token")
+
+	login := req(t, server, "POST", "/api/auth/login", map[string]any{"email": user.Email, "password": "strong-password"})
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", login.Code, login.Body.String())
+	}
+	var loginBody map[string]any
+	if err := json.Unmarshal(login.Body.Bytes(), &loginBody); err != nil {
+		t.Fatal(err)
+	}
+	token, _ := loginBody["session_token"].(string)
+	if token == "" {
+		t.Fatalf("expected login response to include session token: %+v", loginBody)
+	}
+	me := bearerReq(t, server, "GET", "/api/me", nil, token)
+	if me.Code != http.StatusOK {
+		t.Fatalf("bearer /api/me status=%d body=%s", me.Code, me.Body.String())
+	}
+	logout := bearerReq(t, server, "POST", "/api/auth/logout", map[string]any{}, token)
+	if logout.Code != http.StatusOK {
+		t.Fatalf("bearer logout status=%d body=%s", logout.Code, logout.Body.String())
+	}
+	again := bearerReq(t, server, "GET", "/api/me", nil, token)
+	if again.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked bearer should be unauthorized, status=%d body=%s", again.Code, again.Body.String())
+	}
+}
+
 func TestSessionHandoffAcceptUsesDefaultActorOwner(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -282,6 +317,26 @@ func sessionReq(t *testing.T, h http.Handler, method, path string, body any, act
 	r.Header.Set("X-Actor-ID", actorID)
 	r.Header.Set("X-Actor-Session-ID", sessionID)
 	r.Header.Set("X-Actor-Session-Token", sessionToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	return rec
+}
+
+func bearerReq(t *testing.T, h http.Handler, method, path string, body any, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	var rbody *bytes.Reader
+	if body == nil {
+		rbody = bytes.NewReader(nil)
+	} else {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rbody = bytes.NewReader(b)
+	}
+	r := httptest.NewRequest(method, path, rbody)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	return rec

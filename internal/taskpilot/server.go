@@ -201,21 +201,36 @@ func principal(r *http.Request) Principal {
 
 func (s *Server) authPrincipal(r *http.Request) (Principal, bool) {
 	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
-		p, err := s.store.VerifySession(r.Context(), cookie.Value)
+		return s.authPrincipalFromSessionToken(r, cookie.Value)
+	}
+	if token := bearerToken(r); token != "" {
+		return s.authPrincipalFromSessionToken(r, token)
+	}
+	return Principal{}, false
+}
+
+func (s *Server) authPrincipalFromSessionToken(r *http.Request, token string) (Principal, bool) {
+	p, err := s.store.VerifySession(r.Context(), token)
+	if err != nil {
+		return Principal{}, false
+	}
+	if p.Kind == "user" && p.UserID != "" {
+		actor, err := s.store.EnsureDefaultActorForUser(r.Context(), User{ID: p.UserID, Email: p.Email, Name: p.Name})
 		if err != nil {
 			return Principal{}, false
 		}
-		if p.Kind == "user" && p.UserID != "" {
-			actor, err := s.store.EnsureDefaultActorForUser(r.Context(), User{ID: p.UserID, Email: p.Email, Name: p.Name})
-			if err != nil {
-				return Principal{}, false
-			}
-			p.ActorID = actor.ID
-			s.store.TouchActor(r.Context(), actor.ID)
-		}
-		return p, true
+		p.ActorID = actor.ID
+		s.store.TouchActor(r.Context(), actor.ID)
 	}
-	return Principal{}, false
+	return p, true
+}
+
+func bearerToken(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) < len("Bearer ")+1 || !strings.EqualFold(auth[:len("Bearer ")], "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(auth[len("Bearer "):])
 }
 
 func (s *Server) requireScope(required string, next http.HandlerFunc) http.Handler {
@@ -247,6 +262,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   false,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(sessionTTL),
 	})
@@ -276,7 +292,7 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, token)
-	writeJSON(w, http.StatusCreated, map[string]any{"user": u, "default_actor": actor, "actor_recommendation": actorRecommendation()})
+	writeJSON(w, http.StatusCreated, map[string]any{"user": u, "default_actor": actor, "session_token": token, "actor_recommendation": actorRecommendation()})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -303,12 +319,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, token)
-	writeJSON(w, http.StatusOK, map[string]any{"user": u, "default_actor": actor, "actor_recommendation": actorRecommendation()})
+	writeJSON(w, http.StatusOK, map[string]any{"user": u, "default_actor": actor, "session_token": token, "actor_recommendation": actorRecommendation()})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	revoked := false
 	if cookie, err := r.Cookie("taskpilot_session"); err == nil {
 		_ = s.store.RevokeSession(r.Context(), cookie.Value)
+		revoked = true
+	}
+	if !revoked {
+		if token := bearerToken(r); token != "" {
+			_ = s.store.RevokeSession(r.Context(), token)
+		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: "taskpilot_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

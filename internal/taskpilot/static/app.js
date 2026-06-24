@@ -1,6 +1,7 @@
 const apiState = {
   actor: loadSetting("taskpilot.actor", ""),
   actorSecret: loadSetting("taskpilot.actorSecret", ""),
+  sessionToken: loadSessionSetting("taskpilot.sessionToken", ""),
   principal: null,
   tab: "board",
   selected: null,
@@ -86,6 +87,23 @@ function saveSetting(key, value) {
   }
 }
 
+function loadSessionSetting(key, fallback) {
+  try {
+    return sessionStorage.getItem(key) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveSessionSetting(key, value) {
+  try {
+    if (value) sessionStorage.setItem(key, value);
+    else sessionStorage.removeItem(key);
+  } catch {
+    // The current page can still use in-memory session state if storage is blocked.
+  }
+}
+
 function isFormEditing() {
   const el = document.activeElement;
   if (!el) return false;
@@ -106,6 +124,11 @@ function clearActorSettings() {
   apiState.actorSecret = "";
   saveSetting("taskpilot.actor", "");
   saveSetting("taskpilot.actorSecret", "");
+}
+
+function setSessionToken(token) {
+  apiState.sessionToken = token || "";
+  saveSessionSetting("taskpilot.sessionToken", apiState.sessionToken);
 }
 
 function canWrite() {
@@ -132,6 +155,9 @@ function actorOwnershipLabel(actor) {
 
 function authHeaders(includeActor = true) {
   const headers = { "Content-Type": "application/json" };
+  if (apiState.sessionToken) {
+    headers["Authorization"] = `Bearer ${apiState.sessionToken}`;
+  }
   if (includeActor && apiState.actor && apiState.actorSecret) {
     headers["X-Actor-ID"] = apiState.actor;
     headers["X-Actor-Secret"] = apiState.actorSecret;
@@ -1459,6 +1485,7 @@ function loginView() {
       const res = await apiRequest(path, { method: "POST", body: JSON.stringify({ email: email.value, password: password.value }) }, false);
       apiState.authEpoch += 1;
       clearActorSettings();
+      setSessionToken(res.session_token || "");
       apiState.error = "";
       await refresh();
     } catch (err) {
@@ -1486,6 +1513,7 @@ async function logout(callServer = true) {
   if (callServer) {
     try { await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch {}
   }
+  setSessionToken("");
   apiState.principal = null;
   render();
 }
