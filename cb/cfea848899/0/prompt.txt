@@ -1,0 +1,27 @@
+it worked for sometime but still again the same thing hapenn, console :"app.js?v=39:177  GET https://taskpilot-production-ca6b.up.railway.app/api/workspaces 401 (Unauthorized)
+apiRequest @ app.js?v=39:177
+api @ app.js?v=39:169
+refreshNow @ app.js?v=39:236
+await in refreshNow
+refresh @ app.js?v=39:211
+(anonymous) @ app.js?v=39:1564
+app.js?v=39:177  GET https://taskpilot-production-ca6b.up.railway.app/api/events 401 (Unauthorized)
+apiRequest @ app.js?v=39:177
+api @ app.js?v=39:169
+refreshNow @ app.js?v=39:240
+await in refreshNow
+refresh @ app.js?v=39:211
+(anonymous) @ app.js?v=39:1572
+setInterval
+(anonymous) @ app.js?v=39:1571
+app.js?v=39:177  GET https://taskpilot-production-ca6b.up.railway.app/api/actors 401 (Unauthorized)"
+
+---
+
+# Selected text:
+
+## Selection 1
+/api/workspaces, /api/events, /api/actors
+
+## My request for Codex:
+is there any chance that any other call will also did the same problem , check the whole once again that is there any chance of this issue happening again or it is good to go
