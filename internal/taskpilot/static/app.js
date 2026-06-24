@@ -36,6 +36,7 @@ const apiState = {
   refreshTimer: null,
   refreshing: false,
   refreshQueued: false,
+  authEpoch: 0,
   lastEventID: 0,
   pendingRender: false,
   memoryError: "",
@@ -192,9 +193,11 @@ async function refresh() {
 }
 
 async function refreshNow() {
+  const epoch = apiState.authEpoch;
   try {
     apiState.error = "";
     const authed = await loadMe();
+    if (epoch !== apiState.authEpoch) return;
     if (!authed) {
       renderWhenSafe();
       return;
@@ -237,6 +240,7 @@ async function refreshNow() {
     if (apiState.selected) apiState.detail = await api(`/api/tasks/${apiState.selected}`);
     ensureEventStream();
   } catch (err) {
+    if (epoch !== apiState.authEpoch) return;
     apiState.error = err.message;
     stopEventStream();
   }
@@ -1453,8 +1457,9 @@ function loginView() {
   async function finishPasswordAuth(path) {
     try {
       const res = await apiRequest(path, { method: "POST", body: JSON.stringify({ email: email.value, password: password.value }) }, false);
+      apiState.authEpoch += 1;
       clearActorSettings();
-      apiState.error = res.actor_recommendation || "";
+      apiState.error = "";
       await refresh();
     } catch (err) {
       apiState.error = err.message || "Could not authenticate";
@@ -1476,6 +1481,7 @@ function loginView() {
 }
 
 async function logout(callServer = true) {
+  apiState.authEpoch += 1;
   stopEventStream();
   if (callServer) {
     try { await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch {}
