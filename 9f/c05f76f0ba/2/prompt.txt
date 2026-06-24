@@ -1,0 +1,9 @@
+i want to flush the supabase db
+
+---
+
+give me query which i can run in supabase
+
+---
+
+free supabase egress is full so i want to flush all table
