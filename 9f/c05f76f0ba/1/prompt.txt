@@ -1,0 +1,68 @@
+[2026-06-21T18:49:25.191376158Z] [error] 2026/06/21 18:49:25 request_id=b90804e8915e4860 method=POST path=/api/tasks/task_1782067757002550151/heartbeat status=403 duration_ms=38
+[2026-06-21T18:49:25.340066000Z] [error] 2026/06/21 18:49:25 request_id=5370c165621c087d method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=7
+[2026-06-21T18:49:25.443339049Z] [error] 2026/06/21 18:49:25 request_id=e2ba908513ab9f09 method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=17
+[2026-06-21T18:49:25.566908091Z] [error] 2026/06/21 18:49:25 request_id=5280ac69bc249247 method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=7
+[2026-06-21T18:49:25.666751856Z] [error] 2026/06/21 18:49:25 request_id=022dad45cf67a61d method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=7
+[2026-06-21T18:49:31.088694094Z] [error] 2026/06/21 18:49:30 request_id=829dbc7060c22bfa method=POST path=/api/auth/login status=200 duration_ms=102     "this issue came in the taskpilot railway deployed version , deep dive that why it happened and fix it permanently not any temprory solve "
+
+---
+
+[2026-06-21T18:49:25.191376158Z] [error] 2026/06/21 18:49:25 request_id=b90804e8915e4860 method=POST path=/api/tasks/task_1782067757002550151/heartbeat status=403 duration_ms=38
+[2026-06-21T18:49:25.340066000Z] [error] 2026/06/21 18:49:25 request_id=5370c165621c087d method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=7
+[2026-06-21T18:49:25.443339049Z] [error] 2026/06/21 18:49:25 request_id=e2ba908513ab9f09 method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=17
+[2026-06-21T18:49:25.566908091Z] [error] 2026/06/21 18:49:25 request_id=5280ac69bc249247 method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=7
+[2026-06-21T18:49:25.666751856Z] [error] 2026/06/21 18:49:25 request_id=022dad45cf67a61d method=POST path=/api/tasks/task_1782067757002550151/locks status=400 duration_ms=7
+[2026-06-21T18:49:31.088694094Z] [error] 2026/06/21 18:49:30 request_id=829dbc7060c22bfa method=POST path=/api/auth/login status=200 duration_ms=102     "this issue came in the taskpilot railway deployed version while trying logging in  , deep dive that why it happened and fix it permanently not any temprory solve "
+
+---
+
+what happened here explain me
+
+---
+
+then why login doesnot happening at that time
+
+---
+
+2026/06/21 18:49:31 request_id=83d91096203451e7 method=POST path=/api/auth/login status=200 duration_ms=85
+Name
+Value
+level
+error
+
+---
+
+then why after tapping login button im not able to go in the dashboard , it stuck on the auth page
+
+---
+
+2026/06/21 19:08:55 request_id=fadabfb97fac2998 method=POST path=/api/auth/login status=200 duration_ms=118
+2026/06/21 19:08:57 request_id=6a6df38692173e14 method=GET path=/api/tasks status=500 duration_ms=7999
+2026/06/21 19:09:00 request_id=10cfd1ea11e78852 method=GET path=/ status=200 duration_ms=0
+2026/06/21 19:09:00 request_id=c8b8050ecbdd125c method=GET path=/api/tasks status=500 duration_ms=259596
+2026/06/21 19:09:00 request_id=475078dac87a4272 method=GET path=/api/conflicts/stale-claims status=500 duration_ms=259595
+2026/06/21 19:09:00 request_id=ac1723937a994f90 method=GET path=/styles.css status=200 duration_ms=0
+2026/06/21 19:09:00 request_id=84aba45a4d0e5741 method=GET path=/app.js status=200 duration_ms=4
+2026/06/21 19:09:00 request_id=e2480ad811dc10ac method=GET path=/app.js status=200 duration_ms=7
+2026/06/21 19:09:00 request_id=9f24697bbd9c245e method=GET path=/api/me status=200 duration_ms=26
+2026/06/21 19:09:00 request_id=4fd72da3c4a07bb8 method=GET path=/api/handoffs status=200 duration_ms=49
+2026/06/21 19:09:00 request_id=a7eecf08a83dbc01 method=GET path=/api/projects status=200 duration_ms=49
+2026/06/21 19:09:00 request_id=c0b853a08516f41a method=GET path=/api/events status=200 duration_ms=78
+2026/06/21 19:09:00 request_id=d752a14358e4dd76 method=GET path=/api/conflicts status=200 duration_ms=38
+2026/06/21 19:09:00 request_id=b80964f34699935c method=GET path=/api/workspaces status=200 duration_ms=39
+2026/06/21 19:09:00 request_id=debff5342d1cb87c method=GET path=/api/repositories status=200 duration_ms=42
+2026/06/21 19:09:00 request_id=0ea700af5bc2412b method=GET path=/api/actors status=200 duration_ms=46
+2026/06/21 19:09:05 request_id=5e2039c671b9f6a6 method=GET path=/api/tasks status=500 duration_ms=8000
+2026/06/21 19:09:07 request_id=4d68466bf8a858b6 method=POST path=/api/auth/login status=200 duration_ms=100
+2026/06/21 19:09:13 request_id=de0001d5cd2b48ee method=GET path=/api/tasks status=500 duration_ms=7999
+2026/06/21 19:09:21 request_id=c30e030d124ed159 method=GET path=/api/tasks status=500 duration_ms=7999
+2026/06/21 19:09:21 request_id=2feeaed5a74a0b61 method=POST path=/api/tasks status=200 duration_ms=35
+2026/06/21 19:09:29 request_id=ba72de734cd15eff method=POST path=/api/tasks/task_1782068961426226941/heartbeat status=403 duration_ms=17
+2026/06/21 19:09:29 request_id=7569ac0953055c59 method=POST path=/api/tasks/task_1782068961426226941/locks status=400 duration_ms=8
+2026/06/21 19:09:30 request_id=71bc48fff4ae9c26 method=POST path=/api/tasks/task_1782068961426226941/locks status=400 duration_ms=8
+2026/06/21 19:09:30 request_id=2fdd2c734f4edb92 method=POST path=/api/tasks/task_1782068961426226941/locks status=400 duration_ms=8
+2026/06/21 19:09:30 request_id=c62b7195cc43d4b8 method=POST path=/api/tasks/task_1782068961426226941/locks status=400 duration_ms=8
+2026/06/21 19:09:48 request_id=a900a845e2daae28 method=GET path=/api/tasks status=500 duration_ms=7998
+2026/06/21 19:09:51 request_id=b3a6e7f592d32dcb method=POST path=/api/tasks/task_1782068961426226941/sessions/start status=200 duration_ms=29696
+2026/06/21 19:09:56 request_id=f146954d31e9d2fa method=GET path=/api/tasks status=500 duration_ms=7999
+2026/06/21 19:10:04 request_id=fe482b5245b993d1 method=GET path=/api/tasks status=500 duration_ms=7998.   see this
