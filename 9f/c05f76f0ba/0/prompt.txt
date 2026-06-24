@@ -1,0 +1,281 @@
+## Improve Intelligent Task Creation, Naming, Semantic Routing, and Task Relationships
+
+TaskPilot currently creates repository tasks automatically based on agent activity and changed files. However, the task-management logic is not yet intelligent or consistent enough.
+
+### Current Problems
+
+1. **Inconsistent task names**
+
+   * Automatically generated task names are sometimes meaningful, but sometimes too generic or inaccurate.
+   * Examples of weak names include:
+
+     * `Update controls.md`
+     * `Inferred work on 6 changed files`
+   * Task names should describe the actual purpose and outcome of the work, not only the files that changed.
+
+2. **Semantic memory is routed to the wrong task**
+
+   * While working on `controls.md`, TaskPilot created a task named `Update controls.md`.
+   * However, when the agent recorded semantic memory, it was stored under another inferred task named `Inferred work on 6 changed files`.
+   * This splits the context of one piece of work across multiple tasks and makes the task history unreliable.
+
+3. **Duplicate or overlapping tasks are created**
+
+   * TaskPilot may create a new inferred task even when an existing task already represents the same work.
+   * File changes, agent intent, semantic memory, and active task context are not being correlated properly.
+
+4. **Task relationships are not understood**
+
+   * TaskPilot does not reliably identify whether a task is:
+
+     * A subtask of another task
+     * A parent task
+     * Related to another task
+     * A continuation of an existing task
+     * A duplicate or overlapping task
+     * Blocked by or dependent on another task
+
+### Goal
+
+Make TaskPilot’s repository task-management system intelligent enough that an agent can manage tasks automatically without requiring the developer to manually decide where every update belongs.
+
+The agent should understand:
+
+* When to create a new task
+* When to reuse an existing task
+* Which task should receive semantic memory
+* Whether changed files belong to the current task
+* Whether a task is a parent, child, dependency, continuation, duplicate, or related task
+* How to create meaningful task names based on intent and outcome
+* How to preserve a consistent task timeline and context
+
+### Required Behaviour
+
+#### 1. Build a Unified Work-Intent Model
+
+Before creating or selecting a task, TaskPilot should evaluate:
+
+* The agent’s current objective
+* The active TaskPilot task, if one exists
+* Recent semantic-memory records
+* Files currently being modified
+* Recent repository activity
+* Existing open, inferred, and completed tasks
+* Task descriptions, outcomes, and remaining work
+* The agent session and recent prompts
+* Existing task relationships
+
+Task decisions must not be based only on changed filenames.
+
+#### 2. Reuse an Existing Task When Appropriate
+
+TaskPilot should attach repository activity and semantic memory to an existing task when:
+
+* The current work has the same objective
+* The changed files are part of that task’s implementation
+* The work is a continuation of the task
+* The semantic memory describes progress on that task
+* The active session is already associated with that task
+* A recent inferred task strongly matches the current intent
+
+A new task should not be created only because additional files were changed.
+
+#### 3. Create a New Task Only for a Distinct Objective
+
+A new task should be created when the agent begins work with a clearly different outcome or responsibility.
+
+Examples:
+
+* Fixing OAuth authentication and improving the provider UI should become separate tasks when they are independent objectives.
+* Updating several files for the same authentication fix should remain one task.
+* Writing tests for an existing implementation may become a subtask instead of an unrelated task.
+
+Before creating a new task, TaskPilot should compare the proposed task with existing tasks and calculate a confidence score for:
+
+* Reusing an existing task
+* Creating a subtask
+* Creating a related task
+* Creating a completely new task
+
+#### 4. Generate Outcome-Based Task Names
+
+Task names should describe the work’s intent or expected result.
+
+Prefer names such as:
+
+* `Define repository agent control rules`
+* `Add repo-local semantic memory fallback`
+* `Improve inferred task matching`
+* `Fix semantic memory routing for active repo tasks`
+
+Avoid names such as:
+
+* `Update controls.md`
+* `Change 6 files`
+* `Repository modifications`
+* `Inferred work on changed files`
+
+Files can be included as metadata, but should not normally be the task’s primary identity.
+
+#### 5. Route Semantic Memory to the Correct Task
+
+When the agent records semantic memory, TaskPilot should determine the target task using this priority:
+
+1. Explicit task ID provided by the agent
+2. Active TaskPilot task for the current session
+3. Task already associated with the repository activity
+4. Existing task with the strongest intent match
+5. Newly created inferred task only when no suitable task exists
+
+The system must avoid creating one task for file activity and storing the semantic memory in another task for the same work.
+
+All parts of the same work should remain connected:
+
+* Agent intent
+* Changed files
+* Decisions
+* Completed work
+* Reasoning
+* Verification
+* Remaining work
+* Semantic memory
+* Session information
+
+#### 6. Support Task Relationships
+
+Add explicit relationship support between tasks.
+
+Relationship types should include:
+
+* `parent_of`
+* `subtask_of`
+* `related_to`
+* `depends_on`
+* `blocks`
+* `continues`
+* `duplicates`
+* `supersedes`
+
+Each relationship should include:
+
+* Source task ID
+* Target task ID
+* Relationship type
+* Reason for the relationship
+* Confidence score
+* Creation source, such as agent, inference, or developer
+* Created timestamp
+
+Relationships should be visible in task context so that every agent understands the wider work structure.
+
+#### 7. Prevent Duplicate Inferred Tasks
+
+Before creating an inferred task, compare it with:
+
+* The active task
+* Recently updated tasks
+* Tasks connected to the same files
+* Tasks from the same agent session
+* Tasks with similar semantic summaries
+* Parent and child tasks
+* Recently completed tasks that may still be receiving follow-up work
+
+When the match confidence is high, reuse the existing task.
+
+When confidence is moderate, connect the tasks using an appropriate relationship instead of leaving them disconnected.
+
+#### 8. Allow Task Identity to Improve Over Time
+
+An inferred task may initially have limited information. TaskPilot should be able to rename or enrich it when better semantic information becomes available.
+
+For example:
+
+Initial task:
+
+`Inferred work on 6 changed files`
+
+After semantic memory is recorded:
+
+`Improve TaskPilot repository task inference and semantic routing`
+
+The task ID and history should remain unchanged. Only its title, description, scope, and metadata should improve.
+
+#### 9. Keep an Auditable Decision Record
+
+For every automatic task-management decision, record:
+
+* Whether TaskPilot reused or created a task
+* Candidate tasks considered
+* Selected task
+* Confidence score
+* Reason for the decision
+* Relationships created or updated
+* Whether the task was renamed
+* Whether semantic memory was rerouted or merged
+
+This should make incorrect decisions debuggable.
+
+### Agent Instructions
+
+Update the TaskPilot agent instructions so that agents know they must:
+
+* Inspect the active task context before creating a task
+* Prefer an existing task when the objective matches
+* Create a subtask for a smaller part of an existing objective
+* Create a new task only for a distinct outcome
+* Record semantic memory against the correct task
+* Add task relationships when relevant
+* Avoid generic file-based task names
+* Include the intended outcome when recording semantic memory
+* Update an inferred task’s identity when better context becomes available
+
+The system should not depend entirely on agents following instructions. Server-side and daemon-side safeguards must enforce the same behaviour when possible.
+
+### Fallback Behaviour
+
+When TaskPilot cannot confidently identify the correct task:
+
+* Do not silently create multiple generic tasks.
+* Select the strongest candidate and mark the assignment as low-confidence, or create one provisional inferred task.
+* Store the evidence used for the decision.
+* Allow the provisional task to be automatically merged, renamed, or related later when semantic context becomes available.
+
+### Example Scenario
+
+An agent starts modifying `controls.md` to define repository control rules.
+
+Expected behaviour:
+
+1. TaskPilot detects the intent as defining repository agent controls.
+2. It searches for an active or existing task with the same objective.
+3. If one exists, it associates the changed file with that task.
+4. If none exists, it creates a task such as:
+
+   * `Define repository agent control rules`
+5. When semantic memory is recorded, it is stored in the same task.
+6. If this work is part of a larger repository-integration task, TaskPilot creates:
+
+   * `Define repository agent control rules`
+   * Relationship: `subtask_of → Improve TaskPilot repository integration`
+7. It must not separately create:
+
+   * `Update controls.md`
+   * `Inferred work on 6 changed files`
+
+### Acceptance Criteria
+
+The implementation is complete when:
+
+* One logical piece of work consistently maps to one primary task.
+* Semantic memory and changed-file activity are stored against the same task.
+* Existing tasks are reused when the work intent matches.
+* New tasks are created only for distinct objectives.
+* Generated task names describe outcomes rather than filenames.
+* Parent, subtask, dependency, continuation, duplicate, and related-task relationships are supported.
+* Inferred tasks can be renamed and enriched without losing history.
+* Duplicate inferred tasks are prevented or automatically merged.
+* Agents receive the complete task hierarchy and relationship context.
+* Every automatic decision has a reason and confidence score.
+* The behaviour works even when the developer does not manually run a TaskPilot command or explicitly select a task.
+
+Implement this as a complete task-intelligence layer, not as a collection of filename-based heuristics. The final system should make task creation, selection, naming, semantic routing, and relationship management feel automatic, consistent, and reliable.
