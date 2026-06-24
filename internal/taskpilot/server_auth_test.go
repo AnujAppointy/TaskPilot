@@ -31,6 +31,51 @@ func TestActorSecretAuthOnRoutes(t *testing.T) {
 	}
 }
 
+func TestActorSessionAuthAttributesContextAndLocks(t *testing.T) {
+	store := testStore(t)
+	actor := testActor(t, store, "Session Agent")
+	server := NewServer(store, "dev-token")
+
+	activate := req(t, server, "POST", "/api/actor-sessions/activate", ActorSessionStartInput{ActorID: actor.ID, ActorSecret: actor.Secret, TerminalID: "terminal-a", AgentProvider: "codex"})
+	if activate.Code != http.StatusOK {
+		t.Fatalf("activate status=%d body=%s", activate.Code, activate.Body.String())
+	}
+	var activation ActorSessionActivation
+	if err := json.Unmarshal(activate.Body.Bytes(), &activation); err != nil {
+		t.Fatal(err)
+	}
+	createTask := sessionReq(t, server, "POST", "/api/tasks", map[string]any{"title": "Task", "goal": "Goal"}, actor.ID, activation.Session.ID, activation.SessionToken)
+	if createTask.Code != http.StatusOK {
+		t.Fatalf("create task status=%d body=%s", createTask.Code, createTask.Body.String())
+	}
+	var task Task
+	if err := json.Unmarshal(createTask.Body.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	context := sessionReq(t, server, "POST", "/api/tasks/"+task.ID+"/context", map[string]any{"kind": "summary", "content": "session scoped memory", "source": "mcp"}, actor.ID, activation.Session.ID, activation.SessionToken)
+	if context.Code != http.StatusOK {
+		t.Fatalf("context status=%d body=%s", context.Code, context.Body.String())
+	}
+	var entry ContextEntry
+	if err := json.Unmarshal(context.Body.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.ActorSessionID != activation.Session.ID {
+		t.Fatalf("expected context actor session %q, got %+v", activation.Session.ID, entry)
+	}
+	lockResp := sessionReq(t, server, "POST", "/api/tasks/"+task.ID+"/locks", map[string]any{"scope": "src/*", "scope_type": "file_glob"}, actor.ID, activation.Session.ID, activation.SessionToken)
+	if lockResp.Code != http.StatusOK {
+		t.Fatalf("lock status=%d body=%s", lockResp.Code, lockResp.Body.String())
+	}
+	var lock Lock
+	if err := json.Unmarshal(lockResp.Body.Bytes(), &lock); err != nil {
+		t.Fatal(err)
+	}
+	if lock.ActorSessionID != activation.Session.ID {
+		t.Fatalf("expected lock actor session %q, got %+v", activation.Session.ID, lock)
+	}
+}
+
 func TestSessionLoginPasswordAndUserRoutes(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -215,6 +260,28 @@ func actorReq(t *testing.T, h http.Handler, method, path string, body any, actor
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Actor-ID", actorID)
 	r.Header.Set("X-Actor-Secret", actorSecret)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	return rec
+}
+
+func sessionReq(t *testing.T, h http.Handler, method, path string, body any, actorID, sessionID, sessionToken string) *httptest.ResponseRecorder {
+	t.Helper()
+	var rbody *bytes.Reader
+	if body == nil {
+		rbody = bytes.NewReader(nil)
+	} else {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rbody = bytes.NewReader(b)
+	}
+	r := httptest.NewRequest(method, path, rbody)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Actor-ID", actorID)
+	r.Header.Set("X-Actor-Session-ID", sessionID)
+	r.Header.Set("X-Actor-Session-Token", sessionToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	return rec

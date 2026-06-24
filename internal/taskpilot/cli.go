@@ -31,22 +31,67 @@ import (
 )
 
 type Config struct {
-	Server      string `json:"server"`
-	Email       string `json:"email,omitempty"`
-	ActorID     string `json:"actor_id"`
-	ActorSecret string `json:"actor_secret"`
+	Server            string `json:"server"`
+	Email             string `json:"email,omitempty"`
+	ActorID           string `json:"actor_id"`
+	ActorSecret       string `json:"actor_secret"`
+	ActorSessionID    string `json:"actor_session_id,omitempty"`
+	ActorSessionToken string `json:"actor_session_token,omitempty"`
+	CurrentTaskID     string `json:"current_task_id,omitempty"`
+	AgentProvider     string `json:"agent_provider,omitempty"`
 }
 
 type configDiagnostics struct {
-	ConfigPath        string            `json:"config_path"`
-	Server            string            `json:"server"`
-	Email             string            `json:"email,omitempty"`
-	ActorID           string            `json:"actor_id"`
-	HasSecret         bool              `json:"has_secret"`
-	Auth              string            `json:"auth"`
-	Sources           map[string]string `json:"sources,omitempty"`
-	Effective         bool              `json:"effective"`
-	EnvOverrideActive bool              `json:"env_override_active"`
+	ConfigPath             string                   `json:"config_path"`
+	Server                 string                   `json:"server"`
+	Email                  string                   `json:"email,omitempty"`
+	ActorID                string                   `json:"actor_id"`
+	HasSecret              bool                     `json:"has_secret"`
+	Auth                   string                   `json:"auth"`
+	Sources                map[string]string        `json:"sources,omitempty"`
+	Effective              bool                     `json:"effective"`
+	EnvOverrideActive      bool                     `json:"env_override_active"`
+	DeprecatedGlobalActor  bool                     `json:"deprecated_global_actor"`
+	Global                 globalConfigDiagnostics  `json:"global"`
+	CurrentTerminalSession sessionConfigDiagnostics `json:"current_terminal_session"`
+}
+
+type globalConfigDiagnostics struct {
+	Server          string `json:"server"`
+	Email           string `json:"email,omitempty"`
+	LegacyActorID   string `json:"legacy_actor_id,omitempty"`
+	HasLegacySecret bool   `json:"has_legacy_secret"`
+}
+
+type sessionConfigDiagnostics struct {
+	Active        bool   `json:"active"`
+	Scope         string `json:"scope,omitempty"`
+	ActorID       string `json:"actor_id,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Status        string `json:"status,omitempty"`
+	CurrentTaskID string `json:"current_task_id,omitempty"`
+	SessionFile   string `json:"session_file,omitempty"`
+	Source        string `json:"source,omitempty"`
+	HasToken      bool   `json:"has_token,omitempty"`
+}
+
+type terminalActorSession struct {
+	Server            string    `json:"server"`
+	ActorID           string    `json:"actor_id"`
+	ActorName         string    `json:"actor_name,omitempty"`
+	ActorSessionID    string    `json:"actor_session_id"`
+	ActorSessionToken string    `json:"actor_session_token"`
+	CurrentTaskID     string    `json:"current_task_id,omitempty"`
+	AgentProvider     string    `json:"agent_provider,omitempty"`
+	RepositoryPath    string    `json:"repository_path,omitempty"`
+	MachineID         string    `json:"machine_id,omitempty"`
+	TerminalID        string    `json:"terminal_id,omitempty"`
+	ProcessID         int       `json:"process_id,omitempty"`
+	Status            string    `json:"status,omitempty"`
+	StartedAt         time.Time `json:"started_at"`
+	LastHeartbeatAt   time.Time `json:"last_heartbeat_at,omitempty"`
+	SessionFile       string    `json:"session_file,omitempty"`
 }
 
 type retriableRequestError struct{ err error }
@@ -212,7 +257,7 @@ Config:
   taskpilot config show
   taskpilot config set-server http://127.0.0.1:8080
   taskpilot config set-email anuj@company.com
-  taskpilot config set-actor actor_... <actor-secret>
+  taskpilot actor activate --secret <actor-secret>
 
 Bootstrap:
   taskpilot enable
@@ -448,8 +493,8 @@ func runEnable(args []string) error {
 		cfg.Server = "http://127.0.0.1:8080"
 		_ = saveConfig(cfg)
 	}
-	if cfg.ActorID == "" || cfg.ActorSecret == "" {
-		return fmt.Errorf("no TaskPilot actor configured; run `taskpilot config set-actor <actor-id> <actor-secret>`")
+	if cfg.ActorID == "" || (cfg.ActorSecret == "" && cfg.ActorSessionToken == "") {
+		return fmt.Errorf("no TaskPilot actor session configured; run `taskpilot actor activate --secret <actor-secret>`")
 	}
 	root, err := gitRoot(".")
 	if err != nil {
@@ -3169,6 +3214,9 @@ func runAgentCommand(args []string) error {
 	if cfg.Server == "" {
 		cfg.Server = "http://127.0.0.1:8080"
 	}
+	if err := ensureActorSessionForConfig(&cfg, true); err != nil {
+		return err
+	}
 	_, _, _ = flushQueuedHandoffCheckpoints()
 	var detail TaskDetail
 	if err := request("GET", "/api/tasks/"+taskID, nil, &detail); err != nil {
@@ -3198,6 +3246,9 @@ func runAgentCommand(args []string) error {
 	if err := request("POST", "/api/tasks/"+taskID+"/sessions/start", map[string]any{}, &session); err != nil {
 		return taskRunOwnershipError(taskID, cfg, detail, err)
 	}
+	cfg.CurrentTaskID = taskID
+	_ = updateTerminalActorSessionTask(cfg, taskID)
+	_ = doRequestWithConfig(cfg, "POST", "/api/actor-sessions/current/heartbeat", ActorSessionHeartbeat{CurrentTaskID: taskID, Status: "active"}, nil, true)
 	_ = appendRunContext(taskID, "summary", "taskpilot run started agent command: "+strings.Join(commandArgs, " "))
 	taskContextPath, relatedContextPath, contextCleanup, err := createAgentContextFiles(taskID, detail)
 	if err != nil {
@@ -3247,6 +3298,8 @@ func runAgentCommand(args []string) error {
 		"TASKPILOT_TASK_ID="+taskID,
 		"TASKPILOT_SERVER="+cfg.Server,
 		"TASKPILOT_ACTOR_ID="+cfg.ActorID,
+		"TASKPILOT_ACTOR_SESSION_ID="+cfg.ActorSessionID,
+		"TASKPILOT_ACTOR_SESSION_TOKEN="+cfg.ActorSessionToken,
 		"TASKPILOT_SESSION_ID="+session.ID,
 		"TASKPILOT_HANDOFF_PACKET_ID="+handoffPacket.ID,
 		"TASKPILOT_PROJECT_ID="+detail.Task.ProjectID,
@@ -3366,6 +3419,7 @@ func heartbeatLoop(ctx context.Context, taskID string, done <-chan struct{}) {
 		case <-ticker.C:
 			var out Task
 			_ = request("POST", "/api/tasks/"+taskID+"/heartbeat", map[string]any{}, &out)
+			_ = request("POST", "/api/actor-sessions/current/heartbeat", ActorSessionHeartbeat{CurrentTaskID: taskID, Status: "active"}, &ActorSession{})
 		}
 	}
 }
@@ -5280,7 +5334,7 @@ func callMCPTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		if cfg.ActorID == "" {
-			return nil, fmt.Errorf("no TaskPilot actor configured; run `taskpilot config set-actor <actor-id> <actor-secret>`")
+			return nil, fmt.Errorf("no TaskPilot actor session configured; run `taskpilot actor activate --secret <actor-secret>`")
 		}
 		if args == nil {
 			args = map[string]any{}
@@ -6655,7 +6709,7 @@ TaskPilot is the shared task memory for humans and agents across machines. Treat
 Current task:
 - TASKPILOT_TASK_ID=` + taskID + `
 - Use TASKPILOT_SERVER when calling TaskPilot.
-- Use TASKPILOT_ACTOR_ID as your agent identity.
+- Use TASKPILOT_ACTOR_ID and TASKPILOT_ACTOR_SESSION_ID as your agent identity.
 - Read TASKPILOT_TASK_CONTEXT_FILE for the current task snapshot.
 - Read TASKPILOT_RELATED_CONTEXT_FILE for selected prior/linked work context.
 - Write task progress to TASKPILOT_RUN_CONTEXT_FILE.
@@ -6962,14 +7016,15 @@ func runConfig(args []string) error {
 	case "show":
 		fs := flag.NewFlagSet("config show", flag.ExitOnError)
 		effective := fs.Bool("effective", false, "show effective config including environment overrides")
-		jsonOut := fs.Bool("json", true, "print JSON")
+		jsonOut := fs.Bool("json", false, "print JSON")
 		_ = fs.Parse(args[1:])
 		diagnostics, err := loadConfigDiagnostics(*effective)
 		if err != nil {
 			return err
 		}
 		if !*jsonOut {
-			return print(diagnostics, false)
+			printConfigDiagnostics(diagnostics)
+			return nil
 		}
 		b, _ := json.MarshalIndent(diagnostics, "", "  ")
 		fmt.Println(string(b))
@@ -6995,7 +7050,11 @@ func runConfig(args []string) error {
 		cfg, _ := loadConfigFile()
 		cfg.ActorID = args[1]
 		cfg.ActorSecret = args[2]
-		return saveConfig(cfg)
+		if err := saveConfig(cfg); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "Warning: config set-actor stores deprecated global actor credentials. Prefer `taskpilot actor activate --secret <actor-secret>` for terminal-scoped sessions.")
+		return nil
 	default:
 		return fmt.Errorf("unknown config command %q", args[0])
 	}
@@ -7003,9 +7062,144 @@ func runConfig(args []string) error {
 
 func runActor(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: taskpilot actor list")
+		return fmt.Errorf("usage: taskpilot actor activate|current|deactivate|sessions|run|list")
 	}
 	switch args[0] {
+	case "activate":
+		fs := flag.NewFlagSet("actor activate", flag.ExitOnError)
+		secret := fs.String("secret", os.Getenv("TASKPILOT_ACTOR_SECRET"), "actor secret")
+		actorID := fs.String("actor-id", "", "optional actor id")
+		provider := fs.String("provider", detectAgentProvider(nil), "agent provider")
+		taskID := fs.String("task-id", os.Getenv("TASKPILOT_TASK_ID"), "current task id")
+		repoPath := fs.String("repo", bestEffortGitRoot("."), "repository path")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if strings.TrimSpace(*secret) == "" {
+			return fmt.Errorf("--secret is required")
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		if cfg.Server == "" {
+			cfg.Server = "http://127.0.0.1:8080"
+		}
+		activation, err := activateActorSessionWithConfig(cfg, ActorSessionStartInput{
+			ActorID:        *actorID,
+			ActorSecret:    *secret,
+			MachineID:      machineID(),
+			TerminalID:     terminalID(),
+			AgentProvider:  *provider,
+			ProcessID:      os.Getpid(),
+			CurrentTaskID:  *taskID,
+			ClientVersion:  "taskpilot-cli",
+			RepositoryPath: *repoPath,
+		})
+		if err != nil {
+			return err
+		}
+		session := terminalActorSession{
+			Server:            cfg.Server,
+			ActorID:           activation.Actor.ID,
+			ActorName:         activation.Actor.Name,
+			ActorSessionID:    activation.Session.ID,
+			ActorSessionToken: activation.SessionToken,
+			CurrentTaskID:     activation.Session.CurrentTaskID,
+			AgentProvider:     activation.Session.AgentProvider,
+			RepositoryPath:    activation.Session.RepositoryPath,
+			MachineID:         activation.Session.MachineID,
+			TerminalID:        activation.Session.TerminalID,
+			ProcessID:         activation.Session.ProcessID,
+			Status:            activation.Session.Status,
+			StartedAt:         activation.Session.StartedAt,
+		}
+		if err := saveTerminalActorSession(session); err != nil {
+			return err
+		}
+		if *jsonOut {
+			return print(activation, true)
+		}
+		fmt.Println("Actor activated for this terminal.")
+		fmt.Printf("Actor: %s (%s)\n", activation.Actor.Name, activation.Actor.ID)
+		fmt.Printf("Session: %s\n", activation.Session.ID)
+		fmt.Printf("Server: %s\n", cfg.Server)
+		fmt.Printf("Status: %s\n", activation.Session.Status)
+		return nil
+	case "current":
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		session, ok := loadTerminalActorSession(cfg)
+		if !ok && cfg.ActorSessionID != "" {
+			session = terminalActorSession{Server: cfg.Server, ActorID: cfg.ActorID, ActorSessionID: cfg.ActorSessionID, ActorSessionToken: cfg.ActorSessionToken, CurrentTaskID: cfg.CurrentTaskID, AgentProvider: cfg.AgentProvider, Status: "active"}
+			ok = true
+		}
+		if !ok {
+			fmt.Println("No actor is active in this terminal.")
+			if cfg.ActorID != "" && cfg.ActorSecret != "" {
+				fmt.Println("A deprecated global actor is configured; the next authenticated command will migrate it into a terminal session.")
+			}
+			fmt.Println("Activate one with:")
+			fmt.Println("taskpilot actor activate --secret <actor-secret>")
+			return nil
+		}
+		var live ActorSession
+		_ = request("GET", "/api/actor-sessions/current", nil, &live)
+		if live.ID != "" {
+			session.Status = live.Status
+			session.CurrentTaskID = live.CurrentTaskID
+			session.LastHeartbeatAt = live.LastHeartbeatAt
+			_ = saveTerminalActorSession(session)
+		}
+		fmt.Printf("Actor: %s\n", firstNonEmpty(session.ActorName, session.ActorID))
+		fmt.Printf("Session: %s\n", session.ActorSessionID)
+		fmt.Println("Scope: current terminal")
+		if session.CurrentTaskID != "" {
+			fmt.Printf("Current task: %s\n", session.CurrentTaskID)
+		}
+		fmt.Printf("Status: %s\n", firstNonEmpty(session.Status, "active"))
+		return nil
+	case "deactivate":
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		if cfg.ActorSessionID == "" {
+			fmt.Println("No actor is active in this terminal.")
+			return nil
+		}
+		var out ActorSession
+		_ = request("POST", "/api/actor-sessions/current/end", map[string]any{}, &out)
+		if err := clearTerminalActorSession(cfg); err != nil {
+			return err
+		}
+		fmt.Println("Actor session deactivated for this terminal.")
+		return nil
+	case "sessions":
+		fs := flag.NewFlagSet("actor sessions", flag.ExitOnError)
+		actorID := fs.String("actor-id", "", "filter by actor id")
+		active := fs.Bool("active", false, "only active sessions")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		path := "/api/actor-sessions"
+		q := url.Values{}
+		if *actorID != "" {
+			q.Set("actor_id", *actorID)
+		}
+		if *active {
+			q.Set("active", "true")
+		}
+		if encoded := q.Encode(); encoded != "" {
+			path += "?" + encoded
+		}
+		var out []ActorSession
+		if err := request("GET", path, nil, &out); err != nil {
+			return err
+		}
+		return print(out, *jsonOut)
+	case "run":
+		return runActorSessionCommand(args[1:])
 	case "list":
 		var out []Actor
 		if err := request("GET", "/api/actors", nil, &out); err != nil {
@@ -7015,6 +7209,120 @@ func runActor(args []string) error {
 	default:
 		return fmt.Errorf("unknown actor command %q", args[0])
 	}
+}
+
+func runActorSessionCommand(args []string) error {
+	sep := -1
+	for i, arg := range args {
+		if arg == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 || sep == len(args)-1 {
+		return fmt.Errorf("usage: taskpilot actor run --secret <actor-secret> [--provider codex] -- <agent-command> [args...]")
+	}
+	fs := flag.NewFlagSet("actor run", flag.ExitOnError)
+	secret := fs.String("secret", os.Getenv("TASKPILOT_ACTOR_SECRET"), "actor secret")
+	actorID := fs.String("actor-id", "", "optional actor id")
+	provider := fs.String("provider", "", "agent provider")
+	taskID := fs.String("task-id", os.Getenv("TASKPILOT_TASK_ID"), "current task id")
+	repoPath := fs.String("repo", bestEffortGitRoot("."), "repository path")
+	_ = fs.Parse(args[:sep])
+	commandArgs := args[sep+1:]
+	if strings.TrimSpace(*secret) == "" {
+		return fmt.Errorf("--secret is required")
+	}
+	if *provider == "" {
+		*provider = detectAgentProvider(commandArgs)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	activation, err := activateActorSessionWithConfig(cfg, ActorSessionStartInput{
+		ActorID:        *actorID,
+		ActorSecret:    *secret,
+		MachineID:      machineID(),
+		TerminalID:     terminalID(),
+		AgentProvider:  *provider,
+		ProcessID:      os.Getpid(),
+		CurrentTaskID:  *taskID,
+		ClientVersion:  "taskpilot-cli",
+		RepositoryPath: *repoPath,
+	})
+	if err != nil {
+		return err
+	}
+	childCfg := cfg
+	childCfg.ActorID = activation.Actor.ID
+	childCfg.ActorSessionID = activation.Session.ID
+	childCfg.ActorSessionToken = activation.SessionToken
+	childCfg.CurrentTaskID = activation.Session.CurrentTaskID
+	childCfg.AgentProvider = activation.Session.AgentProvider
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	done := make(chan struct{})
+	go actorSessionHeartbeatLoop(ctx, childCfg, done)
+	cmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = append(os.Environ(),
+		"TASKPILOT_SERVER="+cfg.Server,
+		"TASKPILOT_ACTOR_ID="+activation.Actor.ID,
+		"TASKPILOT_ACTOR_SESSION_ID="+activation.Session.ID,
+		"TASKPILOT_ACTOR_SESSION_TOKEN="+activation.SessionToken,
+		"TASKPILOT_TERMINAL_ID="+terminalID(),
+		"TASKPILOT_AGENT_PROVIDER="+activation.Session.AgentProvider,
+	)
+	if activation.Session.CurrentTaskID != "" {
+		cmd.Env = append(cmd.Env, "TASKPILOT_TASK_ID="+activation.Session.CurrentTaskID)
+	}
+	err = cmd.Run()
+	close(done)
+	_ = doRequestWithConfig(childCfg, "POST", "/api/actor-sessions/current/end", map[string]any{}, nil, true)
+	return err
+}
+
+func actorSessionHeartbeatLoop(ctx context.Context, cfg Config, done <-chan struct{}) {
+	ticker := time.NewTicker(heartbeatInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			_ = doRequestWithConfig(cfg, "POST", "/api/actor-sessions/current/heartbeat", ActorSessionHeartbeat{
+				CurrentTaskID: cfg.CurrentTaskID,
+				MachineID:     machineID(),
+				TerminalID:    terminalID(),
+				AgentProvider: cfg.AgentProvider,
+				ProcessID:     os.Getpid(),
+				Status:        "active",
+			}, nil, true)
+		}
+	}
+}
+
+func doRequestWithConfig(cfg Config, method, path string, body any, out any, includeActor bool) error {
+	var bodyBytes []byte
+	if body != nil {
+		bodyBytes, _ = json.Marshal(body)
+	}
+	data, err := doRequestBytesWithConfig(cfg, method, path, bodyBytes, includeActor)
+	if err != nil {
+		return err
+	}
+	if out != nil {
+		return json.Unmarshal(data, out)
+	}
+	return nil
 }
 
 func runTask(args []string) error {
@@ -7484,6 +7792,27 @@ func recordRepoSemanticMemory(repoPath, completed, why, verification, remaining 
 	return recordRepoSemanticMemoryForTask(repoPath, "", completed, why, verification, remaining, files, stage, source, queueOnRetriable)
 }
 
+func currentActorSessionTaskID() string {
+	if taskID := strings.TrimSpace(os.Getenv("TASKPILOT_TASK_ID")); taskID != "" {
+		return taskID
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return ""
+	}
+	if cfg.CurrentTaskID != "" {
+		return cfg.CurrentTaskID
+	}
+	if cfg.ActorSessionID == "" || cfg.ActorSessionToken == "" {
+		return ""
+	}
+	var session ActorSession
+	if err := doRequestWithConfig(cfg, "GET", "/api/actor-sessions/current", nil, &session, true); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(session.CurrentTaskID)
+}
+
 func recordRepoSemanticMemoryForTask(repoPath, explicitTaskID, completed, why, verification, remaining string, files []string, stage, source string, queueOnRetriable bool) (map[string]any, error) {
 	completed = strings.TrimSpace(completed)
 	if completed == "" {
@@ -7499,6 +7828,11 @@ func recordRepoSemanticMemoryForTask(repoPath, explicitTaskID, completed, why, v
 	}
 	intent := repoWorkIntent{Kind: "semantic_memory", Completed: completed, Why: why, Verification: verification, Remaining: remaining, Files: files, Stage: stage, Source: source}
 	explicitTaskID = strings.TrimSpace(explicitTaskID)
+	sessionTaskID := ""
+	if explicitTaskID == "" {
+		sessionTaskID = currentActorSessionTaskID()
+		explicitTaskID = sessionTaskID
+	}
 	var task Task
 	var match repoTaskMatch
 	if explicitTaskID != "" {
@@ -7506,7 +7840,13 @@ func recordRepoSemanticMemoryForTask(repoPath, explicitTaskID, completed, why, v
 		err = requestNoProxy("GET", "/api/tasks/"+url.PathEscape(explicitTaskID), nil, &detail)
 		if err == nil {
 			task = detail.Task
-			match = repoTaskMatch{Task: task, Score: 1000, Confidence: 0.99, Action: "reuse", Reasons: []string{"explicit task id provided by agent"}, Evidence: []string{"explicit_task_id: " + explicitTaskID}}
+			reason := "explicit task id provided by agent"
+			evidence := "explicit_task_id: " + explicitTaskID
+			if sessionTaskID != "" {
+				reason = "current actor session task"
+				evidence = "actor_session_current_task_id: " + sessionTaskID
+			}
+			match = repoTaskMatch{Task: task, Score: 1000, Confidence: 0.99, Action: "reuse", Reasons: []string{reason}, Evidence: []string{evidence}}
 		}
 	} else {
 		task, match, err = ensureTaskForRepoActivityWithIntentWithProxy(activity, intent, false)
@@ -8575,6 +8915,11 @@ func doRequestBytes(method, path string, bodyBytes []byte, includeActor bool, al
 	if cfg.Server == "" {
 		cfg.Server = "http://127.0.0.1:8080"
 	}
+	if includeActor {
+		if err := ensureActorSessionForConfig(&cfg, false); err != nil {
+			return nil, err
+		}
+	}
 	data, err := doRequestBytesWithConfig(cfg, method, path, bodyBytes, includeActor)
 	if err != nil {
 		if allowProxy && isRetriableRequestError(err) {
@@ -8597,11 +8942,21 @@ func doRequestBytesWithConfig(cfg Config, method, path string, bodyBytes []byte,
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if includeActor && cfg.ActorID != "" {
-		req.Header.Set("X-Actor-ID", cfg.ActorID)
-	}
-	if includeActor && cfg.ActorSecret != "" {
-		req.Header.Set("X-Actor-Secret", cfg.ActorSecret)
+	if includeActor {
+		if cfg.ActorSessionID != "" && cfg.ActorSessionToken != "" {
+			if cfg.ActorID != "" {
+				req.Header.Set("X-Actor-ID", cfg.ActorID)
+			}
+			req.Header.Set("X-Actor-Session-ID", cfg.ActorSessionID)
+			req.Header.Set("X-Actor-Session-Token", cfg.ActorSessionToken)
+		} else {
+			if cfg.ActorID != "" {
+				req.Header.Set("X-Actor-ID", cfg.ActorID)
+			}
+			if cfg.ActorSecret != "" {
+				req.Header.Set("X-Actor-Secret", cfg.ActorSecret)
+			}
+		}
 	}
 	client := &http.Client{Timeout: taskPilotHTTPTimeout()}
 	resp, err := client.Do(req)
@@ -8631,6 +8986,77 @@ func doRequestBytesWithConfig(cfg Config, method, path string, bodyBytes []byte,
 		return nil, err
 	}
 	return data, nil
+}
+
+func ensureActorSessionForConfig(cfg *Config, migrateLegacy bool) error {
+	if cfg == nil || cfg.ActorSessionID != "" || cfg.ActorSessionToken != "" {
+		return nil
+	}
+	if strings.TrimSpace(cfg.ActorSecret) == "" {
+		return nil
+	}
+	if !migrateLegacy && strings.TrimSpace(cfg.ActorID) != "" {
+		return nil
+	}
+	activation, err := activateActorSessionWithConfig(*cfg, ActorSessionStartInput{
+		ActorID:        cfg.ActorID,
+		ActorSecret:    cfg.ActorSecret,
+		MachineID:      machineID(),
+		TerminalID:     terminalID(),
+		AgentProvider:  firstNonEmpty(cfg.AgentProvider, detectAgentProvider(nil)),
+		ProcessID:      os.Getpid(),
+		CurrentTaskID:  firstNonEmpty(cfg.CurrentTaskID, os.Getenv("TASKPILOT_TASK_ID")),
+		ClientVersion:  "taskpilot-cli",
+		RepositoryPath: bestEffortGitRoot("."),
+	})
+	if err != nil {
+		return err
+	}
+	cfg.ActorID = activation.Actor.ID
+	cfg.ActorSecret = ""
+	cfg.ActorSessionID = activation.Session.ID
+	cfg.ActorSessionToken = activation.SessionToken
+	cfg.CurrentTaskID = activation.Session.CurrentTaskID
+	cfg.AgentProvider = activation.Session.AgentProvider
+	return saveTerminalActorSession(terminalActorSession{
+		Server:            cfg.Server,
+		ActorID:           activation.Actor.ID,
+		ActorName:         activation.Actor.Name,
+		ActorSessionID:    activation.Session.ID,
+		ActorSessionToken: activation.SessionToken,
+		CurrentTaskID:     activation.Session.CurrentTaskID,
+		AgentProvider:     activation.Session.AgentProvider,
+		RepositoryPath:    activation.Session.RepositoryPath,
+		MachineID:         activation.Session.MachineID,
+		TerminalID:        activation.Session.TerminalID,
+		ProcessID:         activation.Session.ProcessID,
+		Status:            activation.Session.Status,
+		StartedAt:         activation.Session.StartedAt,
+	})
+}
+
+func activateActorSessionWithConfig(cfg Config, in ActorSessionStartInput) (ActorSessionActivation, error) {
+	if cfg.Server == "" {
+		cfg.Server = "http://127.0.0.1:8080"
+	}
+	var out ActorSessionActivation
+	bodyBytes, _ := json.Marshal(in)
+	data, err := doRequestBytesWithConfig(cfg, "POST", "/api/actor-sessions/activate", bodyBytes, false)
+	if err != nil {
+		return ActorSessionActivation{}, err
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return ActorSessionActivation{}, err
+	}
+	return out, nil
+}
+
+func bestEffortGitRoot(path string) string {
+	root, err := gitRoot(path)
+	if err != nil {
+		return ""
+	}
+	return root
 }
 
 func taskPilotHTTPTimeout() time.Duration {
@@ -8831,13 +9257,156 @@ func applyConfigEnvOverrides(cfg Config) Config {
 	if v := strings.TrimSpace(os.Getenv("TASKPILOT_SERVER")); v != "" {
 		cfg.Server = strings.TrimRight(v, "/")
 	}
+	cfg = applyTerminalActorSession(cfg)
+	legacyActorEnv := false
 	if v := strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_ID")); v != "" {
 		cfg.ActorID = v
+		legacyActorEnv = true
 	}
 	if v := strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_SECRET")); v != "" {
 		cfg.ActorSecret = v
+		legacyActorEnv = true
+	}
+	if legacyActorEnv {
+		cfg.ActorSessionID = ""
+		cfg.ActorSessionToken = ""
+	}
+	if v := strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_SESSION_ID")); v != "" {
+		cfg.ActorSessionID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_SESSION_TOKEN")); v != "" {
+		cfg.ActorSessionToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("TASKPILOT_TASK_ID")); v != "" && cfg.CurrentTaskID == "" {
+		cfg.CurrentTaskID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("TASKPILOT_AGENT_PROVIDER")); v != "" {
+		cfg.AgentProvider = v
 	}
 	return cfg
+}
+
+func applyTerminalActorSession(cfg Config) Config {
+	session, ok := loadTerminalActorSession(cfg)
+	if !ok {
+		return cfg
+	}
+	if cfg.Server == "" && session.Server != "" {
+		cfg.Server = strings.TrimRight(session.Server, "/")
+	}
+	cfg.ActorID = session.ActorID
+	cfg.ActorSecret = ""
+	cfg.ActorSessionID = session.ActorSessionID
+	cfg.ActorSessionToken = session.ActorSessionToken
+	cfg.CurrentTaskID = session.CurrentTaskID
+	cfg.AgentProvider = session.AgentProvider
+	return cfg
+}
+
+func loadTerminalActorSession(cfg Config) (terminalActorSession, bool) {
+	path := actorSessionFilePath(cfg)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return terminalActorSession{}, false
+	}
+	var session terminalActorSession
+	if json.Unmarshal(b, &session) != nil || session.ActorSessionID == "" || session.ActorSessionToken == "" || session.ActorID == "" {
+		return terminalActorSession{}, false
+	}
+	session.SessionFile = path
+	return session, true
+}
+
+func saveTerminalActorSession(session terminalActorSession) error {
+	path := actorSessionFilePath(Config{Server: session.Server})
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	session.SessionFile = path
+	if session.TerminalID == "" {
+		session.TerminalID = terminalID()
+	}
+	if session.MachineID == "" {
+		session.MachineID = machineID()
+	}
+	if session.StartedAt.IsZero() {
+		session.StartedAt = time.Now().UTC()
+	}
+	session.LastHeartbeatAt = time.Now().UTC()
+	b, _ := json.MarshalIndent(session, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func clearTerminalActorSession(cfg Config) error {
+	path := actorSessionFilePath(cfg)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func updateTerminalActorSessionTask(cfg Config, taskID string) error {
+	session, ok := loadTerminalActorSession(cfg)
+	if !ok {
+		return nil
+	}
+	session.CurrentTaskID = strings.TrimSpace(taskID)
+	session.Status = "active"
+	return saveTerminalActorSession(session)
+}
+
+func actorSessionFilePath(cfg Config) string {
+	if v := strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_SESSION_FILE")); v != "" {
+		return v
+	}
+	server := strings.TrimRight(firstNonEmpty(cfg.Server, os.Getenv("TASKPILOT_SERVER"), "http://127.0.0.1:8080"), "/")
+	key := configPath() + "|" + server + "|" + terminalID()
+	sum := sha256.Sum256([]byte(key))
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".taskpilot", "actor-sessions", fmt.Sprintf("%x.json", sum[:8]))
+}
+
+func terminalID() string {
+	for _, key := range []string{"TASKPILOT_TERMINAL_ID", "TERM_SESSION_ID", "WT_SESSION", "TMUX_PANE", "STY", "SSH_TTY"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return key + ":" + v
+		}
+	}
+	for _, path := range []string{"/proc/self/fd/0", "/dev/fd/0"} {
+		if target, err := os.Readlink(path); err == nil && strings.TrimSpace(target) != "" {
+			return "tty:" + target
+		}
+	}
+	return fmt.Sprintf("ppid:%d", os.Getppid())
+}
+
+func machineID() string {
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		return host
+	}
+	return "local-machine"
+}
+
+func detectAgentProvider(command []string) string {
+	if v := strings.TrimSpace(os.Getenv("TASKPILOT_AGENT_PROVIDER")); v != "" {
+		return v
+	}
+	if len(command) > 0 {
+		name := strings.ToLower(filepath.Base(command[0]))
+		switch {
+		case strings.Contains(name, "codex"):
+			return "codex"
+		case strings.Contains(name, "claude"):
+			return "claude"
+		case strings.Contains(name, "gemini"):
+			return "gemini"
+		}
+	}
+	return "manual"
 }
 
 func loadConfigDiagnostics(effective bool) (configDiagnostics, error) {
@@ -8845,13 +9414,15 @@ func loadConfigDiagnostics(effective bool) (configDiagnostics, error) {
 	if err != nil {
 		return configDiagnostics{}, err
 	}
-	cfg := fileCfg
+	cfg := applyTerminalActorSession(fileCfg)
 	sources := map[string]string{
 		"server":       "file",
 		"email":        "file",
 		"actor_id":     "file",
 		"actor_secret": "file",
 	}
+	sessionSource := ""
+	sessionFile := actorSessionFilePath(fileCfg)
 	envOverrideActive := false
 	if effective {
 		if strings.TrimSpace(os.Getenv("TASKPILOT_SERVER")) != "" {
@@ -8866,29 +9437,120 @@ func loadConfigDiagnostics(effective bool) (configDiagnostics, error) {
 			sources["actor_secret"] = "env:TASKPILOT_ACTOR_SECRET"
 			envOverrideActive = true
 		}
+		if strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_SESSION_ID")) != "" {
+			sources["actor_session_id"] = "env:TASKPILOT_ACTOR_SESSION_ID"
+			sessionSource = "environment"
+			envOverrideActive = true
+		}
+		if strings.TrimSpace(os.Getenv("TASKPILOT_ACTOR_SESSION_TOKEN")) != "" {
+			sources["actor_session_token"] = "env:TASKPILOT_ACTOR_SESSION_TOKEN"
+			sessionSource = "environment"
+			envOverrideActive = true
+		}
 		cfg = applyConfigEnvOverrides(fileCfg)
 	}
 	auth := "actor_secret"
+	if cfg.ActorSessionID != "" && cfg.ActorSessionToken != "" {
+		auth = "actor_session"
+		if sessionSource == "" {
+			sessionSource = "terminal-session-file"
+		}
+	}
 	if cfg.ActorID == "" || cfg.ActorSecret == "" {
 		auth = "not_configured"
 	}
+	if cfg.ActorSessionID != "" && cfg.ActorSessionToken != "" {
+		auth = "actor_session"
+	}
+	if sessionSource == "" {
+		if _, ok := loadTerminalActorSession(fileCfg); ok {
+			sessionSource = "terminal-session-file"
+		}
+	}
 	return configDiagnostics{
-		ConfigPath:        configPath(),
-		Server:            cfg.Server,
-		Email:             cfg.Email,
-		ActorID:           cfg.ActorID,
-		HasSecret:         cfg.ActorSecret != "",
-		Auth:              auth,
-		Sources:           sources,
-		Effective:         effective,
-		EnvOverrideActive: envOverrideActive,
+		ConfigPath:            configPath(),
+		Server:                cfg.Server,
+		Email:                 cfg.Email,
+		ActorID:               cfg.ActorID,
+		HasSecret:             cfg.ActorSecret != "",
+		Auth:                  auth,
+		Sources:               sources,
+		Effective:             effective,
+		EnvOverrideActive:     envOverrideActive,
+		DeprecatedGlobalActor: fileCfg.ActorID != "" || fileCfg.ActorSecret != "",
+		Global: globalConfigDiagnostics{
+			Server:          fileCfg.Server,
+			Email:           fileCfg.Email,
+			LegacyActorID:   fileCfg.ActorID,
+			HasLegacySecret: fileCfg.ActorSecret != "",
+		},
+		CurrentTerminalSession: sessionConfigDiagnostics{
+			Active:        cfg.ActorSessionID != "" && cfg.ActorSessionToken != "",
+			Scope:         "current terminal",
+			ActorID:       cfg.ActorID,
+			SessionID:     cfg.ActorSessionID,
+			Provider:      cfg.AgentProvider,
+			Status:        firstNonEmpty(sessionStatusFromConfig(cfg), "active"),
+			CurrentTaskID: cfg.CurrentTaskID,
+			SessionFile:   sessionFile,
+			Source:        sessionSource,
+			HasToken:      cfg.ActorSessionToken != "",
+		},
 	}, nil
+}
+
+func sessionStatusFromConfig(cfg Config) string {
+	session, ok := loadTerminalActorSession(cfg)
+	if !ok {
+		return ""
+	}
+	return session.Status
+}
+
+func printConfigDiagnostics(d configDiagnostics) {
+	fmt.Println("Global configuration")
+	fmt.Println("--------------------")
+	fmt.Printf("Server: %s\n", firstNonEmpty(d.Global.Server, d.Server, "http://127.0.0.1:8080"))
+	if d.Global.Email != "" {
+		fmt.Printf("Email: %s\n", d.Global.Email)
+	}
+	if d.Global.LegacyActorID != "" {
+		fmt.Printf("Deprecated global actor: %s\n", d.Global.LegacyActorID)
+	}
+	fmt.Println()
+	fmt.Println("Current terminal session")
+	fmt.Println("------------------------")
+	s := d.CurrentTerminalSession
+	if !s.Active {
+		fmt.Println("No actor is active in this terminal.")
+		if d.DeprecatedGlobalActor {
+			fmt.Println("Deprecated global actor credentials are present and will be migrated on the next authenticated command.")
+		}
+		fmt.Println()
+		fmt.Println("Activate one with:")
+		fmt.Println("taskpilot actor activate --secret <actor-secret>")
+		return
+	}
+	fmt.Printf("Actor ID: %s\n", s.ActorID)
+	fmt.Printf("Session ID: %s\n", s.SessionID)
+	if s.Provider != "" {
+		fmt.Printf("Provider: %s\n", s.Provider)
+	}
+	fmt.Printf("Status: %s\n", firstNonEmpty(s.Status, "active"))
+	if s.CurrentTaskID != "" {
+		fmt.Printf("Current task: %s\n", s.CurrentTaskID)
+	}
+	fmt.Println("Scope: current terminal")
 }
 
 func saveConfig(cfg Config) error {
 	if err := ensureDir(filepath.Dir(configPath())); err != nil {
 		return err
 	}
+	cfg.ActorSessionID = ""
+	cfg.ActorSessionToken = ""
+	cfg.CurrentTaskID = ""
+	cfg.AgentProvider = ""
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	path := configPath()
 	tmp := path + ".tmp"

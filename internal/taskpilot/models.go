@@ -3,19 +3,80 @@ package taskpilot
 import "time"
 
 const (
-	DefaultClaimTTL = 15 * time.Minute
-	DefaultLockTTL  = 30 * time.Minute
+	DefaultClaimTTL                   = 15 * time.Minute
+	DefaultLockTTL                    = 30 * time.Minute
+	DefaultActorSessionStaleThreshold = 2 * time.Minute
 )
 
 type Actor struct {
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	Kind            string         `json:"kind"`
+	MachineName     string         `json:"machine_name,omitempty"`
+	Secret          string         `json:"actor_secret,omitempty"`
+	CreatedByUserID string         `json:"created_by_user_id,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	LastSeenAt      *time.Time     `json:"last_seen_at,omitempty"`
+	Status          string         `json:"status,omitempty"`
+	ActiveSessions  int            `json:"active_sessions,omitempty"`
+	Sessions        []ActorSession `json:"sessions,omitempty"`
+	CurrentTaskIDs  []string       `json:"current_task_ids,omitempty"`
+	LastHeartbeatAt *time.Time     `json:"last_heartbeat_at,omitempty"`
+}
+
+type ActorSession struct {
 	ID              string     `json:"id"`
-	Name            string     `json:"name"`
-	Kind            string     `json:"kind"`
-	MachineName     string     `json:"machine_name,omitempty"`
-	Secret          string     `json:"actor_secret,omitempty"`
-	CreatedByUserID string     `json:"created_by_user_id,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
+	ActorID         string     `json:"actor_id"`
+	UserID          string     `json:"user_id,omitempty"`
+	WorkspaceID     string     `json:"workspace_id,omitempty"`
+	ProjectID       string     `json:"project_id,omitempty"`
+	RepositoryID    string     `json:"repository_id,omitempty"`
+	RepositoryPath  string     `json:"repository_path,omitempty"`
+	MachineID       string     `json:"machine_id,omitempty"`
+	TerminalID      string     `json:"terminal_id,omitempty"`
+	AgentProvider   string     `json:"agent_provider,omitempty"`
+	ProcessID       int        `json:"process_id,omitempty"`
+	StartedAt       time.Time  `json:"started_at"`
+	LastHeartbeatAt time.Time  `json:"last_heartbeat_at"`
+	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	Status          string     `json:"status"`
+	CurrentTaskID   string     `json:"current_task_id,omitempty"`
+	ClientVersion   string     `json:"client_version,omitempty"`
+}
+
+type ActorSessionStartInput struct {
+	ActorID        string `json:"actor_id,omitempty"`
+	ActorSecret    string `json:"actor_secret,omitempty"`
+	WorkspaceID    string `json:"workspace_id,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
+	RepositoryID   string `json:"repository_id,omitempty"`
+	RepositoryPath string `json:"repository_path,omitempty"`
+	MachineID      string `json:"machine_id,omitempty"`
+	TerminalID     string `json:"terminal_id,omitempty"`
+	AgentProvider  string `json:"agent_provider,omitempty"`
+	ProcessID      int    `json:"process_id,omitempty"`
+	CurrentTaskID  string `json:"current_task_id,omitempty"`
+	ClientVersion  string `json:"client_version,omitempty"`
+}
+
+type ActorSessionHeartbeat struct {
+	WorkspaceID    string `json:"workspace_id,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
+	RepositoryID   string `json:"repository_id,omitempty"`
+	RepositoryPath string `json:"repository_path,omitempty"`
+	MachineID      string `json:"machine_id,omitempty"`
+	TerminalID     string `json:"terminal_id,omitempty"`
+	AgentProvider  string `json:"agent_provider,omitempty"`
+	ProcessID      int    `json:"process_id,omitempty"`
+	CurrentTaskID  string `json:"current_task_id,omitempty"`
+	ClientVersion  string `json:"client_version,omitempty"`
+	Status         string `json:"status,omitempty"`
+}
+
+type ActorSessionActivation struct {
+	Actor        Actor        `json:"actor"`
+	Session      ActorSession `json:"session"`
+	SessionToken string       `json:"session_token,omitempty"`
 }
 
 type User struct {
@@ -151,19 +212,20 @@ type TaskIntelligenceDecision struct {
 }
 
 type ContextEntry struct {
-	ID           string    `json:"id"`
-	TaskID       string    `json:"task_id"`
-	AuthorID     string    `json:"author_id"`
-	Kind         string    `json:"kind"`
-	Content      string    `json:"content"`
-	Source       string    `json:"source,omitempty"`
-	Reason       string    `json:"reason,omitempty"`
-	Confidence   string    `json:"confidence,omitempty"`
-	Files        []string  `json:"files,omitempty"`
-	MemoryKey    string    `json:"memory_key,omitempty"`
-	Stage        string    `json:"stage,omitempty"`
-	SupersededBy string    `json:"superseded_by,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID             string    `json:"id"`
+	TaskID         string    `json:"task_id"`
+	AuthorID       string    `json:"author_id"`
+	ActorSessionID string    `json:"actor_session_id,omitempty"`
+	Kind           string    `json:"kind"`
+	Content        string    `json:"content"`
+	Source         string    `json:"source,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	Confidence     string    `json:"confidence,omitempty"`
+	Files          []string  `json:"files,omitempty"`
+	MemoryKey      string    `json:"memory_key,omitempty"`
+	Stage          string    `json:"stage,omitempty"`
+	SupersededBy   string    `json:"superseded_by,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type DecisionRecord struct {
@@ -213,6 +275,7 @@ type Lock struct {
 	ID              string     `json:"id"`
 	TaskID          string     `json:"task_id"`
 	OwnerID         string     `json:"owner_id"`
+	ActorSessionID  string     `json:"actor_session_id,omitempty"`
 	OwnerName       string     `json:"owner_name,omitempty"`
 	TaskTitle       string     `json:"task_title,omitempty"`
 	Scope           string     `json:"scope"`
@@ -361,13 +424,14 @@ type StaleClaim struct {
 }
 
 type TaskSession struct {
-	ID           string     `json:"id"`
-	TaskID       string     `json:"task_id"`
-	ActorID      string     `json:"actor_id"`
-	StartedAt    time.Time  `json:"started_at"`
-	EndedAt      *time.Time `json:"ended_at,omitempty"`
-	ExitStatus   string     `json:"exit_status,omitempty"`
-	FinishReason string     `json:"finish_reason,omitempty"`
+	ID             string     `json:"id"`
+	TaskID         string     `json:"task_id"`
+	ActorID        string     `json:"actor_id"`
+	ActorSessionID string     `json:"actor_session_id,omitempty"`
+	StartedAt      time.Time  `json:"started_at"`
+	EndedAt        *time.Time `json:"ended_at,omitempty"`
+	ExitStatus     string     `json:"exit_status,omitempty"`
+	FinishReason   string     `json:"finish_reason,omitempty"`
 }
 
 type Event struct {

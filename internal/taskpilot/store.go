@@ -179,6 +179,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, machine_name TEXT,
 			created_at TEXT NOT NULL, last_seen_at TEXT, actor_secret_hash TEXT, created_by_user_id TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS actor_sessions (
+			id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, user_id TEXT, workspace_id TEXT, project_id TEXT,
+			repository_id TEXT, repository_path TEXT, machine_id TEXT, terminal_id TEXT,
+			agent_provider TEXT, process_id INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL,
+			last_heartbeat_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL,
+			current_task_id TEXT, client_version TEXT, session_token_hash TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, password_hash TEXT NOT NULL,
 			active INTEGER NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT
@@ -214,7 +221,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			content TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual', reason TEXT NOT NULL DEFAULT '',
 			confidence TEXT NOT NULL DEFAULT '', files_json TEXT NOT NULL DEFAULT '[]',
 			memory_key TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL DEFAULT 'active',
-			superseded_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+			superseded_by TEXT NOT NULL DEFAULT '', actor_session_id TEXT, created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS decision_records (
 			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, author_id TEXT NOT NULL,
@@ -236,7 +243,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			note TEXT NOT NULL, created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS locks (
-			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, owner_id TEXT NOT NULL, scope TEXT NOT NULL,
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, owner_id TEXT NOT NULL, actor_session_id TEXT, scope TEXT NOT NULL,
 			scope_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
 			expires_at TEXT NOT NULL, last_heartbeat_at TEXT NOT NULL,
 			created_at TEXT NOT NULL, released_at TEXT, released_by TEXT, release_reason TEXT,
@@ -275,7 +282,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS task_sessions (
-			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL, actor_id TEXT NOT NULL, actor_session_id TEXT,
 			started_at TEXT NOT NULL, ended_at TEXT, exit_status TEXT, finish_reason TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -317,11 +324,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	_, _ = s.exec(ctx, `ALTER TABLE actors ADD COLUMN actor_secret_hash TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE actors ADD COLUMN created_by_user_id TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE actor_sessions ADD COLUMN repository_path TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT 'project_default'`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN repo_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN workspace_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE tasks ADD COLUMN parent_task_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`)
+	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN actor_session_id TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN last_heartbeat_at TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN released_by TEXT`)
 	_, _ = s.exec(ctx, `ALTER TABLE locks ADD COLUMN release_reason TEXT`)
@@ -342,6 +351,8 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN memory_key TEXT NOT NULL DEFAULT ''`)
 	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN stage TEXT NOT NULL DEFAULT 'active'`)
 	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN superseded_by TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.exec(ctx, `ALTER TABLE context_entries ADD COLUMN actor_session_id TEXT`)
+	_, _ = s.exec(ctx, `ALTER TABLE task_sessions ADD COLUMN actor_session_id TEXT`)
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='published' WHERE status='ready' AND handoff_id IS NOT NULL AND handoff_id<>''`)
 	_, _ = s.exec(ctx, `UPDATE handoff_packets SET status='draft' WHERE status='ready' AND (handoff_id IS NULL OR handoff_id='')`)
 	if err := s.ensureDefaultProject(ctx); err != nil {
@@ -614,6 +625,7 @@ func (s *Store) TouchActor(ctx context.Context, actorID string) {
 }
 
 func (s *Store) ListActors(ctx context.Context) ([]Actor, error) {
+	_ = s.markStaleActorSessions(ctx, time.Now().UTC())
 	rows, err := s.query(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at,created_by_user_id FROM actors ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -625,6 +637,7 @@ func (s *Store) ListActors(ctx context.Context) ([]Actor, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.hydrateActorSessionSummary(ctx, &a)
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -636,7 +649,37 @@ func (s *Store) GetActor(ctx context.Context, id string) (*Actor, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
+	if err == nil {
+		s.hydrateActorSessionSummary(ctx, &a)
+	}
 	return &a, err
+}
+
+func (s *Store) hydrateActorSessionSummary(ctx context.Context, actor *Actor) {
+	if actor == nil || actor.ID == "" {
+		return
+	}
+	sessions, err := s.ListActorSessions(ctx, actor.ID, false)
+	if err != nil {
+		return
+	}
+	actor.Sessions = sessions
+	actor.Status = "offline"
+	seenTasks := map[string]bool{}
+	for _, session := range sessions {
+		if session.EndedAt == nil && oneOf(session.Status, "connecting", "active", "idle") {
+			actor.ActiveSessions++
+			actor.Status = "active"
+			if session.CurrentTaskID != "" && !seenTasks[session.CurrentTaskID] {
+				actor.CurrentTaskIDs = append(actor.CurrentTaskIDs, session.CurrentTaskID)
+				seenTasks[session.CurrentTaskID] = true
+			}
+		}
+		if actor.LastHeartbeatAt == nil || session.LastHeartbeatAt.After(*actor.LastHeartbeatAt) {
+			t := session.LastHeartbeatAt
+			actor.LastHeartbeatAt = &t
+		}
+	}
 }
 
 func (s *Store) UpdateActorForUser(ctx context.Context, actorID, userID, name, kind, machine string) (Actor, error) {
@@ -711,6 +754,227 @@ func (s *Store) ResetActorSecretForUser(ctx context.Context, actorID, userID str
 	}
 	updated.Secret = secret
 	return *updated, s.addEvent(ctx, "", userID, "actor.secret_rotated", map[string]any{"id": actorID, "name": updated.Name})
+}
+
+func (s *Store) StartActorSession(ctx context.Context, in ActorSessionStartInput) (ActorSessionActivation, error) {
+	in.ActorID = strings.TrimSpace(in.ActorID)
+	in.ActorSecret = strings.TrimSpace(in.ActorSecret)
+	if in.ActorSecret == "" {
+		return ActorSessionActivation{}, userErr("validation", "actor secret is required")
+	}
+	actor, err := s.actorBySecret(ctx, in.ActorID, in.ActorSecret)
+	if err != nil {
+		return ActorSessionActivation{}, err
+	}
+	now := time.Now().UTC()
+	token := newSecret()
+	session := ActorSession{
+		ID:              newID("actor_session"),
+		ActorID:         actor.ID,
+		UserID:          actor.CreatedByUserID,
+		WorkspaceID:     strings.TrimSpace(in.WorkspaceID),
+		ProjectID:       strings.TrimSpace(in.ProjectID),
+		RepositoryID:    strings.TrimSpace(in.RepositoryID),
+		RepositoryPath:  strings.TrimSpace(in.RepositoryPath),
+		MachineID:       strings.TrimSpace(in.MachineID),
+		TerminalID:      strings.TrimSpace(in.TerminalID),
+		AgentProvider:   strings.TrimSpace(in.AgentProvider),
+		ProcessID:       in.ProcessID,
+		StartedAt:       now,
+		LastHeartbeatAt: now,
+		Status:          "active",
+		CurrentTaskID:   strings.TrimSpace(in.CurrentTaskID),
+		ClientVersion:   strings.TrimSpace(in.ClientVersion),
+	}
+	_, err = s.exec(ctx, `INSERT INTO actor_sessions (id,actor_id,user_id,workspace_id,project_id,repository_id,repository_path,machine_id,terminal_id,agent_provider,process_id,started_at,last_heartbeat_at,ended_at,status,current_task_id,client_version,session_token_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)`,
+		session.ID, session.ActorID, session.UserID, session.WorkspaceID, session.ProjectID, session.RepositoryID, session.RepositoryPath, session.MachineID, session.TerminalID, session.AgentProvider, session.ProcessID, ts(session.StartedAt), ts(session.LastHeartbeatAt), session.Status, session.CurrentTaskID, session.ClientVersion, secretHash(token))
+	if err != nil {
+		return ActorSessionActivation{}, err
+	}
+	s.TouchActor(ctx, actor.ID)
+	activation := ActorSessionActivation{Actor: actor, Session: session, SessionToken: token}
+	eventPayload := activation
+	eventPayload.SessionToken = ""
+	return activation, s.addEvent(ctx, "", actor.ID, "actor.session_created", eventPayload)
+}
+
+func (s *Store) actorBySecret(ctx context.Context, actorID, secret string) (Actor, error) {
+	if secret == "" {
+		return Actor{}, userErr("unauthorized", "invalid actor credentials")
+	}
+	var row scanner
+	if actorID != "" {
+		row = s.queryRow(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at,created_by_user_id FROM actors WHERE id=? AND actor_secret_hash=?`, actorID, secretHash(secret))
+	} else {
+		row = s.queryRow(ctx, `SELECT id,name,kind,machine_name,created_at,last_seen_at,created_by_user_id FROM actors WHERE actor_secret_hash=? ORDER BY created_at DESC LIMIT 1`, secretHash(secret))
+	}
+	actor, err := scanActor(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Actor{}, userErr("unauthorized", "invalid actor credentials")
+	}
+	return actor, err
+}
+
+func (s *Store) VerifyActorSession(ctx context.Context, sessionID, token string) (ActorSession, bool, error) {
+	if sessionID == "" || token == "" {
+		return ActorSession{}, false, nil
+	}
+	session, tokenHash, err := s.getActorSessionWithToken(ctx, sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ActorSession{}, false, nil
+	}
+	if err != nil {
+		return ActorSession{}, false, err
+	}
+	if session.EndedAt != nil || tokenHash != secretHash(token) {
+		return ActorSession{}, false, nil
+	}
+	return session, true, nil
+}
+
+func (s *Store) GetActorSession(ctx context.Context, sessionID string) (ActorSession, error) {
+	session, _, err := s.getActorSessionWithToken(ctx, sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ActorSession{}, userErr("not_found", "actor session not found")
+	}
+	return session, err
+}
+
+func (s *Store) getActorSessionWithToken(ctx context.Context, sessionID string) (ActorSession, string, error) {
+	row := s.queryRow(ctx, `SELECT id,actor_id,user_id,workspace_id,project_id,repository_id,repository_path,machine_id,terminal_id,agent_provider,process_id,started_at,last_heartbeat_at,ended_at,status,current_task_id,client_version,session_token_hash FROM actor_sessions WHERE id=?`, sessionID)
+	session, tokenHash, err := scanActorSessionWithToken(row)
+	return session, tokenHash, err
+}
+
+func (s *Store) TouchActorSession(ctx context.Context, actorID, sessionID string, heartbeat ActorSessionHeartbeat) (ActorSession, error) {
+	if sessionID == "" {
+		return ActorSession{}, userErr("validation", "actor session id is required")
+	}
+	session, err := s.GetActorSession(ctx, sessionID)
+	if err != nil {
+		return ActorSession{}, err
+	}
+	if session.ActorID != actorID {
+		return ActorSession{}, userErr("forbidden", "actor session does not belong to this actor")
+	}
+	if session.EndedAt != nil {
+		return ActorSession{}, userErr("conflict", "actor session has ended")
+	}
+	now := time.Now().UTC()
+	applyActorSessionHeartbeat(&session, heartbeat)
+	session.LastHeartbeatAt = now
+	if session.Status == "" || session.Status == "stale" || session.Status == "connecting" {
+		session.Status = "active"
+	}
+	if !oneOf(session.Status, "connecting", "active", "idle", "disconnected", "stale", "ended") {
+		session.Status = "active"
+	}
+	_, err = s.exec(ctx, `UPDATE actor_sessions SET workspace_id=?,project_id=?,repository_id=?,repository_path=?,machine_id=?,terminal_id=?,agent_provider=?,process_id=?,last_heartbeat_at=?,status=?,current_task_id=?,client_version=? WHERE id=?`,
+		session.WorkspaceID, session.ProjectID, session.RepositoryID, session.RepositoryPath, session.MachineID, session.TerminalID, session.AgentProvider, session.ProcessID, ts(session.LastHeartbeatAt), session.Status, session.CurrentTaskID, session.ClientVersion, session.ID)
+	if err != nil {
+		return ActorSession{}, err
+	}
+	s.TouchActor(ctx, actorID)
+	return session, nil
+}
+
+func applyActorSessionHeartbeat(session *ActorSession, heartbeat ActorSessionHeartbeat) {
+	if v := strings.TrimSpace(heartbeat.WorkspaceID); v != "" {
+		session.WorkspaceID = v
+	}
+	if v := strings.TrimSpace(heartbeat.ProjectID); v != "" {
+		session.ProjectID = v
+	}
+	if v := strings.TrimSpace(heartbeat.RepositoryID); v != "" {
+		session.RepositoryID = v
+	}
+	if v := strings.TrimSpace(heartbeat.RepositoryPath); v != "" {
+		session.RepositoryPath = v
+	}
+	if v := strings.TrimSpace(heartbeat.MachineID); v != "" {
+		session.MachineID = v
+	}
+	if v := strings.TrimSpace(heartbeat.TerminalID); v != "" {
+		session.TerminalID = v
+	}
+	if v := strings.TrimSpace(heartbeat.AgentProvider); v != "" {
+		session.AgentProvider = v
+	}
+	if heartbeat.ProcessID > 0 {
+		session.ProcessID = heartbeat.ProcessID
+	}
+	if v := strings.TrimSpace(heartbeat.CurrentTaskID); v != "" {
+		session.CurrentTaskID = v
+	}
+	if v := strings.TrimSpace(heartbeat.ClientVersion); v != "" {
+		session.ClientVersion = v
+	}
+	if v := strings.TrimSpace(heartbeat.Status); v != "" {
+		session.Status = v
+	}
+}
+
+func (s *Store) EndActorSession(ctx context.Context, actorID, sessionID string) (ActorSession, error) {
+	session, err := s.GetActorSession(ctx, sessionID)
+	if err != nil {
+		return ActorSession{}, err
+	}
+	if session.ActorID != actorID {
+		return ActorSession{}, userErr("forbidden", "actor session does not belong to this actor")
+	}
+	now := time.Now().UTC()
+	session.EndedAt = &now
+	session.LastHeartbeatAt = now
+	session.Status = "ended"
+	_, err = s.exec(ctx, `UPDATE actor_sessions SET ended_at=?,last_heartbeat_at=?,status='ended' WHERE id=?`, ts(now), ts(now), session.ID)
+	if err != nil {
+		return ActorSession{}, err
+	}
+	_, _ = s.exec(ctx, `UPDATE locks SET status='released', released_at=?, released_by=?, release_reason=? WHERE actor_session_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+		ts(now), actorID, "actor session ended", session.ID)
+	return session, s.addEvent(ctx, "", actorID, "actor.session_ended", session)
+}
+
+func (s *Store) ListActorSessions(ctx context.Context, actorID string, activeOnly bool) ([]ActorSession, error) {
+	_ = s.markStaleActorSessions(ctx, time.Now().UTC())
+	q := `SELECT id,actor_id,user_id,workspace_id,project_id,repository_id,repository_path,machine_id,terminal_id,agent_provider,process_id,started_at,last_heartbeat_at,ended_at,status,current_task_id,client_version FROM actor_sessions`
+	args := []any{}
+	clauses := []string{}
+	if strings.TrimSpace(actorID) != "" {
+		clauses = append(clauses, "actor_id=?")
+		args = append(args, strings.TrimSpace(actorID))
+	}
+	if activeOnly {
+		clauses = append(clauses, "ended_at IS NULL AND status IN ('connecting','active','idle')")
+	}
+	if len(clauses) > 0 {
+		q += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	q += " ORDER BY last_heartbeat_at DESC, started_at DESC"
+	rows, err := s.query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ActorSession{}
+	for rows.Next() {
+		session, err := scanActorSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, session)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) markStaleActorSessions(ctx context.Context, now time.Time) error {
+	cutoff := now.Add(-DefaultActorSessionStaleThreshold)
+	_, err := s.exec(ctx, `UPDATE actor_sessions SET status='stale' WHERE ended_at IS NULL AND status IN ('connecting','active','idle','disconnected') AND last_heartbeat_at<?`, ts(cutoff))
+	if err != nil {
+		return err
+	}
+	_, _ = s.exec(ctx, `UPDATE locks SET status='stale' WHERE released_at IS NULL AND status='active' AND actor_session_id IN (SELECT id FROM actor_sessions WHERE status='stale')`)
+	return nil
 }
 
 type TaskInput struct {
@@ -1156,6 +1420,10 @@ func (s *Store) DeleteTaskMemory(ctx context.Context, actorID, id string) error 
 }
 
 func (s *Store) ClaimTask(ctx context.Context, actorID, id, reason string, force bool) (Task, error) {
+	return s.ClaimTaskForActorSession(ctx, actorID, "", id, reason, force)
+}
+
+func (s *Store) ClaimTaskForActorSession(ctx context.Context, actorID, actorSessionID, id, reason string, force bool) (Task, error) {
 	t, err := s.GetTask(ctx, id)
 	if err != nil {
 		return Task{}, err
@@ -1169,8 +1437,8 @@ func (s *Store) ClaimTask(ctx context.Context, actorID, id, reason string, force
 		return Task{}, userErr("validation", "reason is required to force reassign an active task")
 	}
 	if force && t.OwnerID != "" && t.OwnerID != actorID {
-		_, _ = s.exec(ctx, `UPDATE locks SET owner_id=?, status='active', last_heartbeat_at=?, expires_at=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND status IN ('active','stale')`,
-			actorID, ts(now), ts(now.Add(DefaultLockTTL)), t.ID, t.OwnerID)
+		_, _ = s.exec(ctx, `UPDATE locks SET owner_id=?, actor_session_id=?, status='active', last_heartbeat_at=?, expires_at=? WHERE task_id=? AND owner_id=? AND released_at IS NULL AND status IN ('active','stale')`,
+			actorID, strings.TrimSpace(actorSessionID), ts(now), ts(now.Add(DefaultLockTTL)), t.ID, t.OwnerID)
 	}
 	if err := s.ensureTaskLockable(ctx, actorID, t); err != nil {
 		return Task{}, err
@@ -1190,8 +1458,11 @@ func (s *Store) ClaimTask(ctx context.Context, actorID, id, reason string, force
 	if force {
 		etype = "task.reassigned"
 	}
-	if err := s.ensureTaskLocks(ctx, actorID, t); err != nil {
+	if err := s.ensureTaskLocksForSession(ctx, actorID, actorSessionID, t); err != nil {
 		return Task{}, err
+	}
+	if strings.TrimSpace(actorSessionID) != "" {
+		_, _ = s.TouchActorSession(ctx, actorID, actorSessionID, ActorSessionHeartbeat{CurrentTaskID: t.ID, Status: "active"})
 	}
 	return t, s.addEvent(ctx, t.ID, actorID, etype, map[string]any{"owner_id": actorID, "reason": reason})
 }
@@ -1244,6 +1515,10 @@ func (s *Store) HeartbeatTask(ctx context.Context, actorID, id string) (Task, er
 }
 
 func (s *Store) StartTaskSession(ctx context.Context, actorID, taskID string) (TaskSession, error) {
+	return s.StartTaskSessionForActorSession(ctx, actorID, "", taskID)
+}
+
+func (s *Store) StartTaskSessionForActorSession(ctx context.Context, actorID, actorSessionID, taskID string) (TaskSession, error) {
 	t, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return TaskSession{}, err
@@ -1257,18 +1532,21 @@ func (s *Store) StartTaskSession(ctx context.Context, actorID, taskID string) (T
 	if err := s.ensureTaskLockable(ctx, actorID, t); err != nil {
 		return TaskSession{}, err
 	}
-	if err := s.ensureTaskLocks(ctx, actorID, t); err != nil {
+	if err := s.ensureTaskLocksForSession(ctx, actorID, actorSessionID, t); err != nil {
 		return TaskSession{}, err
 	}
 	if _, err := s.UpdateTask(ctx, actorID, taskID, TaskInput{Status: "in_progress"}, "session started"); err != nil {
 		return TaskSession{}, err
 	}
 	now := time.Now().UTC()
-	session := TaskSession{ID: newID("session"), TaskID: taskID, ActorID: actorID, StartedAt: now}
-	_, err = s.exec(ctx, `INSERT INTO task_sessions (id,task_id,actor_id,started_at) VALUES (?,?,?,?)`,
-		session.ID, session.TaskID, session.ActorID, ts(session.StartedAt))
+	session := TaskSession{ID: newID("session"), TaskID: taskID, ActorID: actorID, ActorSessionID: strings.TrimSpace(actorSessionID), StartedAt: now}
+	_, err = s.exec(ctx, `INSERT INTO task_sessions (id,task_id,actor_id,actor_session_id,started_at) VALUES (?,?,?,?,?)`,
+		session.ID, session.TaskID, session.ActorID, session.ActorSessionID, ts(session.StartedAt))
 	if err != nil {
 		return TaskSession{}, err
+	}
+	if session.ActorSessionID != "" {
+		_, _ = s.TouchActorSession(ctx, actorID, session.ActorSessionID, ActorSessionHeartbeat{CurrentTaskID: taskID, Status: "active"})
 	}
 	return session, s.addEvent(ctx, taskID, actorID, "task.session_started", session)
 }
@@ -1720,10 +1998,14 @@ func (s *Store) AppendContextWithMeta(ctx context.Context, actorID, taskID, kind
 }
 
 func (s *Store) AppendContextWithConfidence(ctx context.Context, actorID, taskID, kind, content, source, reason, confidence string, files []string) (ContextEntry, error) {
-	return s.AppendContextWithLifecycle(ctx, actorID, taskID, kind, content, source, reason, confidence, files, "", "")
+	return s.AppendContextWithActorSession(ctx, actorID, "", taskID, kind, content, source, reason, confidence, files, "", "")
 }
 
 func (s *Store) AppendContextWithLifecycle(ctx context.Context, actorID, taskID, kind, content, source, reason, confidence string, files []string, memoryKey, stage string) (ContextEntry, error) {
+	return s.AppendContextWithActorSession(ctx, actorID, "", taskID, kind, content, source, reason, confidence, files, memoryKey, stage)
+}
+
+func (s *Store) AppendContextWithActorSession(ctx context.Context, actorID, actorSessionID, taskID, kind, content, source, reason, confidence string, files []string, memoryKey, stage string) (ContextEntry, error) {
 	if content == "" {
 		return ContextEntry{}, userErr("validation", "context content is required")
 	}
@@ -1779,9 +2061,9 @@ func (s *Store) AppendContextWithLifecycle(ctx context.Context, actorID, taskID,
 		}
 	}
 	now := time.Now().UTC()
-	c := ContextEntry{ID: newID("ctx"), TaskID: taskID, AuthorID: actorID, Kind: kind, Content: content, Source: source, Reason: reason, Confidence: confidence, Files: files, MemoryKey: memoryKey, Stage: stage, CreatedAt: now}
-	_, err := s.exec(ctx, `INSERT INTO context_entries (id,task_id,author_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.TaskID, c.AuthorID, c.Kind, c.Content, c.Source, c.Reason, c.Confidence, js(c.Files), c.MemoryKey, c.Stage, c.SupersededBy, ts(c.CreatedAt))
+	c := ContextEntry{ID: newID("ctx"), TaskID: taskID, AuthorID: actorID, ActorSessionID: strings.TrimSpace(actorSessionID), Kind: kind, Content: content, Source: source, Reason: reason, Confidence: confidence, Files: files, MemoryKey: memoryKey, Stage: stage, CreatedAt: now}
+	_, err := s.exec(ctx, `INSERT INTO context_entries (id,task_id,author_id,actor_session_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.TaskID, c.AuthorID, c.ActorSessionID, c.Kind, c.Content, c.Source, c.Reason, c.Confidence, js(c.Files), c.MemoryKey, c.Stage, c.SupersededBy, ts(c.CreatedAt))
 	if err != nil {
 		return ContextEntry{}, err
 	}
@@ -1795,7 +2077,7 @@ func (s *Store) AppendContextWithLifecycle(ctx context.Context, actorID, taskID,
 }
 
 func (s *Store) activeContextForMemoryKey(ctx context.Context, taskID, memoryKey string) (ContextEntry, bool, error) {
-	rows, err := s.query(ctx, `SELECT id,task_id,author_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at FROM context_entries WHERE task_id=? AND memory_key=? AND stage<>'superseded' ORDER BY created_at DESC LIMIT 1`, taskID, memoryKey)
+	rows, err := s.query(ctx, `SELECT id,task_id,author_id,actor_session_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at FROM context_entries WHERE task_id=? AND memory_key=? AND stage<>'superseded' ORDER BY created_at DESC LIMIT 1`, taskID, memoryKey)
 	if err != nil {
 		return ContextEntry{}, false, err
 	}
@@ -1817,9 +2099,11 @@ type contextEntryScanner interface {
 func scanContextEntry(scanner contextEntryScanner) (ContextEntry, error) {
 	var c ContextEntry
 	var created, files string
-	if err := scanner.Scan(&c.ID, &c.TaskID, &c.AuthorID, &c.Kind, &c.Content, &c.Source, &c.Reason, &c.Confidence, &files, &c.MemoryKey, &c.Stage, &c.SupersededBy, &created); err != nil {
+	var actorSessionID sql.NullString
+	if err := scanner.Scan(&c.ID, &c.TaskID, &c.AuthorID, &actorSessionID, &c.Kind, &c.Content, &c.Source, &c.Reason, &c.Confidence, &files, &c.MemoryKey, &c.Stage, &c.SupersededBy, &created); err != nil {
 		return ContextEntry{}, err
 	}
+	c.ActorSessionID = actorSessionID.String
 	if c.Source == "" {
 		c.Source = "manual"
 	}
@@ -1851,7 +2135,7 @@ func contextMemoryRank(entry ContextEntry) int {
 }
 
 func (s *Store) ListContext(ctx context.Context, taskID string) ([]ContextEntry, error) {
-	rows, err := s.query(ctx, `SELECT id,task_id,author_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at FROM context_entries WHERE task_id=? ORDER BY created_at ASC`, taskID)
+	rows, err := s.query(ctx, `SELECT id,task_id,author_id,actor_session_id,kind,content,source,reason,confidence,files_json,memory_key,stage,superseded_by,created_at FROM context_entries WHERE task_id=? ORDER BY created_at ASC`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -2596,6 +2880,10 @@ func (s *Store) getConflict(ctx context.Context, id string) (Conflict, error) {
 }
 
 func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeType string) (Lock, []Lock, error) {
+	return s.AcquireLockForSession(ctx, actorID, "", taskID, scope, scopeType)
+}
+
+func (s *Store) AcquireLockForSession(ctx context.Context, actorID, actorSessionID, taskID, scope, scopeType string) (Lock, []Lock, error) {
 	if strings.TrimSpace(scope) == "" {
 		return Lock{}, nil, userErr("validation", "lock scope is required")
 	}
@@ -2609,7 +2897,7 @@ func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeTy
 		return Lock{}, nil, err
 	}
 	_ = s.markStaleLocks(ctx, time.Now().UTC())
-	conflicts, err := s.FindLockConflicts(ctx, actorID, scope, scopeType)
+	conflicts, err := s.FindLockConflictsForSession(ctx, actorID, actorSessionID, scope, scopeType)
 	if err != nil {
 		return Lock{}, nil, err
 	}
@@ -2630,9 +2918,9 @@ func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeTy
 		return Lock{}, conflicts, userErr("conflict", "active overlapping lock exists")
 	}
 	now := time.Now().UTC()
-	l := Lock{ID: newID("lock"), TaskID: taskID, OwnerID: actorID, Scope: scope, ScopeType: scopeType, Status: "active", ExpiresAt: now.Add(DefaultLockTTL), LastHeartbeatAt: now, CreatedAt: now}
-	_, err = s.exec(ctx, `INSERT INTO locks (id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at) VALUES (?,?,?,?,?,?,?,?,?,NULL)`,
-		l.ID, l.TaskID, l.OwnerID, l.Scope, l.ScopeType, l.Status, ts(l.ExpiresAt), ts(l.LastHeartbeatAt), ts(l.CreatedAt))
+	l := Lock{ID: newID("lock"), TaskID: taskID, OwnerID: actorID, ActorSessionID: strings.TrimSpace(actorSessionID), Scope: scope, ScopeType: scopeType, Status: "active", ExpiresAt: now.Add(DefaultLockTTL), LastHeartbeatAt: now, CreatedAt: now}
+	_, err = s.exec(ctx, `INSERT INTO locks (id,task_id,owner_id,actor_session_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL)`,
+		l.ID, l.TaskID, l.OwnerID, l.ActorSessionID, l.Scope, l.ScopeType, l.Status, ts(l.ExpiresAt), ts(l.LastHeartbeatAt), ts(l.CreatedAt))
 	if err != nil {
 		return Lock{}, nil, err
 	}
@@ -2641,7 +2929,7 @@ func (s *Store) AcquireLock(ctx context.Context, actorID, taskID, scope, scopeTy
 
 func (s *Store) ListLocks(ctx context.Context, taskID string, activeOnly bool) ([]Lock, error) {
 	_ = s.markStaleLocks(ctx, time.Now().UTC())
-	q := `SELECT id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at,released_by,release_reason,overridden_at,overridden_by,override_reason FROM locks`
+	q := `SELECT id,task_id,owner_id,actor_session_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at,released_by,release_reason,overridden_at,overridden_by,override_reason FROM locks`
 	args := []any{}
 	clauses := []string{}
 	if taskID != "" {
@@ -2673,13 +2961,17 @@ func (s *Store) ListLocks(ctx context.Context, taskID string, activeOnly bool) (
 }
 
 func (s *Store) FindLockConflicts(ctx context.Context, actorID, scope, scopeType string) ([]Lock, error) {
+	return s.FindLockConflictsForSession(ctx, actorID, "", scope, scopeType)
+}
+
+func (s *Store) FindLockConflictsForSession(ctx context.Context, actorID, actorSessionID, scope, scopeType string) ([]Lock, error) {
 	locks, err := s.ListLocks(ctx, "", true)
 	if err != nil {
 		return nil, err
 	}
 	var conflicts []Lock
 	for _, l := range locks {
-		if l.OwnerID == actorID {
+		if lockOwnedByRequest(l, actorID, actorSessionID) {
 			continue
 		}
 		if scopesOverlap(scopeType, scope, l.ScopeType, l.Scope) {
@@ -2691,15 +2983,19 @@ func (s *Store) FindLockConflicts(ctx context.Context, actorID, scope, scopeType
 }
 
 func (s *Store) ReleaseLock(ctx context.Context, actorID, lockID string) (Lock, error) {
-	return s.ReleaseLockWithReason(ctx, actorID, lockID, "")
+	return s.ReleaseLockForSessionWithReason(ctx, actorID, "", lockID, "")
 }
 
 func (s *Store) ReleaseLockWithReason(ctx context.Context, actorID, lockID, reason string) (Lock, error) {
+	return s.ReleaseLockForSessionWithReason(ctx, actorID, "", lockID, reason)
+}
+
+func (s *Store) ReleaseLockForSessionWithReason(ctx context.Context, actorID, actorSessionID, lockID, reason string) (Lock, error) {
 	l, err := s.getLock(ctx, lockID)
 	if err != nil {
 		return Lock{}, err
 	}
-	if l.OwnerID != actorID {
+	if !lockOwnedByRequest(l, actorID, actorSessionID) {
 		return Lock{}, userErr("forbidden", "only the lock owner can release this lock")
 	}
 	now := time.Now().UTC()
@@ -2715,11 +3011,15 @@ func (s *Store) ReleaseLockWithReason(ctx context.Context, actorID, lockID, reas
 }
 
 func (s *Store) RenewLock(ctx context.Context, actorID, lockID string) (Lock, error) {
+	return s.RenewLockForSession(ctx, actorID, "", lockID)
+}
+
+func (s *Store) RenewLockForSession(ctx context.Context, actorID, actorSessionID, lockID string) (Lock, error) {
 	l, err := s.getLock(ctx, lockID)
 	if err != nil {
 		return Lock{}, err
 	}
-	if l.OwnerID != actorID {
+	if !lockOwnedByRequest(l, actorID, actorSessionID) {
 		return Lock{}, userErr("forbidden", "only the lock owner can renew this lock")
 	}
 	now := time.Now().UTC()
@@ -2731,6 +3031,16 @@ func (s *Store) RenewLock(ctx context.Context, actorID, lockID string) (Lock, er
 		return Lock{}, err
 	}
 	return l, s.addEvent(ctx, l.TaskID, actorID, "lock.renewed", l)
+}
+
+func lockOwnedByRequest(l Lock, actorID, actorSessionID string) bool {
+	if l.OwnerID != actorID {
+		return false
+	}
+	if l.ActorSessionID == "" {
+		return true
+	}
+	return actorSessionID != "" && l.ActorSessionID == actorSessionID
 }
 
 func (s *Store) OverrideLock(ctx context.Context, actorID, lockID, reason string) (Lock, error) {
@@ -2782,8 +3092,12 @@ func (s *Store) ensureTaskLockable(ctx context.Context, actorID string, task Tas
 }
 
 func (s *Store) ensureTaskLocks(ctx context.Context, actorID string, task Task) error {
+	return s.ensureTaskLocksForSession(ctx, actorID, "", task)
+}
+
+func (s *Store) ensureTaskLocksForSession(ctx context.Context, actorID, actorSessionID string, task Task) error {
 	for _, scope := range taskLockScopes(task) {
-		if err := s.ensureOwnedLock(ctx, actorID, task.ID, scope.scope, scope.scopeType); err != nil {
+		if err := s.ensureOwnedLockForSession(ctx, actorID, actorSessionID, task.ID, scope.scope, scope.scopeType); err != nil {
 			return err
 		}
 	}
@@ -2791,19 +3105,23 @@ func (s *Store) ensureTaskLocks(ctx context.Context, actorID string, task Task) 
 }
 
 func (s *Store) ensureOwnedLock(ctx context.Context, actorID, taskID, scope, scopeType string) error {
+	return s.ensureOwnedLockForSession(ctx, actorID, "", taskID, scope, scopeType)
+}
+
+func (s *Store) ensureOwnedLockForSession(ctx context.Context, actorID, actorSessionID, taskID, scope, scopeType string) error {
 	locks, err := s.ListLocks(ctx, taskID, true)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
 	for _, l := range locks {
-		if l.OwnerID == actorID && l.Scope == scope && l.ScopeType == scopeType {
+		if lockOwnedByRequest(l, actorID, actorSessionID) && l.Scope == scope && l.ScopeType == scopeType {
 			_, err := s.exec(ctx, `UPDATE locks SET status='active', expires_at=?, last_heartbeat_at=? WHERE id=?`,
 				ts(now.Add(DefaultLockTTL)), ts(now), l.ID)
 			return err
 		}
 	}
-	_, _, err = s.AcquireLock(ctx, actorID, taskID, scope, scopeType)
+	_, _, err = s.AcquireLockForSession(ctx, actorID, actorSessionID, taskID, scope, scopeType)
 	return err
 }
 
@@ -3002,7 +3320,7 @@ func (s *Store) addEvent(ctx context.Context, taskID, actorID, typ string, paylo
 }
 
 func (s *Store) getLock(ctx context.Context, id string) (Lock, error) {
-	row := s.queryRow(ctx, `SELECT id,task_id,owner_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at,released_by,release_reason,overridden_at,overridden_by,override_reason FROM locks WHERE id=?`, id)
+	row := s.queryRow(ctx, `SELECT id,task_id,owner_id,actor_session_id,scope,scope_type,status,expires_at,last_heartbeat_at,created_at,released_at,released_by,release_reason,overridden_at,overridden_by,override_reason FROM locks WHERE id=?`, id)
 	l, err := scanLock(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Lock{}, userErr("not_found", "lock not found")
@@ -3141,6 +3459,51 @@ func scanActor(row scanner) (Actor, error) {
 	return a, nil
 }
 
+func scanActorSession(row scanner) (ActorSession, error) {
+	var s ActorSession
+	var userID, workspaceID, projectID, repositoryID, repositoryPath, machineID, terminalID, agentProvider, ended, currentTaskID, clientVersion sql.NullString
+	var started, heartbeat string
+	if err := row.Scan(&s.ID, &s.ActorID, &userID, &workspaceID, &projectID, &repositoryID, &repositoryPath, &machineID, &terminalID, &agentProvider, &s.ProcessID, &started, &heartbeat, &ended, &s.Status, &currentTaskID, &clientVersion); err != nil {
+		return ActorSession{}, err
+	}
+	hydrateActorSessionScan(&s, userID, workspaceID, projectID, repositoryID, repositoryPath, machineID, terminalID, agentProvider, ended, currentTaskID, clientVersion, started, heartbeat)
+	return s, nil
+}
+
+func scanActorSessionWithToken(row scanner) (ActorSession, string, error) {
+	var s ActorSession
+	var userID, workspaceID, projectID, repositoryID, repositoryPath, machineID, terminalID, agentProvider, ended, currentTaskID, clientVersion sql.NullString
+	var started, heartbeat string
+	var tokenHash sql.NullString
+	if err := row.Scan(&s.ID, &s.ActorID, &userID, &workspaceID, &projectID, &repositoryID, &repositoryPath, &machineID, &terminalID, &agentProvider, &s.ProcessID, &started, &heartbeat, &ended, &s.Status, &currentTaskID, &clientVersion, &tokenHash); err != nil {
+		return ActorSession{}, "", err
+	}
+	hydrateActorSessionScan(&s, userID, workspaceID, projectID, repositoryID, repositoryPath, machineID, terminalID, agentProvider, ended, currentTaskID, clientVersion, started, heartbeat)
+	return s, tokenHash.String, nil
+}
+
+func hydrateActorSessionScan(s *ActorSession, userID, workspaceID, projectID, repositoryID, repositoryPath, machineID, terminalID, agentProvider, ended, currentTaskID, clientVersion sql.NullString, started, heartbeat string) {
+	s.UserID = userID.String
+	s.WorkspaceID = workspaceID.String
+	s.ProjectID = projectID.String
+	s.RepositoryID = repositoryID.String
+	s.RepositoryPath = repositoryPath.String
+	s.MachineID = machineID.String
+	s.TerminalID = terminalID.String
+	s.AgentProvider = agentProvider.String
+	s.StartedAt = parseTS(started)
+	s.LastHeartbeatAt = parseTS(heartbeat)
+	if ended.Valid {
+		t := parseTS(ended.String)
+		s.EndedAt = &t
+	}
+	if s.Status == "" {
+		s.Status = "active"
+	}
+	s.CurrentTaskID = currentTaskID.String
+	s.ClientVersion = clientVersion.String
+}
+
 func scanTask(row scanner) (Task, error) {
 	var t Task
 	var repo, workspace, parent, owner, claim, heartbeat sql.NullString
@@ -3201,10 +3564,11 @@ func scanTaskIntelligenceDecision(row scanner) (TaskIntelligenceDecision, error)
 func scanLock(row scanner) (Lock, error) {
 	var l Lock
 	var exp, heartbeat, created string
-	var released, releasedBy, releaseReason, overriddenAt, overriddenBy, overrideReason sql.NullString
-	if err := row.Scan(&l.ID, &l.TaskID, &l.OwnerID, &l.Scope, &l.ScopeType, &l.Status, &exp, &heartbeat, &created, &released, &releasedBy, &releaseReason, &overriddenAt, &overriddenBy, &overrideReason); err != nil {
+	var actorSessionID, released, releasedBy, releaseReason, overriddenAt, overriddenBy, overrideReason sql.NullString
+	if err := row.Scan(&l.ID, &l.TaskID, &l.OwnerID, &actorSessionID, &l.Scope, &l.ScopeType, &l.Status, &exp, &heartbeat, &created, &released, &releasedBy, &releaseReason, &overriddenAt, &overriddenBy, &overrideReason); err != nil {
 		return Lock{}, err
 	}
+	l.ActorSessionID = actorSessionID.String
 	if l.Status == "" {
 		l.Status = "active"
 	}

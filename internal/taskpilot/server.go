@@ -72,6 +72,11 @@ func (s *Server) routes() {
 	s.mux.Handle("PATCH /api/actors/{id}", s.requireScope("task:write", s.handleUpdateActor))
 	s.mux.Handle("DELETE /api/actors/{id}", s.requireScope("task:write", s.handleDeleteActor))
 	s.mux.Handle("POST /api/actors/{id}/secret", s.requireScope("task:write", s.handleResetActorSecret))
+	s.mux.Handle("POST /api/actor-sessions/activate", http.HandlerFunc(s.handleActivateActorSession))
+	s.mux.Handle("GET /api/actor-sessions", s.requireScope("task:read", s.handleActorSessions))
+	s.mux.Handle("GET /api/actor-sessions/current", s.requireScope("task:read", s.handleCurrentActorSession))
+	s.mux.Handle("POST /api/actor-sessions/current/heartbeat", s.requireScope("task:write", s.handleHeartbeatActorSession))
+	s.mux.Handle("POST /api/actor-sessions/current/end", s.requireScope("task:write", s.handleEndActorSession))
 	s.mux.Handle("POST /api/tasks", s.requireScope("task:write", s.handleCreateTask))
 	s.mux.Handle("GET /api/tasks", s.requireScope("task:read", s.handleTasks))
 	s.mux.Handle("GET /api/tasks/{id}", s.requireScope("task:read", s.handleTaskDetail))
@@ -134,6 +139,26 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			return
 		}
 		actorID := r.Header.Get("X-Actor-ID")
+		actorSessionID := r.Header.Get("X-Actor-Session-ID")
+		actorSessionToken := r.Header.Get("X-Actor-Session-Token")
+		if actorSessionID != "" || actorSessionToken != "" {
+			session, ok, err := s.store.VerifyActorSession(r.Context(), actorSessionID, actorSessionToken)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err)
+				return
+			}
+			if !ok {
+				writeErr(w, http.StatusUnauthorized, userErr("unauthorized", "invalid actor session"))
+				return
+			}
+			_, _ = s.store.TouchActorSession(r.Context(), session.ActorID, session.ID, ActorSessionHeartbeat{})
+			p := Principal{ID: session.ActorID, Kind: "actor_session", ActorID: session.ActorID, UserID: session.UserID}
+			ctx := context.WithValue(r.Context(), actorKey{}, session.ActorID)
+			ctx = context.WithValue(ctx, actorSessionKey{}, session.ID)
+			ctx = context.WithValue(ctx, principalKey{}, p)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 		if actorID != "" {
 			ok, err := s.store.VerifyActorSecret(r.Context(), actorID, r.Header.Get("X-Actor-Secret"))
 			if err != nil {
@@ -156,10 +181,16 @@ func (s *Server) auth(next http.Handler) http.Handler {
 }
 
 type actorKey struct{}
+type actorSessionKey struct{}
 type principalKey struct{}
 
 func actorID(r *http.Request) string {
 	v, _ := r.Context().Value(actorKey{}).(string)
+	return v
+}
+
+func actorSessionID(r *http.Request) string {
+	v, _ := r.Context().Value(actorSessionKey{}).(string)
 	return v
 }
 
@@ -420,6 +451,44 @@ func (s *Server) handleResetActorSecret(w http.ResponseWriter, r *http.Request) 
 	writeResult(w, out, err)
 }
 
+func (s *Server) handleActivateActorSession(w http.ResponseWriter, r *http.Request) {
+	var in ActorSessionStartInput
+	if !decode(w, r, &in) {
+		return
+	}
+	out, err := s.store.StartActorSession(r.Context(), in)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleActorSessions(w http.ResponseWriter, r *http.Request) {
+	actorID := r.URL.Query().Get("actor_id")
+	active := r.URL.Query().Get("active") == "true"
+	out, err := s.store.ListActorSessions(r.Context(), actorID, active)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleCurrentActorSession(w http.ResponseWriter, r *http.Request) {
+	id := actorSessionID(r)
+	if id == "" {
+		writeResult(w, nil, userErr("not_found", "no actor session is active for this request"))
+		return
+	}
+	out, err := s.store.GetActorSession(r.Context(), id)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleHeartbeatActorSession(w http.ResponseWriter, r *http.Request) {
+	var in ActorSessionHeartbeat
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	out, err := s.store.TouchActorSession(r.Context(), actorID(r), actorSessionID(r), in)
+	writeResult(w, out, err)
+}
+
+func (s *Server) handleEndActorSession(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.EndActorSession(r.Context(), actorID(r), actorSessionID(r))
+	writeResult(w, out, err)
+}
+
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	var in TaskInput
 	if !decode(w, r, &in) {
@@ -536,7 +605,7 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		Force  bool   `json:"force"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
-	out, err := s.store.ClaimTask(r.Context(), actorID(r), r.PathValue("id"), in.Reason, in.Force)
+	out, err := s.store.ClaimTaskForActorSession(r.Context(), actorID(r), actorSessionID(r), r.PathValue("id"), in.Reason, in.Force)
 	writeResult(w, out, err)
 }
 
@@ -551,7 +620,7 @@ func (s *Server) handleHeartbeatTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartTaskSession(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.StartTaskSession(r.Context(), actorID(r), r.PathValue("id"))
+	out, err := s.store.StartTaskSessionForActorSession(r.Context(), actorID(r), actorSessionID(r), r.PathValue("id"))
 	writeResult(w, out, err)
 }
 
@@ -592,7 +661,7 @@ func (s *Server) handleAppendContext(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	out, err := s.store.AppendContextWithLifecycle(r.Context(), actorID(r), r.PathValue("id"), in.Kind, in.Content, in.Source, in.Reason, in.Confidence, in.Files, in.MemoryKey, in.Stage)
+	out, err := s.store.AppendContextWithActorSession(r.Context(), actorID(r), actorSessionID(r), r.PathValue("id"), in.Kind, in.Content, in.Source, in.Reason, in.Confidence, in.Files, in.MemoryKey, in.Stage)
 	if err == nil && in.IntelligenceDecision != nil {
 		decision := *in.IntelligenceDecision
 		decision.TaskID = r.PathValue("id")
@@ -774,7 +843,7 @@ func (s *Server) handleAcquireLock(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	out, conflicts, err := s.store.AcquireLock(r.Context(), actorID(r), r.PathValue("id"), in.Scope, in.ScopeType)
+	out, conflicts, err := s.store.AcquireLockForSession(r.Context(), actorID(r), actorSessionID(r), r.PathValue("id"), in.Scope, in.ScopeType)
 	if err != nil && len(conflicts) > 0 {
 		msg := err.Error()
 		if conflicts[0].Message != "" {
@@ -797,7 +866,7 @@ func (s *Server) handleReleaseLock(w http.ResponseWriter, r *http.Request) {
 		Reason string `json:"reason"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
-	out, err := s.store.ReleaseLockWithReason(r.Context(), actorID(r), r.PathValue("id"), in.Reason)
+	out, err := s.store.ReleaseLockForSessionWithReason(r.Context(), actorID(r), actorSessionID(r), r.PathValue("id"), in.Reason)
 	writeResult(w, out, err)
 }
 
@@ -837,7 +906,7 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRenewLock(w http.ResponseWriter, r *http.Request) {
-	out, err := s.store.RenewLock(r.Context(), actorID(r), r.PathValue("id"))
+	out, err := s.store.RenewLockForSession(r.Context(), actorID(r), actorSessionID(r), r.PathValue("id"))
 	writeResult(w, out, err)
 }
 

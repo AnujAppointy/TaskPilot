@@ -626,7 +626,7 @@ function lockItem(l) {
       h("strong", {}, `${l.scope_type}: ${l.scope}`),
       h("span", { class: `pill ${stale ? "amber" : l.status === "overridden" ? "red" : ""}` }, l.status || "active")
     ),
-    h("p", { class: "meta" }, `Owner: ${l.owner_name || actorName(l.owner_id)} · created ${new Date(l.created_at).toLocaleString()}`),
+    h("p", { class: "meta" }, `Owner: ${l.owner_name || actorName(l.owner_id)}${l.actor_session_id ? ` · session ${l.actor_session_id}` : ""} · created ${new Date(l.created_at).toLocaleString()}`),
     h("p", { class: "meta" }, `Last activity: ${l.last_heartbeat_at ? new Date(l.last_heartbeat_at).toLocaleString() : "unknown"} · expires ${new Date(l.expires_at).toLocaleString()}`),
     l.message ? h("p", {}, l.message) : null,
     canWrite() && !l.released_at && l.status !== "overridden" ? h("div", { class: "button-row" },
@@ -1091,19 +1091,55 @@ function actionsPanel(task) {
 
 function actorsView() {
   const mine = apiState.actors.filter(a => a.created_by_user_id && a.created_by_user_id === currentUserID());
+  const activeActors = apiState.actors.filter(a => (a.active_sessions || 0) > 0);
+  const activeSessions = apiState.actors.reduce((n, a) => n + (a.active_sessions || 0), 0);
+  const idleActors = apiState.actors.filter(a => (a.sessions || []).some(s => s.status === "idle")).length;
+  const offlineActors = apiState.actors.length - activeActors.length;
   return h("div", { class: "grid2" },
     myActorsPanel(mine),
     h("div", { class: "panel list" },
       h("h2", {}, "All Actors"),
-      h("p", { class: "meta" }, "Team-visible human and agent identities currently registered in TaskPilot."),
-      apiState.actors.length ? apiState.actors.map(a => h("div", { class: "item" },
-        h("div", { class: "item-head" },
-          h("strong", {}, a.name),
-          h("span", { class: "pill" }, actorOwnershipLabel(a))
-        ),
-        h("p", {}, `${a.kind} · ${a.machine_name || "no machine"} · ${a.id}`)
-      )) : h("p", { class: "meta" }, "No actors yet.")
+      h("div", { class: "stats" },
+        stat("Total actors", apiState.actors.length),
+        stat("Active actors", activeActors.length),
+        stat("Active sessions", activeSessions),
+        stat("Idle actors", idleActors),
+        stat("Offline actors", Math.max(0, offlineActors))
+      ),
+      apiState.actors.length ? apiState.actors.map(actorItem) : h("p", { class: "meta" }, "No actors yet.")
     )
+  );
+}
+
+function actorItem(actor) {
+  const sessions = Array.isArray(actor.sessions) ? actor.sessions : [];
+  const currentTasks = (actor.current_task_ids || []).map(id => apiState.tasks.find(t => t.id === id)?.title || id);
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", {}, actor.name),
+      h("span", { class: `pill ${(actor.active_sessions || 0) ? "" : "amber"}` }, `${actor.status || "offline"} · ${actor.active_sessions || 0} sessions`)
+    ),
+    h("p", { class: "meta" }, `${actor.kind} · ${actor.machine_name || "no machine"} · ${actor.id} · ${actorOwnershipLabel(actor)}`),
+    currentTasks.length ? h("p", {}, `Tasks: ${currentTasks.join(", ")}`) : null,
+    actor.last_heartbeat_at ? h("p", { class: "meta" }, `Last heartbeat: ${new Date(actor.last_heartbeat_at).toLocaleString()}`) : null,
+    sessions.length ? h("details", {},
+      h("summary", {}, "Sessions"),
+      sessions.map(actorSessionItem)
+    ) : h("p", { class: "meta" }, "No terminal sessions recorded.")
+  );
+}
+
+function actorSessionItem(session) {
+  const task = session.current_task_id ? (apiState.tasks.find(t => t.id === session.current_task_id)?.title || session.current_task_id) : "Idle";
+  return h("div", { class: "item" },
+    h("div", { class: "item-head" },
+      h("strong", {}, session.agent_provider || "terminal"),
+      h("span", { class: `pill ${session.status === "stale" ? "amber" : session.status === "ended" ? "red" : ""}` }, session.status || "active")
+    ),
+    h("p", { class: "meta" }, `Session: ${session.id}`),
+    h("p", { class: "meta" }, `Device: ${session.machine_id || "unknown"} · Terminal: ${session.terminal_id || "unknown"}`),
+    h("p", { class: "meta" }, `Repository: ${session.repository_path || repoName(session.repository_id)} · Current task: ${task}`),
+    h("p", { class: "meta" }, `Started: ${new Date(session.started_at).toLocaleString()} · Last heartbeat: ${new Date(session.last_heartbeat_at).toLocaleString()}`)
   );
 }
 
@@ -1155,8 +1191,8 @@ function myActorItem(actor) {
         const email = apiState.principal.email || "";
         apiState.actorSetupCommands[actor.id] = [
           `taskpilot login --server ${server}${email ? ` --email ${email}` : ""}`,
-          `taskpilot config set-actor ${fresh.id} ${fresh.actor_secret}`,
-          "taskpilot config show",
+          `taskpilot actor activate --secret ${fresh.actor_secret}`,
+          "taskpilot actor current",
         ].join("\n");
         setup.value = apiState.actorSetupCommands[actor.id];
         setup.style.display = "block";
@@ -1168,7 +1204,7 @@ function myActorItem(actor) {
       }}, "Delete")
     ),
     setup,
-    h("p", { class: "meta" }, "The CLI secret is shown only after generation. Generating a new one replaces the previous actor secret.")
+    h("p", { class: "meta" }, "The CLI secret is shown only after generation. Generating a new one replaces the previous actor secret and new terminals should activate with the new command.")
   );
 }
 
@@ -1187,8 +1223,8 @@ function cliSetupItem(actor) {
       const email = apiState.principal.email || "";
       apiState.actorSetupCommands[actor.id] = [
         `taskpilot login --server ${server}${email ? ` --email ${email}` : ""}`,
-        `taskpilot config set-actor ${fresh.id} ${fresh.actor_secret}`,
-        "taskpilot config show",
+        `taskpilot actor activate --secret ${fresh.actor_secret}`,
+        "taskpilot actor current",
       ].join("\n");
       setup.value = apiState.actorSetupCommands[actor.id];
       setup.style.display = "block";

@@ -178,6 +178,41 @@ func TestLoadConfigAppliesEnvironmentOverridesWithoutChangingFileConfig(t *testi
 	}
 }
 
+func TestLoadConfigUsesTerminalActorSessionBeforeGlobalActor(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TASKPILOT_CONFIG", filepath.Join(dir, "config.json"))
+	t.Setenv("TASKPILOT_ACTOR_SESSION_FILE", filepath.Join(dir, "session.json"))
+	if err := saveConfig(Config{Server: "http://file-server", Email: "dev@example.com", ActorID: "actor_global", ActorSecret: "secret_global"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveTerminalActorSession(terminalActorSession{
+		Server:            "http://file-server",
+		ActorID:           "actor_terminal",
+		ActorSessionID:    "actor_session_terminal",
+		ActorSessionToken: "token_terminal",
+		CurrentTaskID:     "task_terminal",
+		AgentProvider:     "codex",
+		Status:            "active",
+		StartedAt:         time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ActorID != "actor_terminal" || cfg.ActorSecret != "" || cfg.ActorSessionID != "actor_session_terminal" || cfg.CurrentTaskID != "task_terminal" {
+		t.Fatalf("expected terminal actor session to override global actor, got %+v", cfg)
+	}
+	diag, err := loadConfigDiagnostics(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !diag.CurrentTerminalSession.Active || diag.CurrentTerminalSession.SessionID != "actor_session_terminal" || !diag.DeprecatedGlobalActor {
+		t.Fatalf("expected config diagnostics to separate global actor and terminal session, got %+v", diag)
+	}
+}
+
 func TestGitRootFallsBackToTaskPilotRepoConfig(t *testing.T) {
 	root := t.TempDir()
 	if err := saveRepoConfig(repoEnableConfig{Version: 1, GitRoot: root, ProjectID: "project_1", RepoID: "repo_1", WorkspaceID: "workspace_1", RepoName: "repo"}); err != nil {

@@ -52,6 +52,37 @@ func TestLockConflictAndRelease(t *testing.T) {
 	}
 }
 
+func TestSameActorDifferentSessionsConflictOnLocks(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	a := testActor(t, s, "Agent A")
+	task, err := s.CreateTask(ctx, a.ID, TaskInput{Title: "Task", Goal: "Goal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.StartActorSession(ctx, ActorSessionStartInput{ActorID: a.ID, ActorSecret: a.Secret, TerminalID: "terminal-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.StartActorSession(ctx, ActorSessionStartInput{ActorID: a.ID, ActorSecret: a.Secret, TerminalID: "terminal-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, conflicts, err := s.AcquireLockForSession(ctx, a.ID, first.Session.ID, task.ID, "src/auth/*", "file_glob")
+	if err != nil || len(conflicts) != 0 {
+		t.Fatalf("expected first session lock to succeed, lock=%v conflicts=%v err=%v", lock, conflicts, err)
+	}
+	if _, conflicts, err := s.AcquireLockForSession(ctx, a.ID, second.Session.ID, task.ID, "src/auth/login.go", "file_glob"); err == nil || len(conflicts) != 1 {
+		t.Fatalf("expected second session for same actor to conflict, conflicts=%v err=%v", conflicts, err)
+	}
+	if _, err := s.RenewLockForSession(ctx, a.ID, second.Session.ID, lock.ID); err == nil || errorCode(err) != "forbidden" {
+		t.Fatalf("expected different session renew to be forbidden, err=%v", err)
+	}
+	if _, err := s.RenewLockForSession(ctx, a.ID, first.Session.ID, lock.ID); err != nil {
+		t.Fatalf("owning session should renew lock: %v", err)
+	}
+}
+
 func TestTaskScopeIsCleanedBeforePersisting(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
