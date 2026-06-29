@@ -1,0 +1,19 @@
+make a all functionality and feature summary such that i will able to make good ui of taskpilot from the stitch , give me a taskpilot ui summary such that stitch will get to know that what all ui things it have to make
+
+---
+
+# Files mentioned by the user:
+
+## stitch_taskpilot_operations_console.zip: /Users/appointy/Downloads/stitch_taskpilot_operations_console.zip
+
+## My request for Codex:
+this is the new ui design proposed for the taskpilot , go through the whole design and change the taskpilot ui same as i provide u , also do not broke any functionality of the taskpilot  , after making ui check that everything is working perfectly or not
+
+---
+
+# Files mentioned by the user:
+
+## stitch_taskpilot_operations_console (1).zip: /Users/appointy/Downloads/stitch_taskpilot_operations_console (1).zip
+
+## My request for Codex:
+these are new design for some pages , go through these and make ui design like these for that pages and do not broke functionality only ui change
