@@ -505,39 +505,57 @@ function stats() {
 }
 
 function stat(label, value) {
-  return h("div", { class: "stat" }, h("strong", {}, value), h("span", {}, label));
+  return h("div", { class: "stat" }, h("span", {}, label), h("strong", {}, value));
 }
 
 function navIcon(tab) {
   const icons = {
     board: "dashboard",
-    detail: "schedule",
-    projects: "inventory_2",
-    conflicts: "report",
+    detail: "assignment_late",
+    projects: "folder_open",
+    conflicts: "warning",
     actors: "groups",
-    handoffs: "call_split",
+    handoffs: "swap_horiz",
     settings: "settings",
   };
   return icons[tab] || "•";
 }
 
+function statusLabel(status) {
+  return String(status || "").split("_").join(" ");
+}
+
+function shortID(id) {
+  const value = String(id || "task");
+  const parts = value.split("_");
+  const tail = (parts[parts.length - 1] || value).replace(/[^a-zA-Z0-9]/g, "");
+  return `TP-${tail.slice(-4).toUpperCase() || "0000"}`;
+}
+
+function actorInitials(name) {
+  return String(name || "TP")
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(part => part[0].toUpperCase())
+    .join("") || "TP";
+}
+
+function statusClass(status) {
+  return String(status || "ready").replace(/[^a-z0-9_-]/gi, "_");
+}
+
 function board() {
   const tasks = filteredTasks();
   return h("div", { class: "board-page" },
-    h("div", { class: "page-heading" },
-      h("div", {},
-        h("p", { class: "eyebrow" }, "Workspace"),
-        h("h1", {}, "Main Kanban Board"),
-        h("p", { class: "meta" }, "Coordinate humans and agents across claims, locks, handoffs, and task memory.")
-      ),
-      canWrite() ? h("button", { class: "primary", onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, "+ New Task") : null
-    ),
-    boardScopeFilter(),
-    taskFilters(),
-    stats(),
+    h("div", { class: "operations-strip" }, stats(), taskFilters()),
+    h("div", { class: "scope-strip" }, boardScopeFilter()),
     h("div", { class: "board" }, statuses.map(status =>
-      h("div", { class: "column" },
-        h("h3", {}, status.split("_").join(" ")),
+      h("div", { class: `column column-${statusClass(status)}` },
+        h("div", { class: "column-head" },
+          h("h3", {}, statusLabel(status), h("span", {}, tasks.filter(t => t.status === status).length)),
+          h("button", { title: "Column options" }, h("span", { class: "material-symbols-outlined" }, "more_horiz"))
+        ),
         tasks.filter(t => t.status === status).map(taskCard)
       )
     ))
@@ -545,19 +563,24 @@ function board() {
 }
 
 function taskCard(t) {
-  return h("div", { class: `card task-card ${t.status === "completed" ? "completed" : ""}`, onclick: () => selectTask(t.id) },
+  const owner = actorName(t.owner_id);
+  const risky = (t.potential_conflict_count || 0) > 0 || t.status === "blocked" || (t.blockers || []).length;
+  return h("div", { class: `card task-card status-${statusClass(t.status)} ${t.status === "completed" ? "completed" : ""}`, onclick: () => selectTask(t.id) },
+    h("div", { class: "task-card-top" },
+      h("span", { class: "code-chip" }, shortID(t.id)),
+      h("span", { class: `priority priority-${String(t.priority || "normal").toLowerCase()}` }, t.priority || "normal")
+    ),
     h("div", { class: "card-title" }, t.title),
-    h("div", { class: "meta" },
-      h("span", {}, `Owner: ${actorName(t.owner_id)}`),
-      t.repo_id ? h("span", {}, `Repo: ${repoName(t.repo_id)}`) : null,
-      apiState.selectedScopeType !== "repo" ? h("span", {}, `Project: ${projectName(t.project_id)}`) : null,
-      h("span", {}, `Priority: ${t.priority}`),
-      h("span", {}, `Updated: ${new Date(t.updated_at).toLocaleString()}`),
-      h("span", { class: "pill" }, `${t.active_lock_count || 0} locks`),
-      (t.subtask_count || 0) > 0 ? h("span", { class: "pill" }, `${t.subtask_count} subtasks`) : null,
-      (t.open_dependency_count || 0) > 0 ? h("span", { class: "pill amber" }, `${t.open_dependency_count} blockers`) : null,
-      (t.potential_conflict_count || 0) > 0 ? h("span", { class: "pill red" }, "conflict") : null,
-      (t.blockers || []).length ? h("span", { class: "pill amber" }, "blocked") : null,
+    h("p", { class: "task-goal" }, t.goal || "No goal recorded."),
+    h("div", { class: "task-signal-row" },
+      risky ? h("span", { class: "pill red" }, h("span", { class: "material-symbols-outlined" }, "warning"), "Conflict") : null,
+      (t.active_lock_count || 0) > 0 ? h("span", { class: "pill" }, h("span", { class: "material-symbols-outlined" }, "lock"), `${t.active_lock_count} locks`) : null,
+      (t.subtask_count || 0) > 0 ? h("span", { class: "pill" }, h("span", { class: "material-symbols-outlined" }, "account_tree"), `${t.subtask_count}`) : null,
+      (t.open_dependency_count || 0) > 0 ? h("span", { class: "pill amber" }, `${t.open_dependency_count} blockers`) : null
+    ),
+    h("div", { class: "task-card-footer" },
+      h("span", { class: "repo-chip" }, t.repo_id ? repoName(t.repo_id) : projectName(t.project_id)),
+      h("span", { class: "avatar", title: owner }, actorInitials(owner))
     )
   );
 }
@@ -606,7 +629,7 @@ function createTaskForm() {
 
 function detailView() {
   if (!apiState.detail) {
-    return h("div", { class: "grid2" },
+    return h("div", { class: "grid2 detail-layout" },
       h("div", {}, createTaskForm()),
       h("div", { class: "panel" },
         h("h2", {}, "Task Detail"),
@@ -630,13 +653,20 @@ function detailView() {
   const dependencies = Array.isArray(apiState.detail.dependencies) ? apiState.detail.dependencies : [];
   const dependents = Array.isArray(apiState.detail.dependents) ? apiState.detail.dependents : [];
   const parent = apiState.detail.parent;
-  return h("div", { class: "grid2" },
-    h("div", {}, createTaskForm(), h("br"), actionsPanel(task)),
-    h("div", { class: "panel detail" },
-      h("h2", {}, task.title),
-      h("div", { class: "meta" },
-        h("span", {}, `Goal: ${task.goal}`),
-        h("span", {}, `Status: ${task.status}`),
+  return h("div", { class: "grid2 detail-layout" },
+    h("div", {}, actionsPanel(task)),
+    h("div", { class: "detail-stack" },
+      h("div", { class: "panel detail-hero" },
+        h("div", {},
+          h("h2", {}, task.title),
+          h("p", {}, `Goal: ${task.goal}`)
+        ),
+        h("div", { class: "hero-badges" },
+          h("span", { class: `priority priority-${String(task.priority || "normal").toLowerCase()}` }, task.priority || "normal"),
+          h("span", { class: `status-badge status-${statusClass(task.status)}` }, statusLabel(task.status)),
+        )
+      ),
+      h("div", { class: "panel detail-meta" },
         h("span", {}, `Owner: ${actorName(task.owner_id)}`),
         h("span", {}, `Project: ${projectName(task.project_id)}`),
         h("span", {}, `Repo: ${repoName(task.repo_id)}`),
@@ -644,17 +674,19 @@ function detailView() {
         parent ? h("span", { class: "linkish", onclick: () => selectTask(parent.id) }, `Parent: ${parent.title}`) : null,
         h("span", {}, `Scope: ${(task.scope || []).join(", ") || "none"}`)
       ),
-      taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots, contextEntries),
-      section("Subtasks", subtasks.map(subtaskItem)),
-      section("Blocked By", dependencies.map(dependencyItem)),
-      section("Blocking", dependents.map(dependentItem)),
-      section("Decisions", decisions.map(decisionItem)),
-      section("Comments", comments.map(commentItem)),
-      section("Artifacts", artifacts.map(artifactItem)),
-      section("Git", gitRefs.map(gitItem)),
-      section("Locks", locks.map(lockItem)),
-      section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`)))),
-      section("Timeline", h("div", { class: "timeline log-panel" }, events.map(e => h("div", { class: "event log-line" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
+      h("div", { class: "detail-grid" },
+        taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots, contextEntries),
+        section("Subtasks", subtasks.map(subtaskItem)),
+        section("Blocked By", dependencies.map(dependencyItem)),
+        section("Blocking", dependents.map(dependentItem)),
+        section("Decisions", decisions.map(decisionItem)),
+        section("Comments", comments.map(commentItem)),
+        section("Artifacts", artifacts.map(artifactItem)),
+        section("Git", gitRefs.map(gitItem)),
+        section("Locks", locks.map(lockItem)),
+        section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`))))
+      ),
+      section("Timeline Audit", h("div", { class: "timeline log-panel" }, events.map(e => h("div", { class: "event log-line" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
     )
   );
 }
@@ -1281,9 +1313,60 @@ function handoffsView() {
     seenTasks.add(x.task_id);
     return true;
   });
-  return h("div", { class: "panel list" },
-    h("h2", {}, "Handoffs"),
-    published.length ? published.map(handoffItem) : h("p", { class: "meta" }, "No published handoffs.")
+  const recent = apiState.handoffs.slice(0, 8);
+  return h("div", { class: "ops-page handoffs-page" },
+    pageHeader("Handoff Hub", "Review and accept task state transitions between specialized agents."),
+    h("section", { class: "ops-section" },
+      h("div", { class: "section-bar" },
+        h("h3", {}, h("span", { class: "material-symbols-outlined" }, "pending_actions"), "Active Handoff Packets"),
+        h("span", { class: "status-badge" }, `${published.length} pending`)
+      ),
+      h("div", { class: "handoff-grid" },
+        published.length ? published.map(handoffPacketCard) : h("div", { class: "empty-panel" },
+          h("strong", {}, "No published handoffs."),
+          h("p", { class: "meta" }, "Prepared handoff packets will appear here when a task is ready for another actor.")
+        )
+      )
+    ),
+    h("section", { class: "ops-section" },
+      h("div", { class: "section-bar" },
+        h("h3", {}, h("span", { class: "material-symbols-outlined" }, "history"), "My Recent Handoffs")
+      ),
+      handoffHistoryTable(recent)
+    )
+  );
+}
+
+function handoffPacketCard(x) {
+  const task = x.task || apiState.tasks.find(t => t.id === x.task_id) || {};
+  const packet = x.packet && x.packet.packet ? x.packet.packet : {};
+  const next = x.next_steps && x.next_steps.length ? x.next_steps : (packet.suggested_next_steps || []);
+  const summary = x.resume_summary || packet.handoff_message || packet.task_objective || "No summary provided.";
+  const files = Array.isArray(packet.files_components_affected) ? packet.files_components_affected.slice(0, 3) : [];
+  return h("div", { class: "handoff-card" },
+    h("div", { class: "handoff-accent" }),
+    h("div", { class: "item-head" },
+      h("div", {},
+        h("h4", {}, task.title || x.task_id),
+        h("p", { class: "meta" }, `${actorName(task.owner_id || x.from_actor_id)} · ${new Date(x.created_at).toLocaleString()}`)
+      ),
+      h("span", { class: "code-chip" }, shortID(x.task_id))
+    ),
+    h("div", { class: "handoff-summary" },
+      h("div", { class: "label-caps" }, "Progress Summary"),
+      h("p", {}, summary),
+      files.length ? h("p", { class: "meta mono" }, `Files: ${files.join(", ")}`) : null
+    ),
+    h("div", { class: "handoff-next" },
+      h("div", { class: "label-caps danger-text" }, "Critical Next Steps"),
+      next.length ? h("ol", { class: "compact-list" }, next.map(step => h("li", {}, step))) : h("p", { class: "meta" }, "No next steps provided.")
+    ),
+    h("div", { class: "handoff-actions" },
+      canWrite() ? h("button", { class: "agent-action", onclick: async () => { await api(`/api/handoffs/${x.id}/accept`, { method: "POST", body: "{}" }); await refresh(); } },
+        h("span", { class: "material-symbols-outlined" }, "check_circle"), "Accept Handoff"
+      ) : null,
+      h("button", { onclick: () => task.id && selectTask(task.id) }, h("span", { class: "material-symbols-outlined" }, "open_in_new"), "Open Task")
+    )
   );
 }
 
@@ -1307,6 +1390,30 @@ function handoffItem(x) {
     h("div", { class: "button-row" },
       task.id ? h("button", { onclick: () => selectTask(task.id) }, "Open Task") : null,
       canWrite() ? h("button", { class: "primary", onclick: async () => { await api(`/api/handoffs/${x.id}/accept`, { method: "POST", body: "{}" }); await refresh(); } }, "Acquire / Accept Handoff") : null
+    )
+  );
+}
+
+function handoffHistoryTable(items) {
+  return h("div", { class: "data-table-wrap" },
+    h("table", { class: "data-table" },
+      h("thead", {}, h("tr", {},
+        h("th", {}, "Task ID"),
+        h("th", {}, "Title"),
+        h("th", {}, "Receiver"),
+        h("th", {}, "Status"),
+        h("th", {}, "Time")
+      )),
+      h("tbody", {}, items.length ? items.map(x => {
+        const task = x.task || apiState.tasks.find(t => t.id === x.task_id) || {};
+        return h("tr", {},
+          h("td", { class: "mono" }, shortID(x.task_id)),
+          h("td", {}, task.title || x.task_id),
+          h("td", {}, actorName(x.to_actor_id || task.owner_id || x.from_actor_id)),
+          h("td", {}, h("span", { class: "status-badge" }, x.status || "handoff")),
+          h("td", {}, new Date(x.created_at).toLocaleString())
+        );
+      }) : h("tr", {}, h("td", { colspan: "5", class: "empty-cell" }, "No handoff history yet.")))
     )
   );
 }
@@ -1406,15 +1513,94 @@ function conflictReason(c, task, otherTask) {
 }
 
 function projectsView() {
-  return h("div", { class: "grid2" },
-    h("div", {}, createProjectForm(), h("br"), createRepoForm(), h("br"), createWorkspaceForm()),
-    h("div", {},
-      h("div", { class: "panel list" }, h("h2", {}, "Projects"), apiState.projects.map(p => h("div", { class: "item" }, h("strong", {}, p.name), h("p", { class: "meta" }, `${p.id} · ${p.description || "no description"}`)))),
-      h("br"),
-      h("div", { class: "panel list" }, h("h2", {}, "Repositories"), apiState.repositories.map(r => h("div", { class: "item" }, h("strong", {}, r.name), h("p", { class: "meta" }, `${r.id} · ${projectName(r.project_id)} · ${r.default_branch} · ${r.path || "no path"}`)))),
-      h("br"),
-      h("div", { class: "panel list" }, h("h2", {}, "Workspaces"), apiState.workspaces.map(w => h("div", { class: "item" }, h("strong", {}, w.name), h("p", { class: "meta" }, `${w.id} · ${projectName(w.project_id)} · ${actorName(w.actor_id)} · ${w.machine_name || "no machine"}`))))
+  return h("div", { class: "ops-page projects-page" },
+    pageHeader("Projects & Infrastructure", "Manage organizational hierarchy, codebase repositories, and execution environments for both human operators and autonomous agents."),
+    h("div", { class: "infra-grid" },
+      h("section", { class: "ops-section projects-column" },
+        h("div", { class: "section-bar" },
+          h("h3", {}, h("span", { class: "material-symbols-outlined" }, "folder"), "Active Projects"),
+          h("span", { class: "status-badge" }, `${apiState.projects.length} total`)
+        ),
+        h("div", { class: "project-card-list" },
+          apiState.projects.length ? apiState.projects.map(projectCard) : h("div", { class: "empty-panel" }, "No projects yet.")
+        ),
+        h("details", { class: "inline-create" },
+          h("summary", {}, h("span", { class: "material-symbols-outlined" }, "add"), "Create Project"),
+          createProjectForm()
+        )
+      ),
+      h("div", { class: "infra-main" },
+        h("section", { class: "ops-section" },
+          h("div", { class: "section-bar" },
+            h("h3", {}, h("span", { class: "material-symbols-outlined" }, "source"), "Code Repositories"),
+            h("details", { class: "menu-create" }, h("summary", {}, h("span", { class: "material-symbols-outlined" }, "add"), "Register Repository"), createRepoForm())
+          ),
+          repositoriesTable()
+        ),
+        h("section", { class: "ops-section" },
+          h("div", { class: "section-bar" },
+            h("h3", {}, h("span", { class: "material-symbols-outlined" }, "dns"), "Execution Workspaces"),
+            h("details", { class: "menu-create" }, h("summary", {}, h("span", { class: "material-symbols-outlined" }, "add"), "Add Workspace"), createWorkspaceForm())
+          ),
+          h("div", { class: "workspace-grid" },
+            apiState.workspaces.length ? apiState.workspaces.map(workspaceCard) : h("div", { class: "empty-panel" }, "No workspaces yet.")
+          )
+        )
+      )
     )
+  );
+}
+
+function pageHeader(title, subtitle) {
+  return h("div", { class: "ops-page-header" },
+    h("div", {}, h("h2", {}, title), h("p", {}, subtitle)),
+    h("span", { class: "version-chip" }, "sys_ver: 2.4.0-stable")
+  );
+}
+
+function projectCard(project) {
+  const taskCount = apiState.tasks.filter(t => t.project_id === project.id).length;
+  const actorCount = new Set(apiState.tasks.filter(t => t.project_id === project.id && t.owner_id).map(t => t.owner_id)).size;
+  return h("div", { class: "project-card" },
+    h("div", { class: "item-head" },
+      h("h4", {}, project.name),
+      h("span", { class: "code-chip" }, shortID(project.id))
+    ),
+    h("p", {}, project.description || "No description recorded."),
+    h("div", { class: "infra-meta" },
+      h("span", {}, h("span", { class: "material-symbols-outlined" }, "assignment"), `${taskCount} tasks`),
+      h("span", {}, h("span", { class: "material-symbols-outlined" }, actorCount ? "smart_toy" : "person"), actorCount ? `${actorCount} actors` : "Human only")
+    )
+  );
+}
+
+function repositoriesTable() {
+  return h("div", { class: "data-table-wrap" },
+    h("table", { class: "data-table" },
+      h("thead", {}, h("tr", {}, h("th", {}, "Repository"), h("th", {}, "Project"), h("th", {}, "Path / URL"), h("th", {}, "Status"))),
+      h("tbody", {}, apiState.repositories.length ? apiState.repositories.map(repo => h("tr", {},
+        h("td", {}, h("span", { class: "material-symbols-outlined" }, "folder_zip"), repo.name),
+        h("td", { class: "mono" }, shortID(repo.project_id)),
+        h("td", { class: "mono" }, repo.path || "no path"),
+        h("td", {}, h("span", { class: "status-badge" }, h("span", { class: "status-dot" }), `${repo.default_branch || "main"} synced`))
+      )) : h("tr", {}, h("td", { colspan: "4", class: "empty-cell" }, "No repositories registered.")))
+    )
+  );
+}
+
+function workspaceCard(workspace) {
+  const active = !!workspace.last_seen_at;
+  return h("div", { class: "workspace-card" },
+    h("div", { class: "item-head" },
+      h("h4", {}, h("span", { class: "material-symbols-outlined" }, workspace.kind === "agent" ? "smart_toy" : "computer"), workspace.name),
+      h("span", { class: `status-badge ${active ? "" : "muted-badge"}` }, active ? "active" : "idle")
+    ),
+    h("div", { class: "workspace-facts" },
+      h("span", {}, "Type: ", h("strong", {}, workspace.kind || "local")),
+      h("span", {}, "Actor: ", h("strong", {}, actorName(workspace.actor_id))),
+      h("span", {}, "Host: ", h("strong", { class: "mono" }, workspace.machine_name || "unknown"))
+    ),
+    h("p", { class: "meta" }, `${active ? "Connected to TaskPilot API" : "Last sync not recorded"} · ${projectName(workspace.project_id)}`)
   );
 }
 
@@ -1473,17 +1659,59 @@ function changePasswordForm() {
 
 function settings() {
   const mine = apiState.actors.filter(a => a.created_by_user_id && a.created_by_user_id === currentUserID());
-  return h("div", { class: "grid2" },
-    h("div", { class: "panel form" },
-      h("h2", {}, "Account"),
-      h("p", { class: "meta" }, `Signed in as ${identityLabel()}. Manage Gemini, Claude, Codex, and manual identities from the Actors page.`)
+  return h("div", { class: "ops-page settings-page" },
+    pageHeader("Settings", "System and account configuration."),
+    h("div", { class: "settings-grid" },
+      h("div", { class: "settings-main" },
+        h("section", { class: "settings-card account-card" },
+          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "badge"), h("h3", {}, "User Account")),
+          h("div", { class: "account-body" },
+            h("div", { class: "account-avatar" }, actorInitials(identityLabel())),
+            h("div", { class: "account-fields" },
+              h("div", { class: "field-grid" },
+                h("label", {}, "Full Name", h("input", { value: identityLabel(), readonly: "readonly" })),
+                h("label", {}, "Email Address", h("input", { value: apiState.principal?.email || "", readonly: "readonly" }))
+              ),
+              h("div", { class: "security-row" },
+                h("div", {}, h("strong", {}, "Session Authentication"), h("p", { class: "meta" }, "Dashboard session and actor setup are managed by TaskPilot.")),
+                h("span", { class: "status-badge" }, apiState.principal?.kind || "user")
+              )
+            )
+          ),
+          h("div", { class: "settings-card-foot" }, changePasswordForm())
+        ),
+        h("section", { class: "settings-card" },
+          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "corporate_fare"), h("h3", {}, "Team Configuration")),
+          h("div", { class: "team-list" },
+            h("div", { class: "team-row" }, h("span", { class: "team-avatar" }, "OP"), h("div", {}, h("strong", {}, "Operations Core"), h("p", { class: "meta" }, `Primary workspace · ${apiState.actors.length} actors`)), h("span", { class: "status-badge" }, "default")),
+            h("div", { class: "team-row" }, h("span", { class: "team-avatar light" }, "AI"), h("div", {}, h("strong", {}, "AI Agents Pool"), h("p", { class: "meta" }, `Automated handlers · ${apiState.actors.filter(a => a.kind === "agent").length} active`)), h("button", { onclick: () => { apiState.tab = "actors"; render(); } }, "Manage")),
+            h("button", { onclick: () => { apiState.tab = "projects"; render(); } }, h("span", { class: "material-symbols-outlined" }, "add"), "Create New Workspace")
+          )
+        )
+      ),
+      h("div", { class: "settings-side" },
+        h("section", { class: "cli-card" },
+          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "terminal"), h("h3", {}, "CLI Setup")),
+          h("p", {}, "Connect your local environment to the TaskPilot operational grid."),
+          mine.length ? mine.map(cliSetupItem) : h("p", { class: "meta" }, "No owned actors yet. Add one from the Actors page."),
+          h("button", { class: "agent-action", onclick: () => { apiState.tab = "actors"; render(); } }, "Manage Actors")
+        ),
+        h("section", { class: "settings-card notifications-card" },
+          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "tune"), h("h3", {}, "Notifications")),
+          notificationRow("Conflict Resolution", "Alert when agent tasks conflict.", true),
+          notificationRow("Handoff Requests", "Notify on manual handoff required.", true),
+          notificationRow("Task Blocks", "Immediate ping on pipeline stall.", false),
+          h("a", { href: "#", onclick: (event) => event.preventDefault() }, "Advanced Delivery Settings")
+        )
+      )
     ),
-    changePasswordForm(),
-    h("div", { class: "panel list" },
-      h("h2", {}, "My CLI Actor Setup"),
-      h("p", { class: "meta" }, "Only your own actors are shown here. Generate a fresh secret, then paste the command into the machine where that agent runs."),
-      mine.length ? mine.map(cliSetupItem) : h("p", { class: "meta" }, "No owned actors yet. Add one from the Actors page.")
-    )
+  );
+}
+
+function notificationRow(title, description, enabled) {
+  return h("div", { class: "notification-row" },
+    h("div", {}, h("strong", {}, title), h("p", { class: "meta" }, description)),
+    h("span", { class: `toggle ${enabled ? "on" : ""}` }, h("span", {}))
   );
 }
 
@@ -1542,7 +1770,6 @@ function render() {
       if (apiState.error) root.append(h("div", { class: "toast error" }, apiState.error));
       return;
     }
-    const tabs = ["board", "detail", "projects", "conflicts", "actors", "handoffs", "settings"];
     const content = apiState.tab === "board" ? board()
       : apiState.tab === "detail" ? detailView()
       : apiState.tab === "projects" ? projectsView()
@@ -1551,23 +1778,61 @@ function render() {
       : apiState.tab === "handoffs" ? handoffsView()
       : settings();
     root.append(h("div", { class: "shell" },
-      h("div", { class: "topbar" },
-        h("div", { class: "brand" }, "TaskPilot"),
-        h("div", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } },
-          h("span", { class: "nav-icon" }, navIcon(t)),
-          h("span", {}, t)
-        ))),
-        h("div", { class: "identity" },
-          h("span", {}, identityLabel()),
-          h("button", { onclick: () => logout(true) }, "Log Out")
+      sidebar(),
+      h("div", { class: "workspace" },
+        appBar(),
+        h("main", { class: "main" }, apiState.error ? h("div", { class: "panel error" }, apiState.error) : null, content),
+        h("footer", { class: "footer" },
+          h("strong", {}, "TaskPilot v2.4.0-stable"),
+          h("span", {}, "System Status"),
+          h("span", {}, "API Docs"),
+          h("span", {}, "Support")
         )
       ),
-      h("main", { class: "main" }, apiState.error ? h("div", { class: "panel error" }, apiState.error) : null, content)
     ));
     if (apiState.handoffModal) root.append(handoffModalView());
   } catch (err) {
     document.body.innerHTML = `<div style="font:14px system-ui;padding:24px"><h1>TaskPilot dashboard error</h1><p>${String(err.message || err)}</p></div>`;
   }
+}
+
+function sidebar() {
+  const tabs = ["board", "detail", "projects", "conflicts", "actors", "handoffs", "settings"];
+  return h("aside", { class: "sidebar" },
+    h("div", { class: "sidebar-brand" },
+      h("div", { class: "brand-mark" }, "TP"),
+      h("div", {}, h("strong", {}, "TaskPilot"), h("span", {}, "Operational Dashboard"))
+    ),
+    h("nav", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } },
+      h("span", { class: "material-symbols-outlined nav-icon" }, navIcon(t)),
+      h("span", {}, t === "detail" ? "Task Detail" : t)
+    ))),
+    h("div", { class: "sidebar-tools" },
+      h("button", { class: "sync-button", onclick: () => refresh() }, h("span", { class: "material-symbols-outlined" }, "sync"), "Sync Workspace"),
+      h("div", { class: "sidebar-quick" },
+        h("span", {}, h("span", { class: "material-symbols-outlined" }, "work"), "Workspace"),
+        h("span", {}, h("span", { class: "material-symbols-outlined" }, "source"), "Repo Context"),
+        h("span", {}, h("span", { class: "material-symbols-outlined" }, "sync"), "Sync Status")
+      )
+    )
+  );
+}
+
+function appBar() {
+  return h("header", { class: "appbar" },
+    h("nav", { class: "appbar-links" },
+      h("button", { class: ["board", "detail", "projects", "handoffs", "settings"].includes(apiState.tab) ? "active" : "", onclick: () => { apiState.tab = "board"; render(); } }, "Dashboard"),
+      h("button", { class: apiState.tab === "actors" ? "active" : "", onclick: () => { apiState.tab = "actors"; render(); } }, "Metrics"),
+      h("button", { class: apiState.tab === "conflicts" ? "active" : "", onclick: () => { apiState.tab = "conflicts"; render(); } }, "Reports")
+    ),
+    h("div", { class: "appbar-actions" },
+      h("button", { class: "icon-button", title: "Notifications" }, h("span", { class: "material-symbols-outlined" }, "notifications")),
+      h("button", { class: "icon-button", title: "System memory" }, h("span", { class: "material-symbols-outlined" }, "memory")),
+      h("button", { class: "icon-button", title: identityLabel() }, h("span", { class: "material-symbols-outlined" }, "account_circle")),
+      canWrite() ? h("button", { class: "primary", onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, h("span", { class: "material-symbols-outlined" }, "add"), "New Task") : null,
+      h("button", { onclick: () => logout(true) }, "Log Out")
+    )
+  );
 }
 
 render();
