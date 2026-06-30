@@ -467,6 +467,29 @@ type SessionStartHook struct {
 	Command string `json:"command"`
 }
 
+type knownAgentProfile struct {
+	Name            string
+	Binaries        []string
+	PromptInjection bool
+	NativeJSONHooks bool
+	ConfigRel       string
+	Format          string
+	JSONPath        string
+	FinalPaths      []string
+	ExtraNote       string
+	ManualSetupNote string
+}
+
+var knownAgentProfiles = []knownAgentProfile{
+	{Name: "claude", Binaries: []string{"claude"}, PromptInjection: true, NativeJSONHooks: true, ConfigRel: ".claude/settings.json", Format: "claude", JSONPath: "hooks.SessionStart", FinalPaths: []string{"hooks.SessionEnd"}, ExtraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
+	{Name: "codex", Binaries: []string{"codex"}, PromptInjection: true, NativeJSONHooks: true, ConfigRel: ".codex/hooks.json", Format: "codex", JSONPath: "hooks.SessionStart", FinalPaths: []string{"hooks.SessionEnd"}, ExtraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
+	{Name: "gemini", Binaries: []string{"gemini"}, PromptInjection: true, NativeJSONHooks: true, ConfigRel: ".gemini/settings.json", Format: "gemini", JSONPath: "hooks.SessionStart", FinalPaths: []string{"hooks.SessionEnd"}, ExtraNote: "Gemini hook output is limited to bounded TaskPilot context."},
+	{Name: "hermes", Binaries: []string{"hermes", "hermes-agent"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap Hermes through `taskpilot run`; native session hooks require Hermes to expose a command hook setting."},
+	{Name: "opencode", Binaries: []string{"opencode", "open-code"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap OpenCode through `taskpilot run`; native session hooks require OpenCode to expose a command hook setting."},
+	{Name: "openclaude", Binaries: []string{"openclaude", "open-claude"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap OpenClaude through `taskpilot run`; native session hooks require OpenClaude to expose a command hook setting."},
+	{Name: "pi", Binaries: []string{"pi"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap Pi through `taskpilot run`; native session hooks require Pi to expose a command hook setting."},
+}
+
 type jsonHookWriteResult struct {
 	Changed    bool
 	Created    bool
@@ -2095,11 +2118,11 @@ func writeHookScripts(cfg repoEnableConfig) error {
 	if err := os.WriteFile(filepath.Join(dir, "session-start.cmd"), []byte(cmdScript), 0o755); err != nil {
 		return err
 	}
-	for _, agent := range []string{"codex", "claude", "gemini"} {
-		if err := os.WriteFile(filepath.Join(dir, agent+"-session-start.sh"), []byte(shScript), 0o755); err != nil {
+	for _, profile := range knownAgentProfiles {
+		if err := os.WriteFile(filepath.Join(dir, profile.Name+"-session-start.sh"), []byte(shScript), 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(dir, agent+"-session-start.cmd"), []byte(cmdScript), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, profile.Name+"-session-start.cmd"), []byte(cmdScript), 0o755); err != nil {
 			return err
 		}
 	}
@@ -2107,11 +2130,15 @@ func writeHookScripts(cfg repoEnableConfig) error {
 }
 
 func agentAdapters() []AgentAdapter {
-	return []AgentAdapter{
-		jsonHookAdapter{name: "claude", binary: "claude", configRel: ".claude/settings.json", hookRel: ".taskpilot/hooks/claude-session-start", format: "claude", jsonPath: "hooks.SessionStart", finalPaths: []string{"hooks.SessionEnd"}, supported: true, extraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
-		jsonHookAdapter{name: "codex", binary: "codex", configRel: ".codex/hooks.json", hookRel: ".taskpilot/hooks/codex-session-start", format: "codex", jsonPath: "hooks.SessionStart", finalPaths: []string{"hooks.SessionEnd"}, supported: true, extraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
-		jsonHookAdapter{name: "gemini", binary: "gemini", configRel: ".gemini/settings.json", hookRel: ".taskpilot/hooks/gemini-session-start", format: "gemini", jsonPath: "hooks.SessionStart", finalPaths: []string{"hooks.SessionEnd"}, supported: true, extraNote: "Gemini hook output is limited to bounded TaskPilot context."},
+	out := []AgentAdapter{}
+	for _, profile := range knownAgentProfiles {
+		if profile.NativeJSONHooks {
+			out = append(out, jsonHookAdapter{name: profile.Name, binary: profile.Binaries[0], configRel: profile.ConfigRel, hookRel: ".taskpilot/hooks/" + profile.Name + "-session-start", format: profile.Format, jsonPath: profile.JSONPath, finalPaths: profile.FinalPaths, supported: true, extraNote: profile.ExtraNote})
+			continue
+		}
+		out = append(out, unsupportedAgentAdapter{name: profile.Name, manualNote: profile.ManualSetupNote})
 	}
+	return out
 }
 
 func configureAgentAdapters(repo repoEnableConfig, dryRun bool, names []string) []AgentConfigureResult {
@@ -2666,7 +2693,8 @@ func (a jsonHookAdapter) legacyCommands() []string {
 }
 
 type unsupportedAgentAdapter struct {
-	name string
+	name       string
+	manualNote string
 }
 
 func (a unsupportedAgentAdapter) Name() string { return a.name }
@@ -2674,12 +2702,15 @@ func (a unsupportedAgentAdapter) Detect(repo repoEnableConfig) AgentDetection {
 	return AgentDetection{Name: a.name, Supported: false}
 }
 func (a unsupportedAgentAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConfigureResult {
-	return AgentConfigureResult{Name: a.name, Status: "unsupported", DryRun: dryRun, Message: "unknown agent adapter", ManualFallback: a.ManualInstructions(repo)}
+	return AgentConfigureResult{Name: a.name, Status: "unsupported", DryRun: dryRun, Message: "native session-hook adapter is not available", ManualFallback: a.ManualInstructions(repo)}
 }
 func (a unsupportedAgentAdapter) Doctor(repo repoEnableConfig) AgentHealth {
-	return AgentHealth{Name: a.name, Status: "unsupported", Message: "unknown agent adapter"}
+	return AgentHealth{Name: a.name, Status: "unsupported", Message: a.ManualInstructions(repo)}
 }
 func (a unsupportedAgentAdapter) ManualInstructions(repo repoEnableConfig) string {
+	if strings.TrimSpace(a.manualNote) != "" {
+		return a.manualNote
+	}
 	return "No automatic adapter exists for " + a.name + ". Configure your agent to run `.taskpilot/hooks/session-start.sh` on session start."
 }
 
@@ -4114,15 +4145,41 @@ func injectAgentStartupPrompt(commandArgs []string, prompt string) []string {
 	if len(commandArgs) == 0 {
 		return commandArgs
 	}
-	name := strings.ToLower(filepath.Base(commandArgs[0]))
-	switch name {
-	case "codex", "gemini", "claude", "pi", "opencode":
+	if isPromptInjectableAgent(commandArgs[0]) {
 		if len(commandArgs) == 1 || isAgentResumeCommand(commandArgs) {
 			return append(commandArgs, prompt)
 		}
 		return injectPromptIntoAgentArgs(commandArgs, prompt)
 	}
 	return commandArgs
+}
+
+func isPromptInjectableAgent(command string) bool {
+	name := normalizedAgentCommandName(command)
+	if name == "" {
+		return false
+	}
+	for _, profile := range knownAgentProfiles {
+		if !profile.PromptInjection {
+			continue
+		}
+		for _, binary := range profile.Binaries {
+			if name == strings.ToLower(binary) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizedAgentCommandName(command string) string {
+	name := strings.TrimSpace(command)
+	if name == "" {
+		return ""
+	}
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = strings.ToLower(filepath.Base(name))
+	return strings.TrimSuffix(name, ".exe")
 }
 
 func agentLaunchPrompt(taskID, promptPath string) string {

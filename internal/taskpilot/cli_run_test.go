@@ -891,6 +891,14 @@ func TestWriteHookScriptsAreRepoRelative(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, ".taskpilot", "hooks", "codex-session-start.cmd")); err != nil {
 		t.Fatalf("expected Windows hook script too: %v", err)
 	}
+	for _, agent := range []string{"claude", "gemini", "hermes", "opencode", "openclaude", "pi"} {
+		if _, err := os.Stat(filepath.Join(root, ".taskpilot", "hooks", agent+"-session-start.sh")); err != nil {
+			t.Fatalf("expected %s hook script: %v", agent, err)
+		}
+		if _, err := os.Stat(filepath.Join(root, ".taskpilot", "hooks", agent+"-session-start.cmd")); err != nil {
+			t.Fatalf("expected %s Windows hook script: %v", agent, err)
+		}
+	}
 }
 
 func runGitTestCommand(t *testing.T, root string, args ...string) {
@@ -928,7 +936,7 @@ func TestInjectAgentStartupPromptSupportsClaude(t *testing.T) {
 
 func TestInjectAgentStartupPromptSupportsPiAndOpenCode(t *testing.T) {
 	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
-	for _, agent := range []string{"pi", "opencode"} {
+	for _, agent := range []string{"pi", "opencode", "open-code", "hermes", "hermes-agent", "openclaude", "open-claude"} {
 		got := injectAgentStartupPrompt([]string{agent, "review README"}, prompt)
 		if len(got) != 2 {
 			t.Fatalf("%s: expected two args, got %+v", agent, got)
@@ -936,6 +944,17 @@ func TestInjectAgentStartupPromptSupportsPiAndOpenCode(t *testing.T) {
 		if !strings.Contains(got[1], "/tmp/taskpilot-prompt.txt") || !strings.Contains(got[1], "review README") {
 			t.Fatalf("%s: prompt was not combined correctly: %+v", agent, got)
 		}
+	}
+}
+
+func TestInjectAgentStartupPromptSupportsExecutablePaths(t *testing.T) {
+	prompt := agentLaunchPrompt("task_1", "/tmp/taskpilot-prompt.txt")
+	got := injectAgentStartupPrompt([]string{`C:\Tools\open-claude.exe`, "review README"}, prompt)
+	if len(got) != 2 {
+		t.Fatalf("expected two args, got %+v", got)
+	}
+	if !strings.Contains(got[1], "/tmp/taskpilot-prompt.txt") || !strings.Contains(got[1], "review README") {
+		t.Fatalf("prompt was not combined correctly: %+v", got)
 	}
 }
 

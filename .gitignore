@@ -10,3 +10,4 @@ bin/
 taskpilot.db
 *.db-shm
 *.db-wal
+.codex/skills

@@ -287,10 +287,14 @@ taskpilot task create \
 taskpilot run <task-id> -- codex "Improve the README architecture section. Keep it brief and easy to understand."
 ```
 
-or:
+Other agent CLIs use the same wrapper path:
 
 ```bash
 taskpilot run <task-id> -- gemini "Continue from the TaskPilot handoff and complete the next steps."
+taskpilot run <task-id> -- claude "Continue from the TaskPilot handoff and complete the next steps."
+taskpilot run <task-id> -- opencode "Continue from the TaskPilot handoff and complete the next steps."
+taskpilot run <task-id> -- hermes "Continue from the TaskPilot handoff and complete the next steps."
+taskpilot run <task-id> -- openclaude "Continue from the TaskPilot handoff and complete the next steps."
 ```
 
 Do not manually paste all task context. `taskpilot run` injects it.

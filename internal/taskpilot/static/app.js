@@ -548,17 +548,95 @@ function statusClass(status) {
 function board() {
   const tasks = filteredTasks();
   return h("div", { class: "board-page" },
+    developerCockpit(tasks),
     h("div", { class: "operations-strip" }, stats(), taskFilters()),
     h("div", { class: "scope-strip" }, boardScopeFilter()),
     h("div", { class: "board" }, statuses.map(status =>
-      h("div", { class: `column column-${statusClass(status)}` },
-        h("div", { class: "column-head" },
-          h("h3", {}, statusLabel(status), h("span", {}, tasks.filter(t => t.status === status).length)),
-          h("button", { title: "Column options" }, h("span", { class: "material-symbols-outlined" }, "more_horiz"))
-        ),
-        tasks.filter(t => t.status === status).map(taskCard)
-      )
+      {
+        const columnTasks = tasks.filter(t => t.status === status);
+        return h("div", { class: `column column-${statusClass(status)}` },
+          h("div", { class: "column-head" },
+            h("h3", {}, statusLabel(status), h("span", {}, columnTasks.length)),
+            h("button", { title: "Create task in this workflow", onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, h("span", { class: "material-symbols-outlined" }, "add"))
+          ),
+          columnTasks.length ? columnTasks.map(taskCard) : boardColumnEmpty(status)
+        );
+      }
     ))
+  );
+}
+
+function developerCockpit(tasks) {
+  const active = tasks.filter(t => ["claimed", "in_progress"].includes(t.status));
+  const blocked = tasks.filter(t => t.status === "blocked" || (t.blockers || []).length || (t.open_dependency_count || 0) > 0);
+  const handoffs = apiState.handoffs.filter(h => h.status === "prepared");
+  const activeActors = apiState.actors.filter(a => (a.active_sessions || 0) > 0);
+  const currentTask = active[0] || tasks.find(t => t.status === "ready") || tasks[0];
+  return h("section", { class: "dev-cockpit" },
+    h("div", { class: "cockpit-hero" },
+      h("div", { class: "cockpit-kicker" }, h("span", { class: "material-symbols-outlined" }, "terminal"), "Developer cockpit"),
+      h("h1", {}, currentTask ? currentTask.title : "No active task in this scope"),
+      h("p", {}, currentTask ? (currentTask.goal || "Open the task to inspect memory, locks, decisions, and next steps.") : "Create a task or register an actor to start coordinating work."),
+      h("div", { class: "cockpit-actions" },
+        currentTask ? h("button", { class: "primary", onclick: () => selectTask(currentTask.id) }, h("span", { class: "material-symbols-outlined" }, "open_in_new"), "Open Current Task") : null,
+        canWrite() && currentTask && currentTask.status === "ready" ? h("button", { onclick: async () => { await api(`/api/tasks/${currentTask.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, h("span", { class: "material-symbols-outlined" }, "play_arrow"), "Claim & Start") : null,
+        canWrite() ? h("button", { onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, h("span", { class: "material-symbols-outlined" }, "add"), "New Task") : null
+      )
+    ),
+    h("div", { class: "cockpit-grid" },
+      cockpitTile("Active work", active.length, active.length ? `${actorName(active[0].owner_id)} owns ${active[0].title}` : "No active claims", "radio_button_checked", () => active[0] ? selectTask(active[0].id) : null),
+      cockpitTile("Needs attention", blocked.length + apiState.conflicts.length + apiState.staleClaims.length, blocked[0] ? blocked[0].title : apiState.conflicts.length ? "Open conflicts waiting" : "No blockers detected", "priority_high", () => { apiState.tab = apiState.conflicts.length || apiState.staleClaims.length ? "conflicts" : blocked[0] ? "detail" : "board"; if (blocked[0] && !apiState.conflicts.length && !apiState.staleClaims.length) selectTask(blocked[0].id); else render(); }),
+      cockpitTile("Handoffs", handoffs.length, handoffs[0] ? "A handoff is ready to accept" : "No pending handoffs", "swap_horiz", () => { apiState.tab = "handoffs"; render(); }),
+      cockpitTile("Actors online", activeActors.length, activeActors[0] ? `${activeActors[0].name} is active` : `${apiState.actors.length} actors registered`, "groups", () => { apiState.tab = "actors"; render(); })
+    )
+  );
+}
+
+function cockpitTile(label, value, caption, icon, action) {
+  return h("button", { class: "cockpit-tile", onclick: action || (() => {}) },
+    h("span", { class: "material-symbols-outlined" }, icon),
+    h("strong", {}, value),
+    h("span", {}, label),
+    h("small", {}, caption)
+  );
+}
+
+function boardColumnEmpty(status) {
+  const messages = {
+    ready: ["No ready tasks", "Create work or clear filters to see available tasks."],
+    claimed: ["No claimed work", "Claim a ready task when a developer or agent starts."],
+    in_progress: ["Nothing running", "Active agent sessions will show here."],
+    blocked: ["No blockers", "Conflicts and blockers stay quiet until attention is needed."],
+    handoff_ready: ["No handoffs", "Prepared transfer packets will land here."],
+    in_review: ["Nothing in review", "Send finished work here before completion."],
+    completed: ["No completed tasks", "Completed outcomes will collect here."],
+  };
+  const [title, body] = messages[status] || ["No tasks", "Nothing in this state."];
+  return h("div", { class: "column-empty" }, h("strong", {}, title), h("p", {}, body));
+}
+
+function stopCardEvent(event) {
+  event.stopPropagation();
+}
+
+async function claimTaskFromCard(event, id) {
+  stopCardEvent(event);
+  await api(`/api/tasks/${id}/claim`, { method: "POST", body: "{}" });
+  await refresh();
+}
+
+async function completeTaskFromCard(event, id) {
+  stopCardEvent(event);
+  await api(`/api/tasks/${id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from dashboard." }) });
+  await refresh();
+}
+
+function cardQuickActions(t) {
+  if (!canWrite()) return null;
+  return h("div", { class: "task-card-actions" },
+    t.status === "ready" ? h("button", { onclick: (event) => claimTaskFromCard(event, t.id) }, h("span", { class: "material-symbols-outlined" }, "play_arrow"), "Claim") : null,
+    ["claimed", "in_progress", "in_review"].includes(t.status) ? h("button", { onclick: (event) => completeTaskFromCard(event, t.id) }, h("span", { class: "material-symbols-outlined" }, "check"), "Done") : null,
+    h("button", { onclick: (event) => { stopCardEvent(event); selectTask(t.id); } }, "Open")
   );
 }
 
@@ -578,6 +656,7 @@ function taskCard(t) {
       (t.subtask_count || 0) > 0 ? h("span", { class: "pill" }, h("span", { class: "material-symbols-outlined" }, "account_tree"), `${t.subtask_count}`) : null,
       (t.open_dependency_count || 0) > 0 ? h("span", { class: "pill amber" }, `${t.open_dependency_count} blockers`) : null
     ),
+    cardQuickActions(t),
     h("div", { class: "task-card-footer" },
       h("span", { class: "repo-chip" }, t.repo_id ? repoName(t.repo_id) : projectName(t.project_id)),
       h("span", { class: "avatar", title: owner }, actorInitials(owner))
@@ -629,11 +708,17 @@ function createTaskForm() {
 
 function detailView() {
   if (!apiState.detail) {
-    return h("div", { class: "grid2 detail-layout" },
-      h("div", {}, createTaskForm()),
-      h("div", { class: "panel" },
-        h("h2", {}, "Task Detail"),
-        h("p", { class: "meta" }, "Select a task from the board or create a new task here.")
+    return h("div", { class: "execution-empty" },
+      h("section", { class: "execution-create" }, createTaskForm()),
+      h("section", { class: "execution-guide" },
+        h("div", { class: "cockpit-kicker" }, h("span", { class: "material-symbols-outlined" }, "route"), "Execution workspace"),
+        h("h1", {}, "Create agent-ready work"),
+        h("p", {}, "Task detail becomes a live run space after creation: status, locks, memory, decisions, handoffs, and evidence stay together."),
+        h("div", { class: "execution-guide-grid" },
+          h("div", {}, h("strong", {}, "1. Define outcome"), h("p", {}, "Give the task a concrete title, goal, priority, and scope.")),
+          h("div", {}, h("strong", {}, "2. Claim safely"), h("p", {}, "Developers or agents claim work before touching shared files.")),
+          h("div", {}, h("strong", {}, "3. Leave memory"), h("p", {}, "Decisions, artifacts, snapshots, and handoffs become future context."))
+        )
       )
     );
   }
@@ -653,41 +738,87 @@ function detailView() {
   const dependencies = Array.isArray(apiState.detail.dependencies) ? apiState.detail.dependencies : [];
   const dependents = Array.isArray(apiState.detail.dependents) ? apiState.detail.dependents : [];
   const parent = apiState.detail.parent;
-  return h("div", { class: "grid2 detail-layout" },
-    h("div", {}, actionsPanel(task)),
-    h("div", { class: "detail-stack" },
-      h("div", { class: "panel detail-hero" },
-        h("div", {},
-          h("h2", {}, task.title),
-          h("p", {}, `Goal: ${task.goal}`)
-        ),
-        h("div", { class: "hero-badges" },
-          h("span", { class: `priority priority-${String(task.priority || "normal").toLowerCase()}` }, task.priority || "normal"),
+  return h("div", { class: "execution-page" },
+    h("section", { class: "execution-header" },
+      h("div", { class: "execution-title" },
+        h("div", { class: "cockpit-kicker" }, h("span", { class: "material-symbols-outlined" }, "terminal"), "Task execution"),
+        h("div", { class: "execution-title-row" },
+          h("span", { class: "code-chip" }, shortID(task.id)),
           h("span", { class: `status-badge status-${statusClass(task.status)}` }, statusLabel(task.status)),
-        )
+          h("span", { class: `priority priority-${String(task.priority || "normal").toLowerCase()}` }, task.priority || "normal")
+        ),
+        h("h1", {}, task.title),
+        h("p", {}, task.goal || "No goal recorded yet.")
       ),
-      h("div", { class: "panel detail-meta" },
-        h("span", {}, `Owner: ${actorName(task.owner_id)}`),
-        h("span", {}, `Project: ${projectName(task.project_id)}`),
-        h("span", {}, `Repo: ${repoName(task.repo_id)}`),
-        h("span", {}, `Workspace: ${workspaceName(task.workspace_id)}`),
-        parent ? h("span", { class: "linkish", onclick: () => selectTask(parent.id) }, `Parent: ${parent.title}`) : null,
-        h("span", {}, `Scope: ${(task.scope || []).join(", ") || "none"}`)
-      ),
-      h("div", { class: "detail-grid" },
+      executionPrimaryActions(task, latestSnapshot, handoffPacket)
+    ),
+    executionStatusStrip(task, locks, dependencies, handoffs, latestSnapshot, handoffPacket),
+    h("div", { class: "execution-layout" },
+      h("main", { class: "execution-main" },
+        executionContextBar(task, parent),
         taskMemoryPanel(task, latestSnapshot, handoffPacket, snapshots, contextEntries),
-        section("Subtasks", subtasks.map(subtaskItem)),
-        section("Blocked By", dependencies.map(dependencyItem)),
-        section("Blocking", dependents.map(dependentItem)),
-        section("Decisions", decisions.map(decisionItem)),
-        section("Comments", comments.map(commentItem)),
-        section("Artifacts", artifacts.map(artifactItem)),
-        section("Git", gitRefs.map(gitItem)),
-        section("Locks", locks.map(lockItem)),
-        section("Handoffs", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`))))
+        h("div", { class: "execution-card-grid" },
+          executionCard("Subtasks", "account_tree", subtasks.map(subtaskItem), "Break work into smaller agent-safe chunks."),
+          executionCard("Blocked By", "block", dependencies.map(dependencyItem), "Dependencies that must clear first."),
+          executionCard("Blocking", "conversion_path", dependents.map(dependentItem), "Tasks waiting on this outcome."),
+          executionCard("Decisions", "rule", decisions.map(decisionItem), "Architecture and product decisions made during the run."),
+          executionCard("Comments", "forum", comments.map(commentItem), "Human review notes and discussion."),
+          executionCard("Artifacts", "attachment", artifacts.map(artifactItem), "PRs, logs, documents, screenshots, or outputs."),
+          executionCard("Git", "commit", gitRefs.map(gitItem), "Branches, commits, PRs, and changed file context."),
+          executionCard("Locks", "lock", locks.map(lockItem), "Active ownership of files, scopes, or semantic areas."),
+          executionCard("Handoffs", "swap_horiz", handoffs.map(x => h("div", { class: "item" }, h("strong", {}, x.status), h("p", {}, x.resume_summary), h("p", {}, `Next: ${(x.next_steps || []).join(", ")}`))), "Transfer packets for another developer or agent.")
+        ),
+        executionCard("Timeline Audit", "timeline", h("div", { class: "timeline log-panel" }, events.map(e => h("div", { class: "event log-line" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))), "System events excluding noisy heartbeats.")
       ),
-      section("Timeline Audit", h("div", { class: "timeline log-panel" }, events.map(e => h("div", { class: "event log-line" }, `${e.id} · ${e.event_type} · ${new Date(e.created_at).toLocaleString()}`))))
+      h("aside", { class: "execution-rail" }, actionsPanel(task))
     )
+  );
+}
+
+function executionPrimaryActions(task, latestSnapshot, handoffPacket) {
+  if (!canWrite()) return h("div", { class: "execution-primary-actions" }, h("span", { class: "pill amber" }, "Read only"));
+  return h("div", { class: "execution-primary-actions" },
+    task.status === "ready" ? h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, h("span", { class: "material-symbols-outlined" }, "play_arrow"), "Claim & Start") : null,
+    ["claimed", "in_progress"].includes(task.status) ? h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "in_review" }) }); await refresh(); } }, h("span", { class: "material-symbols-outlined" }, "rate_review"), "Send To Review") : null,
+    h("button", { onclick: () => openHandoffModal(task, latestSnapshot, handoffPacket) }, h("span", { class: "material-symbols-outlined" }, "swap_horiz"), "Prepare Handoff"),
+    task.status !== "completed" ? h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from execution workspace." }) }); await refresh(); } }, h("span", { class: "material-symbols-outlined" }, "check"), "Complete") : null
+  );
+}
+
+function executionStatusStrip(task, locks, dependencies, handoffs, latestSnapshot, handoffPacket) {
+  const isBlocked = task.status === "blocked" || (task.blockers || []).length || dependencies.length;
+  const memorySource = handoffPacket && handoffPacket.markdown ? "handoff" : latestSnapshot && latestSnapshot.markdown ? "snapshot" : "empty";
+  return h("section", { class: "execution-strip" },
+    executionMetric("Owner", actorName(task.owner_id), task.owner_id ? "Current task owner" : "No owner assigned", "person", task.owner_id ? "" : "muted"),
+    executionMetric("Locks", locks.length, locks.length ? "Protected scopes active" : "No active locks", "lock", locks.length ? "" : "muted"),
+    executionMetric("Dependencies", dependencies.length, isBlocked ? "Attention required" : "Clear to proceed", isBlocked ? "priority_high" : "task_alt", isBlocked ? "danger" : "success"),
+    executionMetric("Memory", memorySource, memorySource === "empty" ? "Generate a snapshot or handoff" : "Context available", "article", memorySource === "empty" ? "muted" : "success"),
+    executionMetric("Handoffs", handoffs.length, handoffs.length ? "Transfer history exists" : "No transfer packets yet", "swap_horiz", handoffs.length ? "" : "muted")
+  );
+}
+
+function executionMetric(label, value, caption, icon, tone = "") {
+  return h("div", { class: `execution-metric ${tone}` },
+    h("span", { class: "material-symbols-outlined" }, icon),
+    h("div", {}, h("strong", {}, value), h("small", {}, label), h("p", {}, caption))
+  );
+}
+
+function executionContextBar(task, parent) {
+  return h("section", { class: "execution-context" },
+    h("span", {}, h("strong", {}, "Project"), projectName(task.project_id)),
+    h("span", {}, h("strong", {}, "Repo"), repoName(task.repo_id)),
+    h("span", {}, h("strong", {}, "Workspace"), workspaceName(task.workspace_id)),
+    h("span", {}, h("strong", {}, "Scope"), (task.scope || []).join(", ") || "none"),
+    parent ? h("span", { class: "linkish", onclick: () => selectTask(parent.id) }, h("strong", {}, "Parent"), parent.title) : null
+  );
+}
+
+function executionCard(title, icon, content, emptyText) {
+  const isEmptyArray = Array.isArray(content) && !content.length;
+  return h("section", { class: "section execution-card" },
+    h("div", { class: "execution-card-head" }, h("h3", {}, h("span", { class: "material-symbols-outlined" }, icon), title)),
+    isEmptyArray ? h("div", { class: "execution-empty-state" }, h("strong", {}, "Nothing yet"), h("p", {}, emptyText || "New entries will appear here as work progresses.")) : content
   );
 }
 
@@ -1093,62 +1224,95 @@ function actionsPanel(task) {
   const subtaskGoal = h("textarea", { placeholder: "Subtask goal" });
   const dependencyOptions = apiState.tasks.filter(t => t.id !== task.id && t.project_id === task.project_id);
   const dependency = h("select", {}, [h("option", { value: "" }, "Select blocking task")].concat(dependencyOptions.map(t => h("option", { value: t.id }, `${t.title} · ${t.status}`))));
-  return h("div", { class: "panel" },
-    h("h2", {}, "Actions"),
-    h("div", { class: "form" },
-      editTaskForm(task),
-      h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, "Claim"),
-      h("div", { class: "row" }, status, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: status.value }) }); await refresh(); } }, "Apply Manual Status")),
-      h("div", { class: "button-row" },
-        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "blocked" }) }); await refresh(); } }, "Mark Blocked"),
-        h("button", { onclick: () => openHandoffModal(task, apiState.detail && apiState.detail.latest_snapshot, apiState.detail && apiState.detail.handoff_packet) }, "Prepare Handoff"),
-        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "in_review" }) }); await refresh(); } }, "Send To Review"),
-        h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from dashboard." }) }); await refresh(); } }, "Mark Complete")
-      ),
-      h("h3", {}, "Subtasks"),
-      subtaskTitle, subtaskGoal,
-      h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/subtasks`, { method: "POST", body: JSON.stringify({ title: subtaskTitle.value, goal: subtaskGoal.value, type: task.type, priority: task.priority }) }); subtaskTitle.value = ""; subtaskGoal.value = ""; await refresh(); } }, "Create Subtask"),
-      h("h3", {}, "Dependencies"),
-      h("div", { class: "row" }, dependency, h("button", { onclick: async () => { if (!dependency.value) return; await api(`/api/tasks/${task.id}/dependencies`, { method: "POST", body: JSON.stringify({ depends_on_id: dependency.value }) }); dependency.value = ""; await refresh(); } }, "Add Blocker")),
-      h("h3", {}, "Decision"),
-      decision, decisionReason, decisionImpact, decisionAlternatives,
-      h("button", { onclick: async () => {
-        await api(`/api/tasks/${task.id}/decisions`, { method: "POST", body: JSON.stringify({
-          decision: decision.value,
-          reason: decisionReason.value,
-          impact: decisionImpact.value,
-          alternatives: decisionAlternatives.value.split(",").map(s => s.trim()).filter(Boolean),
-        }) });
-        decision.value = ""; decisionReason.value = ""; decisionImpact.value = ""; decisionAlternatives.value = "";
-        await refresh();
-      } }, "Record Decision"),
-      h("h3", {}, "Comment"),
-      comment,
-      h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ body: comment.value }) }); comment.value = ""; await refresh(); } }, "Add Comment"),
-      h("h3", {}, "Artifact Reference"),
-      h("div", { class: "row" }, artifactKind, artifactTitle),
-      artifactURI, artifactDescription,
-      h("button", { onclick: async () => {
-        await api(`/api/tasks/${task.id}/artifacts`, { method: "POST", body: JSON.stringify({ kind: artifactKind.value, title: artifactTitle.value, uri: artifactURI.value, description: artifactDescription.value }) });
-        artifactTitle.value = ""; artifactURI.value = ""; artifactDescription.value = "";
-        await refresh();
-      } }, "Add Artifact"),
-      h("h3", {}, "Git Metadata"),
-      h("div", { class: "row" }, gitBranch, gitCommit),
-      gitPR, gitFiles, gitNote,
-      h("button", { onclick: async () => {
-        await api(`/api/tasks/${task.id}/git`, { method: "POST", body: JSON.stringify({
-          branch: gitBranch.value,
-          commit_sha: gitCommit.value,
-          pr_url: gitPR.value,
-          changed_files: gitFiles.value.split(",").map(s => s.trim()).filter(Boolean),
-          note: gitNote.value,
-        }) });
-        gitBranch.value = ""; gitCommit.value = ""; gitPR.value = ""; gitFiles.value = ""; gitNote.value = "";
-        await refresh();
-      } }, "Attach Git Metadata"),
-      h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock")),
-      h("h3", {}, "Danger Zone"),
+  return h("div", { class: "panel execution-actions" },
+    h("h2", {}, "Action Rail"),
+    h("div", { class: "rail-primary" },
+      task.status === "ready" ? h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/claim`, { method: "POST", body: "{}" }); await refresh(); } }, h("span", { class: "material-symbols-outlined" }, "play_arrow"), "Claim") : null,
+      h("button", { onclick: () => openHandoffModal(task, apiState.detail && apiState.detail.latest_snapshot, apiState.detail && apiState.detail.handoff_packet) }, h("span", { class: "material-symbols-outlined" }, "swap_horiz"), "Handoff"),
+      h("button", { class: "primary", onclick: async () => { await api(`/api/tasks/${task.id}/complete`, { method: "POST", body: JSON.stringify({ summary: "Completed from execution workspace." }) }); await refresh(); } }, h("span", { class: "material-symbols-outlined" }, "check"), "Complete")
+    ),
+    h("details", { class: "rail-section", open: "open" },
+      h("summary", {}, "Status"),
+      h("div", { class: "form" },
+        h("div", { class: "row" }, status, h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: status.value }) }); await refresh(); } }, "Apply")),
+        h("div", { class: "button-row" },
+          h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "blocked" }) }); await refresh(); } }, "Mark Blocked"),
+          h("button", { onclick: async () => { await api(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "in_review" }) }); await refresh(); } }, "Send To Review")
+        )
+      )
+    ),
+    editTaskForm(task),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Subtasks"),
+      h("div", { class: "form" }, subtaskTitle, subtaskGoal,
+        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/subtasks`, { method: "POST", body: JSON.stringify({ title: subtaskTitle.value, goal: subtaskGoal.value, type: task.type, priority: task.priority }) }); subtaskTitle.value = ""; subtaskGoal.value = ""; await refresh(); } }, "Create Subtask")
+      )
+    ),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Dependencies"),
+      h("div", { class: "form" },
+        h("div", { class: "row" }, dependency, h("button", { onclick: async () => { if (!dependency.value) return; await api(`/api/tasks/${task.id}/dependencies`, { method: "POST", body: JSON.stringify({ depends_on_id: dependency.value }) }); dependency.value = ""; await refresh(); } }, "Add Blocker"))
+      )
+    ),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Decision"),
+      h("div", { class: "form" }, decision, decisionReason, decisionImpact, decisionAlternatives,
+        h("button", { onclick: async () => {
+          await api(`/api/tasks/${task.id}/decisions`, { method: "POST", body: JSON.stringify({
+            decision: decision.value,
+            reason: decisionReason.value,
+            impact: decisionImpact.value,
+            alternatives: decisionAlternatives.value.split(",").map(s => s.trim()).filter(Boolean),
+          }) });
+          decision.value = ""; decisionReason.value = ""; decisionImpact.value = ""; decisionAlternatives.value = "";
+          await refresh();
+        } }, "Record Decision")
+      )
+    ),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Comment"),
+      h("div", { class: "form" }, comment,
+        h("button", { onclick: async () => { await api(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ body: comment.value }) }); comment.value = ""; await refresh(); } }, "Add Comment")
+      )
+    ),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Artifact"),
+      h("div", { class: "form" },
+        h("div", { class: "row" }, artifactKind, artifactTitle),
+        artifactURI, artifactDescription,
+        h("button", { onclick: async () => {
+          await api(`/api/tasks/${task.id}/artifacts`, { method: "POST", body: JSON.stringify({ kind: artifactKind.value, title: artifactTitle.value, uri: artifactURI.value, description: artifactDescription.value }) });
+          artifactTitle.value = ""; artifactURI.value = ""; artifactDescription.value = "";
+          await refresh();
+        } }, "Add Artifact")
+      )
+    ),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Git Metadata"),
+      h("div", { class: "form" },
+        h("div", { class: "row" }, gitBranch, gitCommit),
+        gitPR, gitFiles, gitNote,
+        h("button", { onclick: async () => {
+          await api(`/api/tasks/${task.id}/git`, { method: "POST", body: JSON.stringify({
+            branch: gitBranch.value,
+            commit_sha: gitCommit.value,
+            pr_url: gitPR.value,
+            changed_files: gitFiles.value.split(",").map(s => s.trim()).filter(Boolean),
+            note: gitNote.value,
+          }) });
+          gitBranch.value = ""; gitCommit.value = ""; gitPR.value = ""; gitFiles.value = ""; gitNote.value = "";
+          await refresh();
+        } }, "Attach Git Metadata")
+      )
+    ),
+    h("details", { class: "rail-section" },
+      h("summary", {}, "Locks"),
+      h("div", { class: "form" },
+        h("div", { class: "row" }, lockScope, h("button", { onclick: async () => { try { await api(`/api/tasks/${task.id}/locks`, { method: "POST", body: JSON.stringify({ scope: lockScope.value, scope_type: "file_glob" }) }); lockScope.value = ""; } finally { await refresh(); } } }, "Acquire Lock"))
+      )
+    ),
+    h("details", { class: "rail-section danger-section" },
+      h("summary", {}, "Danger Zone"),
       h("button", { class: "danger", onclick: async () => {
         if (!confirm(`Delete task "${task.title}" permanently? This removes the task and its related database records.`)) return;
         await api(`/api/tasks/${task.id}`, { method: "DELETE" });
@@ -1553,8 +1717,7 @@ function projectsView() {
 
 function pageHeader(title, subtitle) {
   return h("div", { class: "ops-page-header" },
-    h("div", {}, h("h2", {}, title), h("p", {}, subtitle)),
-    h("span", { class: "version-chip" }, "sys_ver: 2.4.0-stable")
+    h("div", {}, h("h2", {}, title), subtitle ? h("p", {}, subtitle) : null)
   );
 }
 
@@ -1659,8 +1822,10 @@ function changePasswordForm() {
 
 function settings() {
   const mine = apiState.actors.filter(a => a.created_by_user_id && a.created_by_user_id === currentUserID());
+  const agentActors = apiState.actors.filter(a => a.kind === "agent").length;
+  const activeActors = apiState.actors.filter(a => (a.active_sessions || 0) > 0).length;
   return h("div", { class: "ops-page settings-page" },
-    pageHeader("Settings", "System and account configuration."),
+    pageHeader("Settings", "Account access, actor identity, and local CLI setup."),
     h("div", { class: "settings-grid" },
       h("div", { class: "settings-main" },
         h("section", { class: "settings-card account-card" },
@@ -1681,11 +1846,10 @@ function settings() {
           h("div", { class: "settings-card-foot" }, changePasswordForm())
         ),
         h("section", { class: "settings-card" },
-          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "corporate_fare"), h("h3", {}, "Team Configuration")),
+          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "groups"), h("h3", {}, "Actors & Workspaces")),
           h("div", { class: "team-list" },
-            h("div", { class: "team-row" }, h("span", { class: "team-avatar" }, "OP"), h("div", {}, h("strong", {}, "Operations Core"), h("p", { class: "meta" }, `Primary workspace · ${apiState.actors.length} actors`)), h("span", { class: "status-badge" }, "default")),
-            h("div", { class: "team-row" }, h("span", { class: "team-avatar light" }, "AI"), h("div", {}, h("strong", {}, "AI Agents Pool"), h("p", { class: "meta" }, `Automated handlers · ${apiState.actors.filter(a => a.kind === "agent").length} active`)), h("button", { onclick: () => { apiState.tab = "actors"; render(); } }, "Manage")),
-            h("button", { onclick: () => { apiState.tab = "projects"; render(); } }, h("span", { class: "material-symbols-outlined" }, "add"), "Create New Workspace")
+            h("div", { class: "team-row" }, h("span", { class: "team-avatar" }, "AC"), h("div", {}, h("strong", {}, "Actor registry"), h("p", { class: "meta" }, `${apiState.actors.length} actors · ${activeActors} active · ${agentActors} agents`)), h("button", { onclick: () => { apiState.tab = "actors"; render(); } }, "Manage")),
+            h("div", { class: "team-row" }, h("span", { class: "team-avatar light" }, "WS"), h("div", {}, h("strong", {}, "Workspace registry"), h("p", { class: "meta" }, `${apiState.workspaces.length} workspaces · ${apiState.repositories.length} repositories`)), h("button", { onclick: () => { apiState.tab = "projects"; render(); } }, "Open"))
           )
         )
       ),
@@ -1695,23 +1859,9 @@ function settings() {
           h("p", {}, "Connect your local environment to the TaskPilot operational grid."),
           mine.length ? mine.map(cliSetupItem) : h("p", { class: "meta" }, "No owned actors yet. Add one from the Actors page."),
           h("button", { class: "agent-action", onclick: () => { apiState.tab = "actors"; render(); } }, "Manage Actors")
-        ),
-        h("section", { class: "settings-card notifications-card" },
-          h("div", { class: "settings-card-head" }, h("span", { class: "material-symbols-outlined" }, "tune"), h("h3", {}, "Notifications")),
-          notificationRow("Conflict Resolution", "Alert when agent tasks conflict.", true),
-          notificationRow("Handoff Requests", "Notify on manual handoff required.", true),
-          notificationRow("Task Blocks", "Immediate ping on pipeline stall.", false),
-          h("a", { href: "#", onclick: (event) => event.preventDefault() }, "Advanced Delivery Settings")
         )
       )
     ),
-  );
-}
-
-function notificationRow(title, description, enabled) {
-  return h("div", { class: "notification-row" },
-    h("div", {}, h("strong", {}, title), h("p", { class: "meta" }, description)),
-    h("span", { class: `toggle ${enabled ? "on" : ""}` }, h("span", {}))
   );
 }
 
@@ -1781,13 +1931,7 @@ function render() {
       sidebar(),
       h("div", { class: "workspace" },
         appBar(),
-        h("main", { class: "main" }, apiState.error ? h("div", { class: "panel error" }, apiState.error) : null, content),
-        h("footer", { class: "footer" },
-          h("strong", {}, "TaskPilot v2.4.0-stable"),
-          h("span", {}, "System Status"),
-          h("span", {}, "API Docs"),
-          h("span", {}, "Support")
-        )
+        h("main", { class: "main", id: "main-content" }, apiState.error ? h("div", { class: "panel error" }, apiState.error) : null, content)
       ),
     ));
     if (apiState.handoffModal) root.append(handoffModalView());
@@ -1801,34 +1945,35 @@ function sidebar() {
   return h("aside", { class: "sidebar" },
     h("div", { class: "sidebar-brand" },
       h("div", { class: "brand-mark" }, "TP"),
-      h("div", {}, h("strong", {}, "TaskPilot"), h("span", {}, "Operational Dashboard"))
+      h("div", {}, h("strong", {}, "TaskPilot"), h("span", {}, "Product Console"))
     ),
     h("nav", { class: "tabs" }, tabs.map(t => h("button", { class: apiState.tab === t ? "active" : "", onclick: () => { apiState.tab = t; render(); } },
       h("span", { class: "material-symbols-outlined nav-icon" }, navIcon(t)),
       h("span", {}, t === "detail" ? "Task Detail" : t)
     ))),
     h("div", { class: "sidebar-tools" },
-      h("button", { class: "sync-button", onclick: () => refresh() }, h("span", { class: "material-symbols-outlined" }, "sync"), "Sync Workspace"),
-      h("div", { class: "sidebar-quick" },
-        h("span", {}, h("span", { class: "material-symbols-outlined" }, "work"), "Workspace"),
-        h("span", {}, h("span", { class: "material-symbols-outlined" }, "source"), "Repo Context"),
-        h("span", {}, h("span", { class: "material-symbols-outlined" }, "sync"), "Sync Status")
-      )
+      h("button", { class: "sync-button", onclick: () => refresh() }, h("span", { class: "material-symbols-outlined" }, "sync"), "Refresh")
     )
   );
 }
 
 function appBar() {
+  const titles = {
+    board: "Board",
+    detail: "Task Detail",
+    projects: "Projects",
+    conflicts: "Conflicts",
+    actors: "Actors",
+    handoffs: "Handoffs",
+    settings: "Settings",
+  };
   return h("header", { class: "appbar" },
-    h("nav", { class: "appbar-links" },
-      h("button", { class: ["board", "detail", "projects", "handoffs", "settings"].includes(apiState.tab) ? "active" : "", onclick: () => { apiState.tab = "board"; render(); } }, "Dashboard"),
-      h("button", { class: apiState.tab === "actors" ? "active" : "", onclick: () => { apiState.tab = "actors"; render(); } }, "Metrics"),
-      h("button", { class: apiState.tab === "conflicts" ? "active" : "", onclick: () => { apiState.tab = "conflicts"; render(); } }, "Reports")
+    h("div", { class: "appbar-title" },
+      h("strong", {}, titles[apiState.tab] || "TaskPilot"),
+      h("span", {}, identityLabel())
     ),
     h("div", { class: "appbar-actions" },
-      h("button", { class: "icon-button", title: "Notifications" }, h("span", { class: "material-symbols-outlined" }, "notifications")),
-      h("button", { class: "icon-button", title: "System memory" }, h("span", { class: "material-symbols-outlined" }, "memory")),
-      h("button", { class: "icon-button", title: identityLabel() }, h("span", { class: "material-symbols-outlined" }, "account_circle")),
+      h("button", { onclick: () => refresh() }, h("span", { class: "material-symbols-outlined" }, "sync"), "Refresh"),
       canWrite() ? h("button", { class: "primary", onclick: () => { apiState.selected = null; apiState.detail = null; apiState.tab = "detail"; render(); } }, h("span", { class: "material-symbols-outlined" }, "add"), "New Task") : null,
       h("button", { onclick: () => logout(true) }, "Log Out")
     )

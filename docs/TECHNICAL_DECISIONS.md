@@ -143,6 +143,10 @@ The UI must carefully avoid polling bugs that reset input fields while the user 
 ```bash
 taskpilot run <task-id> -- codex "your prompt"
 taskpilot run <task-id> -- gemini "your prompt"
+taskpilot run <task-id> -- claude "your prompt"
+taskpilot run <task-id> -- opencode "your prompt"
+taskpilot run <task-id> -- hermes "your prompt"
+taskpilot run <task-id> -- openclaude "your prompt"
 ```
 
 **Why:**
@@ -183,7 +187,7 @@ An interrupted session does not accidentally mark work complete.
 
 ### Prompt injection
 
-**Decision:** For known agents like Codex and Gemini, TaskPilot combines the TaskPilot startup prompt with the human work-unit prompt.
+**Decision:** For known agent CLIs, TaskPilot combines the TaskPilot startup prompt with the human work-unit prompt. The registry currently covers Codex, Claude, Gemini, OpenCode, Pi, Hermes, and OpenClaude aliases.
 
 Example command:
 
@@ -213,6 +217,12 @@ Agents should not guess from repo-local databases or stale chat memory. The serv
 **Trade-off:**
 
 The child agent still needs to follow instructions. TaskPilot now validates the handoff file at exit and warns if the agent did not produce useful memory.
+
+### Native session hooks
+
+**Decision:** Keep native hook registration adapter-based instead of assuming every agent CLI shares Codex's config model.
+
+`taskpilot agent configure all` registers known JSON hook configs for Codex, Claude, and Gemini. For agents without a confirmed native hook config, `taskpilot run` remains the reliable integration path. If those CLIs add a command-hook surface later, TaskPilot can add an adapter without changing the run wrapper.
 
 ### Context files
 

@@ -187,6 +187,10 @@ The most important workflow is:
 ```bash
 taskpilot run <task-id> -- codex "your prompt"
 taskpilot run <task-id> -- gemini "your prompt"
+taskpilot run <task-id> -- claude "your prompt"
+taskpilot run <task-id> -- opencode "your prompt"
+taskpilot run <task-id> -- hermes "your prompt"
+taskpilot run <task-id> -- openclaude "your prompt"
 ```
 
 `taskpilot run` does the coordination work around the child agent:
@@ -197,7 +201,7 @@ taskpilot run <task-id> -- gemini "your prompt"
 4. Acquires task/scope locks.
 5. Sends heartbeats while the agent runs.
 6. Creates task context and related-context files.
-7. Injects a startup prompt into known agents like Codex and Gemini.
+7. Injects a startup prompt into known agents including Codex, Claude, Gemini, OpenCode, Pi, Hermes, and OpenClaude.
 8. Creates `TASKPILOT_RUN_CONTEXT_FILE` for incremental notes.
 9. Creates `TASKPILOT_HANDOFF_FILE` for transfer-ready memory.
 10. Imports useful context and handoff checkpoints.
@@ -217,6 +221,8 @@ The visible agent prompt points to the full prompt file and includes the human p
 ```text
 TaskPilot task <task-id>: before doing any repository analysis or edits, read the full TaskPilot instructions from <prompt-file> and follow them exactly. Human prompt for this work unit: your prompt
 ```
+
+`taskpilot agent configure all` also registers native session hooks for agents with a known hook config format, currently Codex, Claude, and Gemini. Other agents still get the same `taskpilot run` background coordination path; if they expose a native command-hook setting, point their session-start hook at `taskpilot context render --repo . --format markdown` and their session-end hook at `taskpilot context checkpoint --repo . --source agent-hook --reason session_end`.
 
 ## Agent Context And Handoff Files
 
