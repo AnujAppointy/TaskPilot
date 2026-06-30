@@ -222,7 +222,9 @@ The child agent still needs to follow instructions. TaskPilot now validates the 
 
 **Decision:** Keep native hook registration adapter-based instead of assuming every agent CLI shares Codex's config model.
 
-`taskpilot agent configure all` registers known JSON hook configs for Codex, Claude, and Gemini. For agents without a confirmed native hook config, `taskpilot run` remains the reliable integration path. If those CLIs add a command-hook surface later, TaskPilot can add an adapter without changing the run wrapper.
+`taskpilot agent configure all` registers known JSON hook configs for Codex, Claude, and Gemini. OpenCode uses its documented project plugin system instead: TaskPilot writes `.opencode/plugins/taskpilot.js`, appends live repo context through `experimental.chat.system.transform`, and checkpoints on `session.idle`. Hermes uses its documented shell hook system: TaskPilot writes scripts under `~/.hermes/agent-hooks/`, adds them to `~/.hermes/config.yaml`, injects context through `pre_llm_call`, and checkpoints through `on_session_end`.
+
+For agents without a confirmed native hook or plugin config, `taskpilot run` remains the reliable integration path. If those CLIs add a command-hook surface later, TaskPilot can add an adapter without changing the run wrapper.
 
 ### Context files
 

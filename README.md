@@ -222,7 +222,7 @@ The visible agent prompt points to the full prompt file and includes the human p
 TaskPilot task <task-id>: before doing any repository analysis or edits, read the full TaskPilot instructions from <prompt-file> and follow them exactly. Human prompt for this work unit: your prompt
 ```
 
-`taskpilot agent configure all` also registers native session hooks for agents with a known hook config format, currently Codex, Claude, and Gemini. Other agents still get the same `taskpilot run` background coordination path; if they expose a native command-hook setting, point their session-start hook at `taskpilot context render --repo . --format markdown` and their session-end hook at `taskpilot context checkpoint --repo . --source agent-hook --reason session_end`.
+`taskpilot agent configure all` also registers native integrations for agents with a known extension format. Codex, Claude, and Gemini use command hooks. OpenCode uses a project plugin at `.opencode/plugins/taskpilot.js` that appends TaskPilot repo context through OpenCode's chat system transform hook and checkpoints on `session.idle`. Hermes uses documented shell hooks in `~/.hermes/config.yaml`: `pre_llm_call` injects TaskPilot context and `on_session_end` checkpoints. Agents without a confirmed native hook/plugin config still get the same `taskpilot run` background coordination path.
 
 ## Agent Context And Handoff Files
 

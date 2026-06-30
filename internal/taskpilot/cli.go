@@ -462,6 +462,19 @@ type jsonHookAdapter struct {
 	entryLabel string
 }
 
+type opencodePluginAdapter struct {
+	name      string
+	binaries  []string
+	configRel string
+	extraNote string
+}
+
+type hermesShellHookAdapter struct {
+	name      string
+	binaries  []string
+	extraNote string
+}
+
 type SessionStartHook struct {
 	Type    string `json:"type"`
 	Command string `json:"command"`
@@ -478,14 +491,16 @@ type knownAgentProfile struct {
 	FinalPaths      []string
 	ExtraNote       string
 	ManualSetupNote string
+	OpenCodePlugin  bool
+	HermesShellHook bool
 }
 
 var knownAgentProfiles = []knownAgentProfile{
 	{Name: "claude", Binaries: []string{"claude"}, PromptInjection: true, NativeJSONHooks: true, ConfigRel: ".claude/settings.json", Format: "claude", JSONPath: "hooks.SessionStart", FinalPaths: []string{"hooks.SessionEnd"}, ExtraNote: "Claude Code may show its normal hook approval prompt the first time this repo opens."},
 	{Name: "codex", Binaries: []string{"codex"}, PromptInjection: true, NativeJSONHooks: true, ConfigRel: ".codex/hooks.json", Format: "codex", JSONPath: "hooks.SessionStart", FinalPaths: []string{"hooks.SessionEnd"}, ExtraNote: "Codex may show its normal hook approval prompt the first time this repo opens."},
 	{Name: "gemini", Binaries: []string{"gemini"}, PromptInjection: true, NativeJSONHooks: true, ConfigRel: ".gemini/settings.json", Format: "gemini", JSONPath: "hooks.SessionStart", FinalPaths: []string{"hooks.SessionEnd"}, ExtraNote: "Gemini hook output is limited to bounded TaskPilot context."},
-	{Name: "hermes", Binaries: []string{"hermes", "hermes-agent"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap Hermes through `taskpilot run`; native session hooks require Hermes to expose a command hook setting."},
-	{Name: "opencode", Binaries: []string{"opencode", "open-code"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap OpenCode through `taskpilot run`; native session hooks require OpenCode to expose a command hook setting."},
+	{Name: "hermes", Binaries: []string{"hermes", "hermes-agent"}, PromptInjection: true, ExtraNote: "Hermes shell hooks inject TaskPilot context on pre_llm_call and checkpoint on on_session_end.", HermesShellHook: true},
+	{Name: "opencode", Binaries: []string{"opencode", "open-code"}, PromptInjection: true, ConfigRel: ".opencode/plugins/taskpilot.js", ExtraNote: "OpenCode loads project plugins from .opencode/plugins at startup.", OpenCodePlugin: true},
 	{Name: "openclaude", Binaries: []string{"openclaude", "open-claude"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap OpenClaude through `taskpilot run`; native session hooks require OpenClaude to expose a command hook setting."},
 	{Name: "pi", Binaries: []string{"pi"}, PromptInjection: true, ManualSetupNote: "TaskPilot can wrap Pi through `taskpilot run`; native session hooks require Pi to expose a command hook setting."},
 }
@@ -2136,6 +2151,14 @@ func agentAdapters() []AgentAdapter {
 			out = append(out, jsonHookAdapter{name: profile.Name, binary: profile.Binaries[0], configRel: profile.ConfigRel, hookRel: ".taskpilot/hooks/" + profile.Name + "-session-start", format: profile.Format, jsonPath: profile.JSONPath, finalPaths: profile.FinalPaths, supported: true, extraNote: profile.ExtraNote})
 			continue
 		}
+		if profile.OpenCodePlugin {
+			out = append(out, opencodePluginAdapter{name: profile.Name, binaries: profile.Binaries, configRel: profile.ConfigRel, extraNote: profile.ExtraNote})
+			continue
+		}
+		if profile.HermesShellHook {
+			out = append(out, hermesShellHookAdapter{name: profile.Name, binaries: profile.Binaries, extraNote: profile.ExtraNote})
+			continue
+		}
 		out = append(out, unsupportedAgentAdapter{name: profile.Name, manualNote: profile.ManualSetupNote})
 	}
 	return out
@@ -2334,6 +2357,482 @@ func (a jsonHookAdapter) ManualInstructions(repo repoEnableConfig) string {
 		return fmt.Sprintf("Manual setup for %s: add a session-start command hook to %s that runs %s, a session-end hook that runs %s, and register Codex MCP server `taskpilot` with command `taskpilot mcp serve` including tool `record_repo_semantic_memory`.", a.name, filepath.Join(repo.GitRoot, a.configRel), a.command(), a.finalCommand())
 	}
 	return fmt.Sprintf("Manual setup for %s: add a session-start command hook to %s that runs %s, and a session-end hook that runs %s.", a.name, filepath.Join(repo.GitRoot, a.configRel), a.command(), a.finalCommand())
+}
+
+func (a opencodePluginAdapter) Name() string { return a.name }
+
+func (a opencodePluginAdapter) Detect(repo repoEnableConfig) AgentDetection {
+	bin := ""
+	installed := false
+	for _, binary := range a.binaries {
+		if found, err := exec.LookPath(binary); err == nil {
+			bin = found
+			installed = true
+			break
+		}
+	}
+	return AgentDetection{
+		Name:        a.name,
+		Installed:   installed,
+		Binary:      bin,
+		ConfigPath:  filepath.Join(repo.GitRoot, a.configRel),
+		HookCommand: "OpenCode project plugin",
+		Supported:   true,
+	}
+}
+
+func (a opencodePluginAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConfigureResult {
+	detection := a.Detect(repo)
+	result := AgentConfigureResult{Name: a.name, ConfigPath: detection.ConfigPath, HookCommand: detection.HookCommand, DryRun: dryRun}
+	plugin := []byte(renderOpenCodeTaskPilotPlugin())
+	existing, err := os.ReadFile(detection.ConfigPath)
+	if os.IsNotExist(err) {
+		existing = nil
+	} else if err != nil {
+		result.Status = "error"
+		result.Message = err.Error()
+		result.ManualFallback = a.ManualInstructions(repo)
+		return result
+	}
+	changed := !bytes.Equal(bytes.TrimSpace(existing), bytes.TrimSpace(plugin))
+	result.Changed = changed
+	if dryRun {
+		result.Status = "dry_run"
+		if changed {
+			result.Message = fmt.Sprintf("would register %s native OpenCode plugin in %s", a.name, a.configRel)
+		} else {
+			result.Message = fmt.Sprintf("%s native OpenCode plugin already registered in %s", a.name, a.configRel)
+		}
+		return result
+	}
+	if !changed {
+		result.Status = "already_configured"
+		result.Message = fmt.Sprintf("%s native OpenCode plugin already registered in %s", a.name, a.configRel)
+		return result
+	}
+	if err := ensureDir(filepath.Dir(detection.ConfigPath)); err != nil {
+		result.Status = "error"
+		result.Message = err.Error()
+		result.ManualFallback = a.ManualInstructions(repo)
+		return result
+	}
+	if len(existing) > 0 {
+		backup, err := ensureOneTimeBackup(detection.ConfigPath)
+		if err != nil {
+			result.Status = "error"
+			result.Message = err.Error()
+			result.ManualFallback = a.ManualInstructions(repo)
+			return result
+		}
+		result.BackupPath = backup
+	}
+	if err := atomicWriteFile(detection.ConfigPath, plugin, 0o644); err != nil {
+		result.Status = "error"
+		result.Message = err.Error()
+		result.ManualFallback = a.ManualInstructions(repo)
+		return result
+	}
+	result.Status = "configured"
+	result.Message = fmt.Sprintf("registered %s native OpenCode plugin in %s", a.name, a.configRel)
+	if a.extraNote != "" {
+		result.Message += "; " + a.extraNote
+	}
+	return result
+}
+
+func (a opencodePluginAdapter) Doctor(repo repoEnableConfig) AgentHealth {
+	detection := a.Detect(repo)
+	registered := openCodePluginRegistered(detection.ConfigPath)
+	status := "ok"
+	msg := ""
+	if !registered {
+		status = "not_registered"
+		msg = "run `taskpilot agent configure " + a.name + "`"
+	} else if !detection.Installed {
+		status = "agent_not_on_path"
+		msg = "native OpenCode plugin is registered, but the OpenCode binary was not found on PATH"
+	}
+	return AgentHealth{Name: a.name, Installed: detection.Installed, ConfigPath: detection.ConfigPath, HookScriptPath: detection.ConfigPath, HookScriptExists: registered, Registered: registered, Status: status, Message: msg}
+}
+
+func (a opencodePluginAdapter) ManualInstructions(repo repoEnableConfig) string {
+	return fmt.Sprintf("Manual setup for %s: create %s with a project plugin that appends `taskpilot context render --repo <repo> --format markdown` output through `experimental.chat.system.transform` and checkpoints on `session.idle`.", a.name, filepath.Join(repo.GitRoot, a.configRel))
+}
+
+func openCodePluginRegistered(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	text := string(data)
+	return strings.Contains(text, "TaskPilotOpenCodePlugin") &&
+		strings.Contains(text, "experimental.chat.system.transform") &&
+		strings.Contains(text, "session.idle") &&
+		strings.Contains(text, "taskpilot context render") &&
+		strings.Contains(text, "taskpilot context checkpoint")
+}
+
+func renderOpenCodeTaskPilotPlugin() string {
+	return `// Managed by TaskPilot. Re-run ` + "`taskpilot agent configure opencode`" + ` to refresh.
+export const TaskPilotOpenCodePlugin = async ({ $, directory, worktree, client }) => {
+  const repo = worktree || directory || "."
+
+  const renderContext = async () => {
+    try {
+      return await ` + "$" + "`taskpilot context render --repo ${repo} --format markdown`" + `.text()
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err)
+      return "## TaskPilot Live Repo Context\n\nTaskPilot context render failed: " + message
+    }
+  }
+
+  const checkpoint = async (reason) => {
+    try {
+      await ` + "$" + "`taskpilot context checkpoint --repo ${repo} --source agent-hook --reason ${reason}`" + `.quiet()
+    } catch (err) {
+      if (client && client.app && client.app.log) {
+        await client.app.log({
+          body: {
+            service: "taskpilot",
+            level: "warn",
+            message: "TaskPilot checkpoint failed",
+            extra: { reason, error: err && err.message ? err.message : String(err) },
+          },
+        })
+      }
+    }
+  }
+
+  return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push(await renderContext())
+    },
+    event: async ({ event }) => {
+      if (event.type === "session.idle") {
+        await checkpoint("session_idle")
+      }
+    },
+  }
+}
+`
+}
+
+func (a hermesShellHookAdapter) Name() string { return a.name }
+
+func (a hermesShellHookAdapter) Detect(repo repoEnableConfig) AgentDetection {
+	bin := ""
+	installed := false
+	for _, binary := range a.binaries {
+		if found, err := exec.LookPath(binary); err == nil {
+			bin = found
+			installed = true
+			break
+		}
+	}
+	return AgentDetection{
+		Name:        a.name,
+		Installed:   installed,
+		Binary:      bin,
+		ConfigPath:  hermesConfigPath(),
+		HookCommand: "Hermes shell hooks",
+		Supported:   true,
+	}
+}
+
+func (a hermesShellHookAdapter) Configure(repo repoEnableConfig, dryRun bool) AgentConfigureResult {
+	detection := a.Detect(repo)
+	result := AgentConfigureResult{Name: a.name, ConfigPath: detection.ConfigPath, HookCommand: detection.HookCommand, DryRun: dryRun}
+	contextScript, checkpointScript := hermesTaskPilotHookPaths()
+	contextBody := []byte(renderHermesTaskPilotContextHook())
+	checkpointBody := []byte(renderHermesTaskPilotCheckpointHook())
+	config, err := os.ReadFile(detection.ConfigPath)
+	if os.IsNotExist(err) {
+		config = nil
+	} else if err != nil {
+		result.Status = "error"
+		result.Message = err.Error()
+		result.ManualFallback = a.ManualInstructions(repo)
+		return result
+	}
+	updated := string(config)
+	changed := false
+	var hookChanged bool
+	updated, hookChanged = ensureHermesHookYAML(updated, "pre_llm_call", contextScript, 20)
+	changed = changed || hookChanged
+	updated, hookChanged = ensureHermesHookYAML(updated, "on_session_end", checkpointScript, 20)
+	changed = changed || hookChanged
+	if existing, err := os.ReadFile(contextScript); err != nil || !bytes.Equal(existing, contextBody) {
+		changed = true
+	}
+	if existing, err := os.ReadFile(checkpointScript); err != nil || !bytes.Equal(existing, checkpointBody) {
+		changed = true
+	}
+	result.Changed = changed
+	if dryRun {
+		result.Status = "dry_run"
+		if changed {
+			result.Message = fmt.Sprintf("would register %s native Hermes shell hooks in %s", a.name, detection.ConfigPath)
+		} else {
+			result.Message = fmt.Sprintf("%s native Hermes shell hooks already registered in %s", a.name, detection.ConfigPath)
+		}
+		return result
+	}
+	if !changed {
+		result.Status = "already_configured"
+		result.Message = fmt.Sprintf("%s native Hermes shell hooks already registered in %s", a.name, detection.ConfigPath)
+		return result
+	}
+	for _, write := range []struct {
+		path string
+		body []byte
+		mode os.FileMode
+	}{
+		{contextScript, contextBody, 0o755},
+		{checkpointScript, checkpointBody, 0o755},
+	} {
+		if err := ensureDir(filepath.Dir(write.path)); err != nil {
+			result.Status = "error"
+			result.Message = err.Error()
+			result.ManualFallback = a.ManualInstructions(repo)
+			return result
+		}
+		if err := atomicWriteFile(write.path, write.body, write.mode); err != nil {
+			result.Status = "error"
+			result.Message = err.Error()
+			result.ManualFallback = a.ManualInstructions(repo)
+			return result
+		}
+	}
+	if err := ensureDir(filepath.Dir(detection.ConfigPath)); err != nil {
+		result.Status = "error"
+		result.Message = err.Error()
+		result.ManualFallback = a.ManualInstructions(repo)
+		return result
+	}
+	if len(config) > 0 && !bytes.Equal(bytes.TrimSpace(config), bytes.TrimSpace([]byte(updated))) {
+		backup, err := ensureOneTimeBackup(detection.ConfigPath)
+		if err != nil {
+			result.Status = "error"
+			result.Message = err.Error()
+			result.ManualFallback = a.ManualInstructions(repo)
+			return result
+		}
+		result.BackupPath = backup
+	}
+	if err := atomicWriteFile(detection.ConfigPath, []byte(updated), 0o600); err != nil {
+		result.Status = "error"
+		result.Message = err.Error()
+		result.ManualFallback = a.ManualInstructions(repo)
+		return result
+	}
+	result.Status = "configured"
+	result.Message = fmt.Sprintf("registered %s native Hermes shell hooks in %s", a.name, detection.ConfigPath)
+	if a.extraNote != "" {
+		result.Message += "; " + a.extraNote
+	}
+	return result
+}
+
+func (a hermesShellHookAdapter) Doctor(repo repoEnableConfig) AgentHealth {
+	detection := a.Detect(repo)
+	registered := hermesShellHooksRegistered()
+	status := "ok"
+	msg := ""
+	if !registered {
+		status = "not_registered"
+		msg = "run `taskpilot agent configure " + a.name + "`"
+	} else if !detection.Installed {
+		status = "agent_not_on_path"
+		msg = "native Hermes shell hooks are registered, but the Hermes binary was not found on PATH"
+	}
+	return AgentHealth{Name: a.name, Installed: detection.Installed, ConfigPath: detection.ConfigPath, HookScriptPath: filepath.Dir(hermesTaskPilotContextHookPath()), HookScriptExists: registered, Registered: registered, Status: status, Message: msg}
+}
+
+func (a hermesShellHookAdapter) ManualInstructions(repo repoEnableConfig) string {
+	contextScript, checkpointScript := hermesTaskPilotHookPaths()
+	return fmt.Sprintf("Manual setup for %s: create executable scripts %s and %s, then add them under hooks.pre_llm_call and hooks.on_session_end in %s.", a.name, contextScript, checkpointScript, hermesConfigPath())
+}
+
+func hermesConfigPath() string {
+	home := strings.TrimSpace(os.Getenv("HERMES_HOME"))
+	if home == "" {
+		if userHome, err := os.UserHomeDir(); err == nil {
+			home = filepath.Join(userHome, ".hermes")
+		}
+	}
+	if home == "" {
+		home = ".hermes"
+	}
+	return filepath.Join(home, "config.yaml")
+}
+
+func hermesTaskPilotContextHookPath() string {
+	contextScript, _ := hermesTaskPilotHookPaths()
+	return contextScript
+}
+
+func hermesTaskPilotHookPaths() (string, string) {
+	home := filepath.Dir(hermesConfigPath())
+	dir := filepath.Join(home, "agent-hooks")
+	return filepath.Join(dir, "taskpilot-context.py"), filepath.Join(dir, "taskpilot-checkpoint.py")
+}
+
+func hermesShellHooksRegistered() bool {
+	contextScript, checkpointScript := hermesTaskPilotHookPaths()
+	data, err := os.ReadFile(hermesConfigPath())
+	if err != nil {
+		return false
+	}
+	text := string(data)
+	if !strings.Contains(text, strconv.Quote(contextScript)) || !strings.Contains(text, strconv.Quote(checkpointScript)) {
+		return false
+	}
+	contextData, err := os.ReadFile(contextScript)
+	if err != nil || !pythonHookContainsTaskPilotCommand(string(contextData), "render") {
+		return false
+	}
+	checkpointData, err := os.ReadFile(checkpointScript)
+	return err == nil && pythonHookContainsTaskPilotCommand(string(checkpointData), "checkpoint")
+}
+
+func pythonHookContainsTaskPilotCommand(text, subcommand string) bool {
+	return strings.Contains(text, strconv.Quote("taskpilot")) &&
+		strings.Contains(text, strconv.Quote("context")) &&
+		strings.Contains(text, strconv.Quote(subcommand))
+}
+
+func ensureHermesHookYAML(text, event, command string, timeout int) (string, bool) {
+	if strings.Contains(text, strconv.Quote(command)) || strings.Contains(text, command) {
+		return text, false
+	}
+	entry := []string{
+		"    - command: " + strconv.Quote(command),
+		fmt.Sprintf("      timeout: %d", timeout),
+	}
+	lines := splitYAMLLines(text)
+	hooksIdx := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "hooks:" {
+			hooksIdx = i
+			break
+		}
+	}
+	if hooksIdx < 0 {
+		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "hooks:", "  "+event+":")
+		lines = append(lines, entry...)
+		return strings.Join(lines, "\n") + "\n", true
+	}
+	hooksEnd := len(lines)
+	for i := hooksIdx + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.HasPrefix(lines[i], " ") && !strings.HasPrefix(lines[i], "\t") {
+			hooksEnd = i
+			break
+		}
+	}
+	eventIdx := -1
+	for i := hooksIdx + 1; i < hooksEnd; i++ {
+		if strings.TrimSpace(lines[i]) == event+":" && strings.HasPrefix(lines[i], "  ") {
+			eventIdx = i
+			break
+		}
+	}
+	if eventIdx < 0 {
+		insert := append([]string{"  " + event + ":"}, entry...)
+		lines = insertLines(lines, hooksEnd, insert)
+		return strings.Join(lines, "\n") + "\n", true
+	}
+	eventEnd := hooksEnd
+	for i := eventIdx + 1; i < hooksEnd; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(lines[i], "  ") && !strings.HasPrefix(lines[i], "    ") && strings.HasSuffix(trimmed, ":") {
+			eventEnd = i
+			break
+		}
+	}
+	lines = insertLines(lines, eventEnd, entry)
+	return strings.Join(lines, "\n") + "\n", true
+}
+
+func splitYAMLLines(text string) []string {
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
+
+func insertLines(lines []string, idx int, insert []string) []string {
+	out := append([]string{}, lines[:idx]...)
+	out = append(out, insert...)
+	return append(out, lines[idx:]...)
+}
+
+func renderHermesTaskPilotContextHook() string {
+	return `#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    payload = {}
+
+repo = payload.get("cwd") or os.getcwd()
+try:
+    result = subprocess.run(
+        ["taskpilot", "context", "render", "--repo", repo, "--format", "markdown"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode == 0:
+        context = result.stdout
+    else:
+        context = "## TaskPilot Live Repo Context\n\nTaskPilot context render failed:\n" + (result.stderr or result.stdout)
+except Exception as exc:
+    context = "## TaskPilot Live Repo Context\n\nTaskPilot context render failed: " + str(exc)
+
+print(json.dumps({"context": context}))
+`
+}
+
+func renderHermesTaskPilotCheckpointHook() string {
+	return `#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    payload = {}
+
+repo = payload.get("cwd") or os.getcwd()
+try:
+    subprocess.run(
+        ["taskpilot", "context", "checkpoint", "--repo", repo, "--source", "agent-hook", "--reason", "session_end"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+except Exception:
+    pass
+
+print("{}")
+`
 }
 
 type codexMCPConfigResult struct {

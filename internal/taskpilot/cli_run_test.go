@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -545,6 +546,111 @@ func TestMergeSessionStartHookJSONCreatesBackupAndSkipsNoopWrite(t *testing.T) {
 	}
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Fatalf("no-op merge should not rewrite file")
+	}
+}
+
+func TestOpenCodePluginAdapterConfiguresProjectPlugin(t *testing.T) {
+	root := t.TempDir()
+	repo := repoEnableConfig{GitRoot: root}
+	adapter := opencodePluginAdapter{name: "opencode", binaries: []string{"opencode"}, configRel: ".opencode/plugins/taskpilot.js"}
+
+	result := adapter.Configure(repo, false)
+	if result.Status != "configured" || !result.Changed {
+		t.Fatalf("expected configured result, got %+v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".opencode", "plugins", "taskpilot.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{"TaskPilotOpenCodePlugin", "experimental.chat.system.transform", "session.idle", "taskpilot context render", "taskpilot context checkpoint"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("plugin missing %q:\n%s", want, text)
+		}
+	}
+
+	second := adapter.Configure(repo, false)
+	if second.Status != "already_configured" || second.Changed {
+		t.Fatalf("expected idempotent configure, got %+v", second)
+	}
+}
+
+func TestOpenCodePluginAdapterDoctorDetectsRegistration(t *testing.T) {
+	root := t.TempDir()
+	repo := repoEnableConfig{GitRoot: root}
+	adapter := opencodePluginAdapter{name: "opencode", binaries: []string{"opencode"}, configRel: ".opencode/plugins/taskpilot.js"}
+
+	health := adapter.Doctor(repo)
+	if health.Status != "not_registered" || health.Registered {
+		t.Fatalf("expected not_registered before configure, got %+v", health)
+	}
+	_ = adapter.Configure(repo, false)
+	health = adapter.Doctor(repo)
+	if !health.Registered {
+		t.Fatalf("expected registered after configure, got %+v", health)
+	}
+	if health.Status != "ok" && health.Status != "agent_not_on_path" {
+		t.Fatalf("expected ok or agent_not_on_path after configure, got %+v", health)
+	}
+}
+
+func TestHermesShellHookAdapterConfiguresHooksAndScripts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HERMES_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.yaml"), []byte("model:\n  default: test\nhooks:\n  post_tool_call:\n    - command: \"/tmp/existing.py\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo := repoEnableConfig{GitRoot: t.TempDir()}
+	adapter := hermesShellHookAdapter{name: "hermes", binaries: []string{"hermes"}}
+
+	result := adapter.Configure(repo, false)
+	if result.Status != "configured" || !result.Changed {
+		t.Fatalf("expected configured result, got %+v", result)
+	}
+	contextScript, checkpointScript := hermesTaskPilotHookPaths()
+	for _, path := range []string{contextScript, checkpointScript} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pythonHookContainsTaskPilotCommand(string(data), "render") && !pythonHookContainsTaskPilotCommand(string(data), "checkpoint") {
+			t.Fatalf("expected TaskPilot command in %s:\n%s", path, data)
+		}
+	}
+	config, err := os.ReadFile(filepath.Join(home, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(config)
+	for _, want := range []string{"model:", "post_tool_call:", "pre_llm_call:", "on_session_end:", strconv.Quote(contextScript), strconv.Quote(checkpointScript)} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config missing %q:\n%s", want, text)
+		}
+	}
+
+	second := adapter.Configure(repo, false)
+	if second.Status != "already_configured" || second.Changed {
+		t.Fatalf("expected idempotent configure, got %+v", second)
+	}
+}
+
+func TestHermesShellHookAdapterDoctorDetectsRegistration(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HERMES_HOME", home)
+	repo := repoEnableConfig{GitRoot: t.TempDir()}
+	adapter := hermesShellHookAdapter{name: "hermes", binaries: []string{"hermes"}}
+
+	health := adapter.Doctor(repo)
+	if health.Status != "not_registered" || health.Registered {
+		t.Fatalf("expected not_registered before configure, got %+v", health)
+	}
+	_ = adapter.Configure(repo, false)
+	health = adapter.Doctor(repo)
+	if !health.Registered {
+		t.Fatalf("expected registered after configure, got %+v", health)
+	}
+	if health.Status != "ok" && health.Status != "agent_not_on_path" {
+		t.Fatalf("expected ok or agent_not_on_path after configure, got %+v", health)
 	}
 }
 
