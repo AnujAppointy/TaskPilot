@@ -69,6 +69,34 @@ func TestTaskPilotManagedRepoFilesAreIgnoredForInference(t *testing.T) {
 	}
 }
 
+func TestAgentRulesFileRequiresOwningTasksForMeaningfulWork(t *testing.T) {
+	rules := agentRulesFile()
+	required := []string{
+		"Do not treat task\ncreation as optional just because the user did not provide a task ID.",
+		"When the user starts work without a TaskPilot task ID:",
+		"create\n   the owning task before or immediately after the first safe inspection step.",
+		"technical decision, planning document,\n   architecture direction",
+		"must have an owning task. Do not record only semantic memory",
+		"Session boundary examples:",
+		"Update technicaldecisions.md",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(rules, phrase) {
+			t.Fatalf("agent rules missing required guidance %q\n%s", phrase, rules)
+		}
+	}
+	forbidden := []string{
+		"# Codebase Exploration Rules",
+		"codebase-memory",
+		"Codebase Memory MCP",
+	}
+	for _, phrase := range forbidden {
+		if strings.Contains(rules, phrase) {
+			t.Fatalf("agent rules should not include Codex-specific guidance %q\n%s", phrase, rules)
+		}
+	}
+}
+
 func TestCompactContextEntriesDropsRepoDaemonNoise(t *testing.T) {
 	entries := []ContextEntry{
 		{Kind: "summary", Content: "TaskPilot daemon captured live uncommitted repo activity.\nBranch: main\nChanged files:\n- AGENTS.md"},
